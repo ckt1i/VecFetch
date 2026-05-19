@@ -16,6 +16,7 @@ using vdb::rabitq::RaBitQEncoder;
 using vdb::rabitq::RaBitQEstimator;
 using vdb::rabitq::RaBitQCode;
 using vdb::rabitq::PreparedQuery;
+using vdb::rabitq::ClusterPreparedScratch;
 using vdb::Dim;
 
 namespace {
@@ -340,6 +341,38 @@ TEST(RaBitQEstimatorTest, HadamardRotation) {
     // Both should be in the same order of magnitude as exact
     EXPECT_LT(std::abs(fast - exact), 10.0f * exact + 5.0f);
     EXPECT_LT(std::abs(acc - exact), 10.0f * exact + 5.0f);
+}
+
+TEST(RaBitQEstimatorTest, BlockedHadamardPrepareQueryRotatedMatchesPrepareQuery) {
+    const Dim dim = 768;
+    RotationMatrix P(dim);
+    ASSERT_TRUE(P.GenerateBlockedHadamardPermuted(42, true));
+    RaBitQEstimator estimator(dim);
+
+    auto q = RandomVec(dim, 111);
+    auto c = RandomVec(dim, 222);
+
+    PreparedQuery pq_direct;
+    ClusterPreparedScratch scratch_direct;
+    estimator.PrepareQueryInto(q.data(), c.data(), P, &pq_direct, &scratch_direct);
+
+    std::vector<float> rotated_q(dim), rotated_c(dim);
+    P.Apply(q.data(), rotated_q.data());
+    P.Apply(c.data(), rotated_c.data());
+
+    PreparedQuery pq_rot;
+    ClusterPreparedScratch scratch_rot;
+    estimator.PrepareQueryRotatedInto(
+        rotated_q.data(), rotated_c.data(), &pq_rot, &scratch_rot);
+
+    EXPECT_NEAR(pq_direct.norm_qc, pq_rot.norm_qc, 1e-4f);
+    EXPECT_NEAR(pq_direct.norm_qc_sq, pq_rot.norm_qc_sq, 1e-3f);
+    EXPECT_NEAR(pq_direct.sum_q, pq_rot.sum_q, 1e-3f);
+    EXPECT_EQ(pq_direct.sign_code, pq_rot.sign_code);
+    ASSERT_EQ(pq_direct.rotated.size(), pq_rot.rotated.size());
+    for (size_t i = 0; i < pq_direct.rotated.size(); ++i) {
+        EXPECT_NEAR(pq_direct.rotated[i], pq_rot.rotated[i], 1e-4f) << "dim " << i;
+    }
 }
 
 // ===========================================================================

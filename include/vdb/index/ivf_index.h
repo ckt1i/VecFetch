@@ -11,6 +11,7 @@
 #include "vdb/common/types.h"
 #include "vdb/index/conann.h"
 #include "vdb/index/ivf_metadata.h"
+#include "vdb/simd/coarse_select.h"
 #include "vdb/rabitq/rabitq_rotation.h"
 #include "vdb/storage/segment.h"
 
@@ -77,6 +78,10 @@ class IvfIndex {
                                                 uint32_t nprobe) const;
     double last_coarse_score_ms() const { return last_coarse_score_ms_; }
     double last_coarse_topn_ms() const { return last_coarse_topn_ms_; }
+    bool use_coarse_select_simd() const { return use_coarse_select_simd_; }
+    void SetUseCoarseSelectSimd(bool enabled) { use_coarse_select_simd_ = enabled; }
+    bool use_coarse_select_phase2() const { return use_coarse_select_phase2_; }
+    void SetUseCoarseSelectPhase2(bool enabled) { use_coarse_select_phase2_ = enabled; }
 
     /// Get the ConANN classifier.
     const ConANN& conann() const { return conann_; }
@@ -93,6 +98,13 @@ class IvfIndex {
 
     /// Vector dimensionality.
     Dim dim() const { return dim_; }
+    Dim logical_dim() const { return logical_dim_; }
+    Dim effective_dim() const { return dim_; }
+    const std::string& padding_mode() const { return padding_mode_; }
+    const std::string& rotation_mode() const { return rotation_mode_; }
+    bool uses_padded_hadamard() const {
+        return logical_dim_ != dim_ && rotation_mode_ == "hadamard_padded";
+    }
 
     /// Get centroid for a specific cluster (row-major offset into centroids_).
     const float* centroid(uint32_t cluster_idx) const {
@@ -150,6 +162,9 @@ class IvfIndex {
     CoarseBuilder coarse_builder_ = CoarseBuilder::Auto;
     std::string requested_metric_ = "l2";
     std::string effective_metric_ = "l2";
+    Dim logical_dim_ = 0;
+    std::string padding_mode_ = "none";
+    std::string rotation_mode_ = "random_matrix";
     std::vector<float> normalized_centroids_;
     CoarsePackedLayout packed_centroids_;
     CoarsePackedLayout packed_normalized_centroids_;
@@ -162,6 +177,8 @@ class IvfIndex {
     mutable std::unique_ptr<CoarseScratch> coarse_scratch_;
     mutable double last_coarse_score_ms_ = 0;
     mutable double last_coarse_topn_ms_ = 0;
+    mutable bool use_coarse_select_simd_ = true;
+    mutable bool use_coarse_select_phase2_ = false;
 
 #ifdef VDB_USE_MKL
     // Precomputed ||c||² for each centroid (MKL-accelerated distance)

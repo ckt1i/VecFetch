@@ -30,8 +30,8 @@ class RerankConsumer {
     };
 
     /// @param ctx   SearchContext (provides query_vec and collector)
-    /// @param dim   Vector dimensionality
-    RerankConsumer(SearchContext& ctx, Dim dim);
+    /// @param raw_dim   Raw-vector dimensionality used by exact rerank
+    RerankConsumer(SearchContext& ctx, Dim raw_dim);
     ~RerankConsumer();
 
     /// Consume a VEC_ONLY buffer: buffer vector for later batch rerank.
@@ -68,7 +68,7 @@ class RerankConsumer {
  private:
     SearchContext& ctx_;
     Dim dim_;
-    uint32_t vec_bytes_;  // dim * sizeof(float)
+    uint32_t vec_bytes_;  // raw_dim * sizeof(float)
     std::vector<BufferedCandidate> buffered_candidates_;
 
     // Payload cache: addr.offset → owned payload buffer (freed via free())

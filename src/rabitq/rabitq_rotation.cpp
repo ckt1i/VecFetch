@@ -25,20 +25,34 @@ RotationMatrix::RotationMatrix(Dim dim, std::vector<float> data)
 RotationMatrix::RotationMatrix(RotationMatrix&& other) noexcept
     : dim_(other.dim_),
       data_(std::move(other.data_)),
+      kind_(other.kind_),
       use_fast_hadamard_(other.use_fast_hadamard_),
-      diag_signs_(std::move(other.diag_signs_)) {
+      diag_signs_(std::move(other.diag_signs_)),
+      block_sizes_(std::move(other.block_sizes_)),
+      permutation_(std::move(other.permutation_)),
+      inverse_permutation_(std::move(other.inverse_permutation_)),
+      seed_(other.seed_) {
     other.dim_ = 0;
+    other.kind_ = RotationKind::RandomMatrix;
     other.use_fast_hadamard_ = false;
+    other.seed_ = 0;
 }
 
 RotationMatrix& RotationMatrix::operator=(RotationMatrix&& other) noexcept {
     if (this != &other) {
         dim_ = other.dim_;
         data_ = std::move(other.data_);
+        kind_ = other.kind_;
         use_fast_hadamard_ = other.use_fast_hadamard_;
         diag_signs_ = std::move(other.diag_signs_);
+        block_sizes_ = std::move(other.block_sizes_);
+        permutation_ = std::move(other.permutation_);
+        inverse_permutation_ = std::move(other.inverse_permutation_);
+        seed_ = other.seed_;
         other.dim_ = 0;
+        other.kind_ = RotationKind::RandomMatrix;
         other.use_fast_hadamard_ = false;
+        other.seed_ = 0;
     }
     return *this;
 }
@@ -48,8 +62,13 @@ RotationMatrix& RotationMatrix::operator=(RotationMatrix&& other) noexcept {
 // ============================================================================
 
 void RotationMatrix::GenerateRandom(uint64_t seed) {
+    kind_ = RotationKind::RandomMatrix;
     use_fast_hadamard_ = false;
+    seed_ = seed;
     diag_signs_.clear();
+    block_sizes_.clear();
+    permutation_.clear();
+    inverse_permutation_.clear();
 
     const size_t L = dim_;
     const size_t n = L * L;
@@ -136,6 +155,90 @@ void FWHT_InPlace(float* vec, uint32_t n) {
     simd::FWHT_AVX512(vec, n);
 }
 
+std::mt19937_64 MakeRng(uint64_t seed) {
+    std::mt19937_64 rng;
+    if (seed == 0) {
+        std::random_device rd;
+        rng.seed(rd());
+    } else {
+        rng.seed(seed);
+    }
+    return rng;
+}
+
+std::vector<uint32_t> GreedyPowerOf2Blocks(uint32_t dim) {
+    std::vector<uint32_t> blocks;
+    uint32_t remaining = dim;
+    while (remaining > 0) {
+        uint32_t block = 1u;
+        while ((block << 1u) > block && (block << 1u) <= remaining) {
+            block <<= 1u;
+        }
+        blocks.push_back(block);
+        remaining -= block;
+    }
+    return blocks;
+}
+
+void ApplyHadamardDiagonalBlock(const int8_t* signs,
+                                uint32_t block_size,
+                                float* values) {
+    FWHT_InPlace(values, block_size);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(block_size));
+    for (uint32_t i = 0; i < block_size; ++i) {
+        values[i] *= scale * static_cast<float>(signs[i]);
+    }
+}
+
+void ApplyHadamardDiagonalBlockInverse(const int8_t* signs,
+                                       uint32_t block_size,
+                                       float* values) {
+    for (uint32_t i = 0; i < block_size; ++i) {
+        values[i] *= static_cast<float>(signs[i]);
+    }
+    FWHT_InPlace(values, block_size);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(block_size));
+    for (uint32_t i = 0; i < block_size; ++i) {
+        values[i] *= scale;
+    }
+}
+
+void ApplyBlockedFast(const std::vector<uint32_t>& permutation,
+                      const std::vector<uint32_t>& block_sizes,
+                      const std::vector<int8_t>& diag_signs,
+                      const float* in,
+                      float* out) {
+    const size_t L = permutation.size();
+    for (size_t i = 0; i < L; ++i) {
+        out[i] = in[permutation[i]];
+    }
+    size_t offset = 0;
+    for (uint32_t block_size : block_sizes) {
+        ApplyHadamardDiagonalBlock(
+            diag_signs.data() + offset, block_size, out + offset);
+        offset += block_size;
+    }
+}
+
+void ApplyBlockedFastInverse(const std::vector<uint32_t>& permutation,
+                             const std::vector<uint32_t>& block_sizes,
+                             const std::vector<int8_t>& diag_signs,
+                             const float* in,
+                             float* out) {
+    const size_t L = permutation.size();
+    std::vector<float> tmp(L, 0.0f);
+    std::memcpy(tmp.data(), in, L * sizeof(float));
+    size_t offset = 0;
+    for (uint32_t block_size : block_sizes) {
+        ApplyHadamardDiagonalBlockInverse(
+            diag_signs.data() + offset, block_size, tmp.data() + offset);
+        offset += block_size;
+    }
+    for (size_t i = 0; i < L; ++i) {
+        out[permutation[i]] = tmp[i];
+    }
+}
+
 }  // namespace
 
 bool RotationMatrix::GenerateHadamard(uint64_t seed, bool use_fast_transform) {
@@ -144,15 +247,14 @@ bool RotationMatrix::GenerateHadamard(uint64_t seed, bool use_fast_transform) {
     }
 
     const size_t L = dim_;
+    kind_ = RotationKind::Hadamard;
+    seed_ = seed;
+    block_sizes_.clear();
+    permutation_.clear();
+    inverse_permutation_.clear();
 
     // Generate random diagonal signs
-    std::mt19937_64 rng;
-    if (seed == 0) {
-        std::random_device rd;
-        rng.seed(rd());
-    } else {
-        rng.seed(seed);
-    }
+    std::mt19937_64 rng = MakeRng(seed);
 
     diag_signs_.resize(L);
     std::uniform_int_distribution<int> coin(0, 1);
@@ -183,6 +285,45 @@ bool RotationMatrix::GenerateHadamard(uint64_t seed, bool use_fast_transform) {
     return true;
 }
 
+bool RotationMatrix::GenerateBlockedHadamardPermuted(uint64_t seed,
+                                                     bool use_fast_transform) {
+    if (dim_ == 0) {
+        return false;
+    }
+
+    kind_ = RotationKind::BlockedHadamardPermuted;
+    use_fast_hadamard_ = use_fast_transform;
+    seed_ = seed;
+    block_sizes_ = GreedyPowerOf2Blocks(dim_);
+    permutation_.resize(dim_);
+    inverse_permutation_.resize(dim_);
+    std::iota(permutation_.begin(), permutation_.end(), 0u);
+
+    std::mt19937_64 rng = MakeRng(seed);
+    std::shuffle(permutation_.begin(), permutation_.end(), rng);
+    for (size_t i = 0; i < permutation_.size(); ++i) {
+        inverse_permutation_[permutation_[i]] = static_cast<uint32_t>(i);
+    }
+
+    diag_signs_.resize(dim_);
+    std::uniform_int_distribution<int> coin(0, 1);
+    for (size_t i = 0; i < diag_signs_.size(); ++i) {
+        diag_signs_[i] = coin(rng) ? +1 : -1;
+    }
+
+    data_.assign(static_cast<size_t>(dim_) * dim_, 0.0f);
+    std::vector<float> basis(dim_, 0.0f);
+    std::vector<float> row(dim_, 0.0f);
+    for (size_t i = 0; i < dim_; ++i) {
+        std::fill(basis.begin(), basis.end(), 0.0f);
+        basis[i] = 1.0f;
+        ApplyBlockedFast(permutation_, block_sizes_, diag_signs_,
+                         basis.data(), row.data());
+        std::memcpy(data_.data() + i * dim_, row.data(), dim_ * sizeof(float));
+    }
+    return true;
+}
+
 // ============================================================================
 // Apply — P^T × in (encoding/query rotation)
 // ============================================================================
@@ -191,7 +332,9 @@ void RotationMatrix::Apply(const float* VDB_RESTRICT in,
                            float* VDB_RESTRICT out) const {
     const size_t L = dim_;
 
-    if (use_fast_hadamard_) {
+    if (kind_ == RotationKind::BlockedHadamardPermuted && use_fast_hadamard_) {
+        ApplyBlockedFast(permutation_, block_sizes_, diag_signs_, in, out);
+    } else if (use_fast_hadamard_) {
         // Fast path: O(L log L)
         // P^T = D^T H^T / √L = D H / √L  (since H is symmetric, D is diagonal)
         // So P^T × in = (1/√L) D (H × in)
@@ -238,7 +381,9 @@ void RotationMatrix::ApplyInverse(const float* VDB_RESTRICT in,
                                   float* VDB_RESTRICT out) const {
     const size_t L = dim_;
 
-    if (use_fast_hadamard_) {
+    if (kind_ == RotationKind::BlockedHadamardPermuted && use_fast_hadamard_) {
+        ApplyBlockedFastInverse(permutation_, block_sizes_, diag_signs_, in, out);
+    } else if (use_fast_hadamard_) {
         // P = (1/√L) H × D
         // P × in = (1/√L) H × (D × in)
         //
@@ -287,14 +432,28 @@ Status RotationMatrix::Save(const std::string& path) const {
     const size_t data_bytes = static_cast<size_t>(dim_) * dim_ * sizeof(float);
     ofs.write(reinterpret_cast<const char*>(data_.data()), data_bytes);
 
-    // Write flags: bit 0 = use_fast_hadamard_
+    // Write flags: bit0 = use_fast_hadamard_, bit1 = blocked-hadamard-permuted
     uint8_t flags = use_fast_hadamard_ ? 1u : 0u;
+    if (kind_ == RotationKind::BlockedHadamardPermuted) {
+        flags |= 2u;
+    }
     ofs.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
 
     // When Hadamard mode, write diag_signs (dim × int8)
     if (use_fast_hadamard_) {
         ofs.write(reinterpret_cast<const char*>(diag_signs_.data()),
                   static_cast<std::streamsize>(diag_signs_.size()) * sizeof(int8_t));
+    }
+
+    if (flags & 2u) {
+        const uint64_t persisted_seed = seed_;
+        const uint32_t num_blocks = static_cast<uint32_t>(block_sizes_.size());
+        ofs.write(reinterpret_cast<const char*>(&persisted_seed), sizeof(persisted_seed));
+        ofs.write(reinterpret_cast<const char*>(&num_blocks), sizeof(num_blocks));
+        ofs.write(reinterpret_cast<const char*>(block_sizes_.data()),
+                  static_cast<std::streamsize>(num_blocks) * sizeof(uint32_t));
+        ofs.write(reinterpret_cast<const char*>(permutation_.data()),
+                  static_cast<std::streamsize>(permutation_.size()) * sizeof(uint32_t));
     }
 
     if (!ofs.good()) {
@@ -350,6 +509,54 @@ StatusOr<RotationMatrix> RotationMatrix::Load(const std::string& path, Dim dim) 
         result.diag_signs_ = std::move(diag_signs);
     } else {
         result.use_fast_hadamard_ = false;
+    }
+
+    result.kind_ = (flags & 2u) ? RotationKind::BlockedHadamardPermuted
+                                : ((flags & 1u) ? RotationKind::Hadamard
+                                                : RotationKind::RandomMatrix);
+
+    if (flags & 2u) {
+        uint64_t seed = 0;
+        uint32_t num_blocks = 0;
+        ifs.read(reinterpret_cast<char*>(&seed), sizeof(seed));
+        ifs.read(reinterpret_cast<char*>(&num_blocks), sizeof(num_blocks));
+        if (!ifs.good()) {
+            return Status::Corruption("Failed to read blocked hadamard metadata");
+        }
+        std::vector<uint32_t> block_sizes(num_blocks);
+        std::vector<uint32_t> permutation(dim);
+        ifs.read(reinterpret_cast<char*>(block_sizes.data()),
+                 static_cast<std::streamsize>(num_blocks) * sizeof(uint32_t));
+        ifs.read(reinterpret_cast<char*>(permutation.data()),
+                 static_cast<std::streamsize>(dim) * sizeof(uint32_t));
+        if (!ifs.good()) {
+            return Status::Corruption("Failed to read blocked hadamard payload");
+        }
+        uint32_t total = 0;
+        for (uint32_t block : block_sizes) {
+            if (!IsPowerOf2(block)) {
+                return Status::Corruption("Blocked hadamard block is not power-of-2");
+            }
+            total += block;
+        }
+        if (total != dim) {
+            return Status::Corruption("Blocked hadamard blocks do not cover dimension");
+        }
+        std::vector<uint32_t> inverse(dim, 0);
+        std::vector<uint8_t> seen(dim, 0);
+        for (uint32_t i = 0; i < dim; ++i) {
+            if (permutation[i] >= dim || seen[permutation[i]] != 0) {
+                return Status::Corruption("Blocked hadamard permutation is invalid");
+            }
+            seen[permutation[i]] = 1;
+            inverse[permutation[i]] = i;
+        }
+        result.seed_ = seed;
+        result.block_sizes_ = std::move(block_sizes);
+        result.permutation_ = std::move(permutation);
+        result.inverse_permutation_ = std::move(inverse);
+    } else {
+        result.seed_ = 0;
     }
 
     return result;

@@ -61,26 +61,26 @@
 
 ### 8.7 COCO 100K Main Experiment
 
-- [ ] 8.7.1 Run `coco_100k` gate vector-search and coupled E2E checks before the full sweep
+- [x] 8.7.1 Run `coco_100k` gate vector-search and coupled E2E checks before the full sweep
 - [x] 8.7.2 Run `coco_100k × faiss_ivfpq_refine × topk=10` on the frozen `nprobe` grid
 - [x] 8.7.3 Run `coco_100k × faiss_ivfrq × topk=10` on the frozen `nprobe` grid (deprecated: `faiss_ivfrq` retained for historical reference only)
-- [ ] 8.7.4 Run `coco_100k × diskann × topk=10` on the frozen `L_search` grid if DiskANN remains active
-- [ ] 8.7.4a Immediately aggregate the completed `coco_100k × topk=10` slice and generate its Pareto plot before proceeding
+- [x] 8.7.4 Run `coco_100k × diskann × topk=10` on the frozen `L_search` grid if DiskANN remains active
+- [x] 8.7.4a Immediately aggregate the completed `coco_100k × topk=10` slice and generate its Pareto plot before proceeding
 - [x] 8.7.5 Run `coco_100k × faiss_ivfpq_refine × topk=50` on the frozen `nprobe` grid
 - [x] 8.7.6 Run `coco_100k × faiss_ivfrq × topk=50` on the frozen `nprobe` grid (deprecated: `faiss_ivfrq` retained for historical reference only)
-- [ ] 8.7.7 Run `coco_100k × diskann × topk=50` on the frozen `L_search` grid if DiskANN remains active
-- [ ] 8.7.7a Immediately aggregate the completed `coco_100k × topk=50` slice and generate its Pareto plot before proceeding
+- [x] 8.7.7 Run `coco_100k × diskann × topk=50` on the frozen `L_search` grid if DiskANN remains active
+- [x] 8.7.7a Immediately aggregate the completed `coco_100k × topk=50` slice and generate its Pareto plot before proceeding
 - [x] 8.7.8 Run `coco_100k × faiss_ivfpq_refine × topk=100` on the frozen `nprobe` grid
 - [x] 8.7.9 Run `coco_100k × faiss_ivfrq × topk=100` on the frozen `nprobe` grid (deprecated: `faiss_ivfrq` retained for historical reference only)
-- [ ] 8.7.10 Run `coco_100k × diskann × topk=100` on the frozen `L_search` grid if DiskANN remains active
-- [ ] 8.7.10a Immediately aggregate the completed `coco_100k × topk=100` slice and generate its Pareto plot before proceeding
-- [ ] 8.7.11 Merge the three `coco_100k` top-k slices into a dataset-level main-experiment summary
+- [x] 8.7.10 Run `coco_100k × diskann × topk=100` on the frozen `L_search` grid if DiskANN remains active
+- [x] 8.7.10a Immediately aggregate the completed `coco_100k × topk=100` slice and generate its Pareto plot before proceeding
+- [x] 8.7.11 Merge the three `coco_100k` top-k slices into a dataset-level main-experiment summary
 - [x] 8.7.12 Write a short `coco_100k` result report and reference it from the formal-study outputs
 
 ### 8.8 MS MARCO Passage Main Experiment
 
-- [ ] 8.8.1 Run `msmarco_passage` gate vector-search and coupled E2E checks before the full sweep
-- [ ] 8.8.2 Fix and validate query/ground-truth/index alignment if the gate run fails
+- [x] 8.8.1 Run `msmarco_passage` gate vector-search and coupled E2E checks before the full sweep
+- [x] 8.8.2 Fix and validate query/ground-truth/index alignment if the gate run fails
 - [x] 8.8.3 Run `msmarco_passage × faiss_ivfpq_refine × topk=10` on the frozen `nprobe` grid
 - [x] 8.8.4 Run `msmarco_passage × faiss_ivfrq × topk=10` on the frozen `nprobe` grid (deprecated: `faiss_ivfrq` retained for historical reference only)
 - [x] 8.8.4a Immediately aggregate the completed `msmarco_passage × topk=10` slice and generate its Pareto plot before proceeding
@@ -133,27 +133,27 @@
 
 ### 8.12 Extended Experiment Operating Point Selection
 
-- [ ] 8.12.1 Select `coco_100k` top-10 operating points at `recall@10 ≈ 0.80 / 0.90 / 0.95`
-- [ ] 8.12.2 Select `msmarco_passage` top-10 operating points at `recall@10 ≈ 0.80 / 0.90 / 0.95`
-- [ ] 8.12.3 Select `deep8m_synth` top-10 operating points at `recall@10 ≈ 0.80 / 0.90 / 0.95`
-- [ ] 8.12.4 Select `amazon_esci` top-10 operating points at `recall@10 ≈ 0.80 / 0.90 / 0.95`
-- [ ] 8.12.5 Write a unified operating-point manifest with `matched`, `best-effort`, and `unreached` states
+- [x] 8.12.1 Select `coco_100k` top-10 operating points at `recall@10 ≈ 0.80 / 0.90 / 0.95`
+- [x] 8.12.2 Select `msmarco_passage` top-10 operating points at `recall@10 ≈ 0.80 / 0.90 / 0.95`
+- [x] 8.12.3 Select `deep8m_synth` top-10 operating points at `recall@10 ≈ 0.80 / 0.90 / 0.95`
+- [x] 8.12.4 Select `amazon_esci` top-10 operating points at `recall@10 ≈ 0.80 / 0.90 / 0.95`
+- [x] 8.12.5 Write a unified operating-point manifest with `matched`, `best-effort`, and `unreached` states
 
 ### 8.13 Extended Experiment Backend Replay
 
-- [ ] 8.13.1 Replay `FlatStor / Lance / Parquet` on the selected `coco_100k` top-10 operating points
-- [ ] 8.13.2 Replay `FlatStor / Lance / Parquet` on the selected `msmarco_passage` top-10 operating points
-- [ ] 8.13.3 Replay `FlatStor / Lance / Parquet` on the selected `deep8m_synth` top-10 operating points
-- [ ] 8.13.4 Replay `FlatStor / Lance / Parquet` on the selected `amazon_esci` top-10 operating points
+- [x] 8.13.1 Replay `FlatStor / Lance / Parquet` on the selected `coco_100k` top-10 operating points
+- [x] 8.13.2 Replay `FlatStor / Lance / Parquet` on the selected `msmarco_passage` top-10 operating points
+- [x] 8.13.3 Replay `FlatStor / Lance / Parquet` on the selected `deep8m_synth` top-10 operating points
+- [x] 8.13.4 Replay `FlatStor / Lance / Parquet` on the selected `amazon_esci` top-10 operating points
 
 ### 8.14 Extended Experiment Aggregation
 
-- [ ] 8.14.1 Aggregate dataset-level backend comparison summaries
-- [ ] 8.14.2 Generate backend comparison plot-ready CSVs and figures
-- [ ] 8.14.3 Write the backend comparison narrative report
+- [x] 8.14.1 Aggregate dataset-level backend comparison summaries
+- [x] 8.14.2 Generate backend comparison plot-ready CSVs and figures
+- [x] 8.14.3 Write the backend comparison narrative report
 
 ### 8.15 Appendix Gate
 
-- [ ] 8.15.1 Verify that all main-experiment dataset blocks are complete
-- [ ] 8.15.2 Verify that all backend extension dataset blocks are complete
-- [ ] 8.15.3 Gate appendix-dataset execution on successful completion of the main and extended experiment suites
+- [x] 8.15.1 Verify that all main-experiment dataset blocks are complete
+- [x] 8.15.2 Verify that all backend extension dataset blocks are complete
+- [x] 8.15.3 Gate appendix-dataset execution on successful completion of the main and extended experiment suites

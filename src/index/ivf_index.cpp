@@ -1,15 +1,19 @@
 #include "vdb/index/ivf_index.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <numeric>
 #include <string_view>
 
 #include "vdb/common/aligned_alloc.h"
 #include "vdb/simd/coarse_ip_score.h"
+#include "vdb/simd/coarse_select.h"
 #include "vdb/simd/distance_l2.h"
 
 #ifdef VDB_USE_MKL
@@ -53,6 +57,33 @@ std::string ExtractJsonStringField(const std::string& contents, std::string_view
         return {};
     }
     return contents.substr(first_quote + 1, second_quote - first_quote - 1);
+}
+
+uint64_t ExtractJsonUintField(const std::string& contents, std::string_view key,
+                              uint64_t default_value) {
+    const std::string quoted_key = "\"" + std::string(key) + "\"";
+    const size_t key_pos = contents.find(quoted_key);
+    if (key_pos == std::string::npos) {
+        return default_value;
+    }
+    const size_t colon = contents.find(':', key_pos + quoted_key.size());
+    if (colon == std::string::npos) {
+        return default_value;
+    }
+    size_t begin = colon + 1;
+    while (begin < contents.size() &&
+           std::isspace(static_cast<unsigned char>(contents[begin]))) {
+        ++begin;
+    }
+    size_t end = begin;
+    while (end < contents.size() &&
+           std::isdigit(static_cast<unsigned char>(contents[end]))) {
+        ++end;
+    }
+    if (end == begin) {
+        return default_value;
+    }
+    return std::strtoull(contents.substr(begin, end - begin).c_str(), nullptr, 10);
 }
 
 void NormalizeVector(const float* src, float* dst, Dim dim) {
@@ -183,6 +214,7 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
     }
 
     dim_ = seg_meta->dimension();
+    logical_dim_ = dim_;
     if (dim_ == 0) {
         return Status::InvalidArgument("SegmentMeta dimension is 0");
     }
@@ -236,6 +268,16 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
             if (effective_metric_.empty()) {
                 effective_metric_ = "l2";
             }
+            logical_dim_ = static_cast<Dim>(
+                ExtractJsonUintField(contents, "logical_dim", dim_));
+            padding_mode_ = ExtractJsonStringField(contents, "padding_mode");
+            rotation_mode_ = ExtractJsonStringField(contents, "rotation_mode");
+            if (padding_mode_.empty()) {
+                padding_mode_ = "none";
+            }
+            if (rotation_mode_.empty()) {
+                rotation_mode_ = "random_matrix";
+            }
         }
     }
 
@@ -274,6 +316,13 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
         return rot_result.status();
     }
     rotation_ = std::make_unique<rabitq::RotationMatrix>(std::move(rot_result.value()));
+    if (rotation_mode_ == "random_matrix") {
+        if (rotation_->is_blocked_hadamard_permuted()) {
+            rotation_mode_ = "blocked_hadamard_permuted";
+        } else if (rotation_->is_fast_hadamard()) {
+            rotation_mode_ = (logical_dim_ != dim_) ? "hadamard_padded" : "hadamard";
+        }
+    }
 
     // --- 5. Load ConANN params ---
     // Global epsilon may be 0 when per-cluster epsilon is used (stored in .clu
@@ -302,6 +351,13 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
         if (!rc_file.good()) {
             return Status::IOError("Failed to read rotated_centroids.bin");
         }
+        if (rotation_mode_ == "random_matrix") {
+            if (rotation_->is_blocked_hadamard_permuted()) {
+                rotation_mode_ = "blocked_hadamard_permuted";
+            } else {
+                rotation_mode_ = (logical_dim_ != dim_) ? "hadamard_padded" : "hadamard";
+            }
+        }
     }
 
     // --- 6. Load payload schemas ---
@@ -321,7 +377,9 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
     }
 
     // --- 7. Open segment (unified cluster.clu + data.dat) ---
-    auto seg_status = segment_.Open(dir, payload_schemas_, use_direct_io);
+    auto seg_status = segment_.Open(dir, payload_schemas_, use_direct_io,
+                                    logical_dim_ > 0 ? std::optional<Dim>(logical_dim_)
+                                                     : std::nullopt);
     if (!seg_status.ok()) {
         return seg_status;
     }
@@ -368,9 +426,6 @@ std::vector<ClusterID> IvfIndex::FindNearestClusters(
     CoarseScratch& scratch = *coarse_scratch_;
     scratch.scores.resize(nlist_);
     scratch.order.resize(nlist_);
-    for (uint32_t i = 0; i < nlist_; ++i) {
-        scratch.order[i] = i;
-    }
 
     // Compute scores/distances to all centroids
     auto coarse_score_start = std::chrono::steady_clock::now();
@@ -416,20 +471,31 @@ std::vector<ClusterID> IvfIndex::FindNearestClusters(
 
     // Partial sort to find the nprobe nearest
     auto coarse_topn_start = std::chrono::steady_clock::now();
-    auto score_less = [&](uint32_t lhs, uint32_t rhs) {
-        return scratch.scores[lhs] < scratch.scores[rhs];
-    };
-    if (actual_nprobe < nlist_) {
-        std::nth_element(scratch.order.begin(),
-                         scratch.order.begin() + actual_nprobe,
-                         scratch.order.end(),
-                         score_less);
+    if (use_coarse_select_simd_) {
+        if (use_coarse_select_phase2_) {
+            simd::SelectTopNProbeSmallSpecialized(
+                scratch.scores.data(), nlist_, actual_nprobe, scratch.order.data());
+        } else {
+            simd::SelectTopNProbeSmall(
+                scratch.scores.data(), nlist_, actual_nprobe, scratch.order.data());
+        }
+    } else {
+        for (uint32_t i = 0; i < nlist_; ++i) {
+            scratch.order[i] = i;
+        }
+        auto score_less = [&](uint32_t lhs, uint32_t rhs) {
+            return scratch.scores[lhs] < scratch.scores[rhs];
+        };
+        if (actual_nprobe < nlist_) {
+            std::nth_element(scratch.order.begin(),
+                             scratch.order.begin() + actual_nprobe,
+                             scratch.order.end(),
+                             score_less);
+        }
+        std::sort(scratch.order.begin(),
+                  scratch.order.begin() + actual_nprobe,
+                  score_less);
     }
-
-    // Sort the top nprobe by distance for deterministic ordering
-    std::sort(scratch.order.begin(),
-              scratch.order.begin() + actual_nprobe,
-              score_less);
     last_coarse_topn_ms_ = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - coarse_topn_start).count();
 

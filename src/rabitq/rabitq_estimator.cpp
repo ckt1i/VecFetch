@@ -205,7 +205,12 @@ void RaBitQEstimator::PrepareQueryInto(
     }
 
     // Rotate — Apply reads from residual, writes to rotated
+    auto t_rot = std::chrono::steady_clock::now();
     rotation.Apply(residual, pq->rotated.data());
+    if (timing != nullptr) {
+        timing->rotation_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_rot).count();
+    }
 
     // Fused sign-quantize + sum_q in one memory pass
     // inv_norm=1.0f: rotated is already unit-length; the multiply is a no-op

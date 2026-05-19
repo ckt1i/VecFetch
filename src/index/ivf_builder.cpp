@@ -42,6 +42,40 @@ namespace {
 
 constexpr uint32_t kDefaultFaissNiter = 10;
 
+bool IsPowerOf2(uint32_t n) {
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+uint32_t NextPowerOf2(uint32_t n) {
+    if (n == 0) return 1;
+    if (IsPowerOf2(n)) return n;
+    uint32_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+std::vector<float> PadRowsToDim(const float* vectors, uint32_t rows,
+                                uint32_t old_dim, uint32_t new_dim) {
+    std::vector<float> padded(static_cast<size_t>(rows) * new_dim, 0.0f);
+    for (uint32_t i = 0; i < rows; ++i) {
+        std::memcpy(padded.data() + static_cast<size_t>(i) * new_dim,
+                    vectors + static_cast<size_t>(i) * old_dim,
+                    static_cast<size_t>(old_dim) * sizeof(float));
+    }
+    return padded;
+}
+
+std::string JsonUIntArray(const std::vector<uint32_t>& values) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) oss << ", ";
+        oss << values[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
 void NormalizeRows(std::vector<float>* matrix, uint32_t rows, uint32_t dim) {
     for (uint32_t i = 0; i < rows; ++i) {
         float* row = matrix->data() + static_cast<size_t>(i) * dim;
@@ -130,8 +164,36 @@ Status IvfBuilder::Build(const float* vectors, uint32_t N, Dim dim,
             "assignment_mode=redundant_top2_rair requires assignment_factor=2");
     }
 
+    logical_dim_ = dim;
+    effective_dim_ = dim;
+    padding_mode_ = "none";
+    rotation_mode_ = "random_matrix";
+
+    std::vector<float> padded_vectors;
+    std::vector<float> padded_calibration_queries;
+    const float* build_vectors = vectors;
+    const float* calibration_queries = config_.calibration_queries;
+    Dim build_dim = dim;
+
+    if (config_.pad_non_power_of_two_to_pow2 && !IsPowerOf2(dim)) {
+        effective_dim_ = static_cast<Dim>(NextPowerOf2(dim));
+        build_dim = effective_dim_;
+        padding_mode_ = "zero_pad_to_pow2";
+        padded_vectors = PadRowsToDim(vectors, N, dim, build_dim);
+        build_vectors = padded_vectors.data();
+        if (config_.calibration_queries != nullptr &&
+            config_.num_calibration_queries > 0) {
+            padded_calibration_queries = PadRowsToDim(
+                config_.calibration_queries,
+                config_.num_calibration_queries,
+                dim,
+                build_dim);
+            calibration_queries = padded_calibration_queries.data();
+        }
+    }
+
     // Phase A: K-means clustering
-    auto s = RunKMeans(vectors, N, dim);
+    auto s = RunKMeans(build_vectors, N, build_dim);
     if (!s.ok()) return s;
 
     assignment_mode_ = config_.assignment_mode;
@@ -142,14 +204,18 @@ Status IvfBuilder::Build(const float* vectors, uint32_t N, Dim dim,
     rair_lambda_ = config_.rair_lambda;
     rair_strict_second_choice_ = config_.rair_strict_second_choice;
 
-    s = DeriveSecondaryAssignments(vectors, N, dim);
+    s = DeriveSecondaryAssignments(build_vectors, N, build_dim);
     if (!s.ok()) return s;
 
     // Phase B: calibrate ConANN d_k
-    CalibrateDk(vectors, N, dim);
+    const float* saved_queries = config_.calibration_queries;
+    config_.calibration_queries = calibration_queries;
+    CalibrateDk(build_vectors, N, build_dim);
+    config_.calibration_queries = saved_queries;
 
     // Phase C+D: write everything to disk
-    s = WriteIndex(vectors, N, dim, output_dir, std::move(payload_fn));
+    s = WriteIndex(vectors, build_vectors, N, build_dim, output_dir,
+                   std::move(payload_fn));
     return s;
 }
 
@@ -172,10 +238,15 @@ Status IvfBuilder::RunKMeans(const float* vectors, uint32_t N, Dim dim) {
                                    c_or.status().ToString());
         }
         auto& c = c_or.value();
-        if (c.cols != dim) {
+        if (c.cols == dim) {
+            centroids_.assign(c.data.begin(), c.data.end());
+        } else if (config_.pad_non_power_of_two_to_pow2 &&
+                   c.cols == logical_dim_ &&
+                   dim == effective_dim_) {
+            centroids_ = PadRowsToDim(c.data.data(), c.rows, c.cols, dim);
+        } else {
             return Status::InvalidArgument("Centroid dim mismatch");
         }
-        centroids_.assign(c.data.begin(), c.data.end());
 
         auto a_or = io::LoadIvecs(config_.assignments_path);
         if (!a_or.ok()) {
@@ -613,7 +684,10 @@ static float CalibrateEpsilonIp(
 // Phase C+D: Write per-cluster files + global metadata
 // ============================================================================
 
-Status IvfBuilder::WriteIndex(const float* vectors, uint32_t N, Dim dim,
+Status IvfBuilder::WriteIndex(const float* raw_vectors,
+                              const float* encoded_vectors,
+                              uint32_t N,
+                              Dim dim,
                               const std::string& output_dir,
                               PayloadFn payload_fn) {
     const uint32_t K = config_.nlist;
@@ -627,11 +701,25 @@ Status IvfBuilder::WriteIndex(const float* vectors, uint32_t N, Dim dim,
     // Matches the selection strategy in bench_vector_search and aligns
     // bench_e2e recall with the direct-memory benchmark.
     rabitq::RotationMatrix rotation(dim);
-    bool used_hadamard = (dim > 0 && (dim & (dim - 1)) == 0)
-                       && rotation.GenerateHadamard(config_.seed,
-                                                     /*use_fast_transform=*/true);
+    bool used_hadamard = false;
+    if (dim > 0 && (dim & (dim - 1)) == 0) {
+        used_hadamard = rotation.GenerateHadamard(config_.seed,
+                                                  /*use_fast_transform=*/true);
+        if (used_hadamard) {
+            rotation_mode_ = (logical_dim_ != dim) ? "hadamard_padded" : "hadamard";
+        }
+    } else if (!config_.pad_non_power_of_two_to_pow2 &&
+               config_.use_blocked_hadamard_permuted) {
+        used_hadamard = rotation.GenerateBlockedHadamardPermuted(
+            config_.seed, /*use_fast_transform=*/true);
+        if (used_hadamard) {
+            rotation_mode_ = "blocked_hadamard_permuted";
+        }
+    }
+
     if (!used_hadamard) {
         rotation.GenerateRandom(config_.seed);
+        rotation_mode_ = "random_matrix";
     }
     auto s = rotation.Save(output_dir + "/rotation.bin");
     if (!s.ok()) return s;
@@ -692,7 +780,7 @@ Status IvfBuilder::WriteIndex(const float* vectors, uint32_t N, Dim dim,
 
     // --- Phase 1: write all records into one DataFileWriter ---
     storage::DataFileWriter dat_writer;
-    s = dat_writer.Open(dat_path, 0, dim, config_.payload_schemas,
+    s = dat_writer.Open(dat_path, 0, logical_dim_, config_.payload_schemas,
                         config_.page_size);
     if (!s.ok()) return s;
 
@@ -701,7 +789,8 @@ Status IvfBuilder::WriteIndex(const float* vectors, uint32_t N, Dim dim,
     std::vector<AddressEntry> addr_by_vec_id(N);
 
     for (uint32_t idx = 0; idx < N; ++idx) {
-        const float* vec = vectors + static_cast<size_t>(idx) * dim;
+        const float* vec =
+            raw_vectors + static_cast<size_t>(idx) * logical_dim_;
         auto pl = payload_fn ? payload_fn(idx) : std::vector<Datum>{};
         s = dat_writer.WriteRecord(vec, pl, addr_by_vec_id[idx]);
         if (!s.ok()) return s;
@@ -735,7 +824,7 @@ Status IvfBuilder::WriteIndex(const float* vectors, uint32_t N, Dim dim,
         std::vector<float> member_vecs(static_cast<size_t>(n_members) * dim);
         for (uint32_t m = 0; m < n_members; ++m) {
             std::memcpy(member_vecs.data() + static_cast<size_t>(m) * dim,
-                         vectors + static_cast<size_t>(members[m]) * dim,
+                         encoded_vectors + static_cast<size_t>(members[m]) * dim,
                          dim * sizeof(float));
         }
 
@@ -751,7 +840,7 @@ Status IvfBuilder::WriteIndex(const float* vectors, uint32_t N, Dim dim,
     // Distance-error calibration: |dist_fs - dist_true| / (2·norm_oc·norm_qc).
     // Used as: margin = 2 · r_max · norm_qc · eps_ip (per-cluster, per-query).
     calibrated_eps_ip_ = CalibrateEpsilonIp(
-        all_codes, cluster_members, vectors, centroids_.data(),
+        all_codes, cluster_members, encoded_vectors, centroids_.data(),
         rotation, dim, K,
         config_.epsilon_samples, config_.epsilon_percentile, config_.seed,
         calibrated_dk_, config_.rabitq.bits);
@@ -986,6 +1075,13 @@ Status IvfBuilder::WriteIndex(const float* vectors, uint32_t N, Dim dim,
             << "  \"coarse_builder\": \"" << CoarseBuilderName(coarse_builder_used_) << "\",\n"
             << "  \"requested_metric\": \"" << config_.metric << "\",\n"
             << "  \"effective_metric\": \"" << effective_metric_ << "\",\n"
+            << "  \"logical_dim\": " << logical_dim_ << ",\n"
+            << "  \"effective_dim\": " << effective_dim_ << ",\n"
+            << "  \"padding_mode\": \"" << padding_mode_ << "\",\n"
+            << "  \"rotation_mode\": \"" << rotation_mode_ << "\",\n"
+            << "  \"rotation_seed\": " << rotation.seed() << ",\n"
+            << "  \"rotation_block_sizes\": "
+            << JsonUIntArray(rotation.block_sizes()) << ",\n"
             << "  \"nlist\": " << K << ",\n"
             << "  \"assignment_mode\": \"" << AssignmentModeName(assignment_mode_) << "\",\n"
             << "  \"assignment_factor\": " << config_.assignment_factor << ",\n"

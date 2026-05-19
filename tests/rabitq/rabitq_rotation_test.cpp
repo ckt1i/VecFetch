@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <vector>
 
@@ -204,6 +206,78 @@ TEST(RotationMatrixTest, Hadamard_DeterministicWithSeed) {
     for (Dim i = 0; i < 16 * 16; ++i) {
         EXPECT_FLOAT_EQ(P1.data()[i], P2.data()[i]);
     }
+}
+
+TEST(RotationMatrixTest, BlockedHadamardPermuted_Orthogonal) {
+    RotationMatrix P(768);
+    ASSERT_TRUE(P.GenerateBlockedHadamardPermuted(42, true));
+    EXPECT_TRUE(P.is_fast_hadamard());
+    EXPECT_TRUE(P.is_blocked_hadamard_permuted());
+    EXPECT_EQ(P.block_sizes(), (std::vector<uint32_t>{512u, 256u}));
+    AssertOrthogonal(P, 1e-4f);
+}
+
+TEST(RotationMatrixTest, BlockedHadamardPermuted_RoundTrip) {
+    RotationMatrix P(768);
+    ASSERT_TRUE(P.GenerateBlockedHadamardPermuted(7, true));
+    std::vector<float> vec(768);
+    for (int i = 0; i < 768; ++i) vec[i] = static_cast<float>(i % 17 - 8);
+    AssertRoundTrip(P, vec.data(), 1e-3f);
+}
+
+TEST(RotationMatrixTest, BlockedHadamardPermuted_DeterministicMetadata) {
+    RotationMatrix P1(768), P2(768);
+    ASSERT_TRUE(P1.GenerateBlockedHadamardPermuted(123, true));
+    ASSERT_TRUE(P2.GenerateBlockedHadamardPermuted(123, true));
+    EXPECT_EQ(P1.block_sizes(), P2.block_sizes());
+    EXPECT_EQ(P1.permutation(), P2.permutation());
+    EXPECT_EQ(P1.inverse_permutation(), P2.inverse_permutation());
+    EXPECT_EQ(P1.diagonal_signs(), P2.diagonal_signs());
+    EXPECT_EQ(P1.seed(), P2.seed());
+}
+
+TEST(RotationMatrixTest, BlockedHadamardPermuted_FastVsDense) {
+    RotationMatrix P_fast(768), P_dense(768);
+    ASSERT_TRUE(P_fast.GenerateBlockedHadamardPermuted(42, true));
+    ASSERT_TRUE(P_dense.GenerateBlockedHadamardPermuted(42, false));
+
+    std::vector<float> vec(768), out_fast(768), out_dense(768);
+    for (int i = 0; i < 768; ++i) vec[i] = std::sin(static_cast<float>(i) * 0.1f);
+    P_fast.Apply(vec.data(), out_fast.data());
+    P_dense.Apply(vec.data(), out_dense.data());
+    for (int i = 0; i < 768; ++i) {
+        EXPECT_NEAR(out_fast[i], out_dense[i], 1e-4f) << "dim " << i;
+    }
+}
+
+TEST(RotationMatrixTest, BlockedHadamardPermuted_SaveLoadRoundTrip) {
+    namespace fs = std::filesystem;
+    const fs::path tmp_path =
+        fs::temp_directory_path() / "blocked_hadamard_rotation_test.bin";
+    RotationMatrix saved(768);
+    ASSERT_TRUE(saved.GenerateBlockedHadamardPermuted(314, true));
+    ASSERT_TRUE(saved.Save(tmp_path.string()).ok());
+
+    auto loaded_or = RotationMatrix::Load(tmp_path.string(), 768);
+    ASSERT_TRUE(loaded_or.ok()) << loaded_or.status().message();
+    RotationMatrix loaded = std::move(loaded_or.value());
+
+    EXPECT_TRUE(loaded.is_blocked_hadamard_permuted());
+    EXPECT_TRUE(loaded.is_fast_hadamard());
+    EXPECT_EQ(saved.seed(), loaded.seed());
+    EXPECT_EQ(saved.block_sizes(), loaded.block_sizes());
+    EXPECT_EQ(saved.permutation(), loaded.permutation());
+    EXPECT_EQ(saved.inverse_permutation(), loaded.inverse_permutation());
+    EXPECT_EQ(saved.diagonal_signs(), loaded.diagonal_signs());
+
+    std::vector<float> vec(768), out_saved(768), out_loaded(768);
+    for (int i = 0; i < 768; ++i) vec[i] = static_cast<float>((i % 13) - 6);
+    saved.Apply(vec.data(), out_saved.data());
+    loaded.Apply(vec.data(), out_loaded.data());
+    for (int i = 0; i < 768; ++i) {
+        EXPECT_NEAR(out_saved[i], out_loaded[i], 1e-5f) << "dim " << i;
+    }
+    fs::remove(tmp_path);
 }
 
 // ===========================================================================

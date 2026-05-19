@@ -53,7 +53,8 @@ class Segment {
     /// @return Status
     Status Open(const std::string& dir,
                 const std::vector<ColumnSchema>& payload_schemas = {},
-                bool use_direct_io = false);
+                bool use_direct_io = false,
+                std::optional<Dim> raw_vector_dim = std::nullopt);
 
     /// Whether the segment is open.
     bool is_open() const { return clu_reader_.is_open(); }

@@ -885,11 +885,13 @@ int main(int argc, char* argv[]) {
             if (used_hadamard) {
                 const float* rotated_c =
                     rotated_centroids.data() + static_cast<size_t>(cid) * dim;
-                estimator.PrepareQueryRotatedInto(rotated_q.data(), rotated_c, &pq);
+                estimator.PrepareQueryRotatedInto(
+                    rotated_q.data(), rotated_c, &pq, nullptr, nullptr);
             } else {
                 const float* centroid = centroids.data() +
                     static_cast<size_t>(cid) * dim;
-                estimator.PrepareQueryInto(q_vec, centroid, rotation, &pq);
+                estimator.PrepareQueryInto(
+                    q_vec, centroid, rotation, &pq, nullptr, nullptr);
             }
             float margin_factor = 2.0f * pq.norm_qc * active_eps_ip;
 

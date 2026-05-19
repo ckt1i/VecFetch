@@ -12,6 +12,12 @@
 namespace vdb {
 namespace rabitq {
 
+enum class RotationKind : uint8_t {
+    RandomMatrix = 0,
+    Hadamard = 1,
+    BlockedHadamardPermuted = 2,
+};
+
 // ============================================================================
 // RotationMatrix — stores a L×L orthogonal matrix P for RaBitQ
 // ============================================================================
@@ -44,7 +50,8 @@ class RotationMatrix {
  public:
     /// Default-construct an empty rotation (dim=0).
     /// Required by StatusOr&lt;RotationMatrix&gt;; not useful on its own.
-    RotationMatrix() : dim_(0), use_fast_hadamard_(false) {}
+    RotationMatrix() : dim_(0), kind_(RotationKind::RandomMatrix),
+                       use_fast_hadamard_(false) {}
 
     /// Construct an uninitialized rotation for dimension `dim`.
     /// Call GenerateRandom() or GenerateHadamard() to populate.
@@ -89,6 +96,19 @@ class RotationMatrix {
     /// @return true on success, false if dim is not power-of-2
     bool GenerateHadamard(uint64_t seed = 0, bool use_fast_transform = true);
 
+    /// Generate a blocked Hadamard rotation for non-power-of-two dimensions.
+    ///
+    /// The generated rotation is deterministic for a fixed `(dim, seed)` and
+    /// consists of:
+    ///   1. A global permutation of dimensions.
+    ///   2. A greedy descending power-of-two block partition.
+    ///   3. Per-block Hadamard-diagonal transforms.
+    ///
+    /// The dense matrix is still materialized in `data_` for compatibility,
+    /// while Apply/ApplyInverse can use the blocked fast path.
+    bool GenerateBlockedHadamardPermuted(uint64_t seed = 0,
+                                         bool use_fast_transform = true);
+
     /// Apply the rotation: out = P^T × in (forward rotation for encoding).
     ///
     /// This computes P^{-1} × in = P^T × in since P is orthogonal.
@@ -117,10 +137,20 @@ class RotationMatrix {
 
     /// Whether this rotation uses the fast Hadamard transform path.
     bool is_fast_hadamard() const { return use_fast_hadamard_; }
+    RotationKind kind() const { return kind_; }
+    bool is_blocked_hadamard_permuted() const {
+        return kind_ == RotationKind::BlockedHadamardPermuted;
+    }
+    uint64_t seed() const { return seed_; }
 
     /// Random diagonal signs for Hadamard mode (length = dim).
-    /// Only valid after GenerateHadamard().
+    /// Valid after GenerateHadamard() and GenerateBlockedHadamardPermuted().
     const std::vector<int8_t>& diagonal_signs() const { return diag_signs_; }
+    const std::vector<uint32_t>& block_sizes() const { return block_sizes_; }
+    const std::vector<uint32_t>& permutation() const { return permutation_; }
+    const std::vector<uint32_t>& inverse_permutation() const {
+        return inverse_permutation_;
+    }
 
     /// Save the rotation matrix to a binary file.
     ///
@@ -141,8 +171,13 @@ class RotationMatrix {
  private:
     Dim dim_;
     std::vector<float> data_;        // Row-major P[dim × dim]
+    RotationKind kind_ = RotationKind::RandomMatrix;
     bool use_fast_hadamard_ = false; // Whether Apply() uses FWHT
     std::vector<int8_t> diag_signs_; // ±1 diagonal for Hadamard mode
+    std::vector<uint32_t> block_sizes_;
+    std::vector<uint32_t> permutation_;
+    std::vector<uint32_t> inverse_permutation_;
+    uint64_t seed_ = 0;
 };
 
 }  // namespace rabitq

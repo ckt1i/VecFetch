@@ -23,7 +23,7 @@ DataFileWriter::~DataFileWriter() {
 
 Status DataFileWriter::Open(const std::string& path,
                              uint32_t cluster_id,
-                             Dim dim,
+                             Dim raw_dim,
                              const std::vector<ColumnSchema>& payload_schemas,
                              uint32_t page_size) {
     if (file_.is_open()) {
@@ -32,7 +32,7 @@ Status DataFileWriter::Open(const std::string& path,
 
     path_ = path;
     cluster_id_ = cluster_id;
-    dim_ = dim;
+    dim_ = raw_dim;
     payload_schemas_ = payload_schemas;
     page_size_ = page_size;
     current_offset_ = 0;
@@ -70,7 +70,7 @@ Status DataFileWriter::WriteRecord(const float* vec,
 
     out_entry.offset = current_offset_;
 
-    // Write raw vector: dim × sizeof(float) bytes
+    // Write raw vector: raw_dim × sizeof(float) bytes
     const uint32_t vec_bytes = dim_ * sizeof(float);
     file_.write(reinterpret_cast<const char*>(vec), vec_bytes);
     if (!file_.good()) {

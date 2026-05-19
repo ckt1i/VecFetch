@@ -813,6 +813,64 @@ void AccumulateBlock(const uint8_t* VDB_RESTRICT packed_codes,
 // FastScanSafeOutMask — batch SafeOut classification for one FastScan block
 // ============================================================================
 
+uint32_t FastScanSafeInMask(const float* VDB_RESTRICT dists,
+                             const float* VDB_RESTRICT block_norms,
+                             uint32_t count,
+                             float safein_threshold_base,
+                             float margin_factor) {
+#if defined(VDB_USE_AVX512)
+    const __m512 v_mfac = _mm512_set1_ps(2.0f * margin_factor);
+    const __m512 v_base = _mm512_set1_ps(safein_threshold_base);
+    uint32_t result = 0;
+    for (uint32_t base = 0; base < count; base += 16) {
+        const uint32_t valid = std::min<uint32_t>(16u, count - base);
+        const __mmask16 lane_mask = (valid >= 16)
+            ? __mmask16(0xFFFF)
+            : __mmask16((1u << valid) - 1u);
+        const __m512 v_dists = (valid >= 16)
+            ? _mm512_loadu_ps(dists + base)
+            : _mm512_maskz_loadu_ps(lane_mask, dists + base);
+        const __m512 v_norms = (valid >= 16)
+            ? _mm512_loadu_ps(block_norms + base)
+            : _mm512_maskz_loadu_ps(lane_mask, block_norms + base);
+        const __m512 v_thresh = _mm512_sub_ps(
+            v_base, _mm512_mul_ps(v_mfac, v_norms));
+        const __mmask16 mask = _mm512_mask_cmp_ps_mask(
+            lane_mask, v_dists, v_thresh, _CMP_LT_OQ);
+        result |= static_cast<uint32_t>(mask) << base;
+    }
+    return result;
+#elif defined(VDB_USE_AVX2)
+    const __m256 v_mfac = _mm256_set1_ps(2.0f * margin_factor);
+    const __m256 v_base = _mm256_set1_ps(safein_threshold_base);
+    uint32_t result = 0;
+    for (uint32_t base = 0; base < count; base += 8) {
+        const uint32_t valid = std::min<uint32_t>(8u, count - base);
+        const __m256 v_dists = _mm256_loadu_ps(dists + base);
+        const __m256 v_norms = _mm256_loadu_ps(block_norms + base);
+        const __m256 v_thresh = _mm256_sub_ps(
+            v_base, _mm256_mul_ps(v_mfac, v_norms));
+        uint32_t mask = static_cast<uint32_t>(
+            _mm256_movemask_ps(_mm256_cmp_ps(v_dists, v_thresh, _CMP_LT_OQ)));
+        if (valid < 8) {
+            mask &= ((1u << valid) - 1u);
+        }
+        result |= mask << base;
+    }
+    return result;
+#else
+    uint32_t result = 0;
+    const float threshold_mul = 2.0f * margin_factor;
+    for (uint32_t v = 0; v < count; ++v) {
+        const float threshold = safein_threshold_base - threshold_mul * block_norms[v];
+        if (dists[v] < threshold) {
+            result |= 1u << v;
+        }
+    }
+    return result;
+#endif
+}
+
 uint32_t FastScanSafeOutMask(const float* VDB_RESTRICT dists,
                               const float* VDB_RESTRICT block_norms,
                               uint32_t count,

@@ -42,7 +42,7 @@ DataFileReader& DataFileReader::operator=(DataFileReader&& other) noexcept {
 // ============================================================================
 
 Status DataFileReader::Open(const std::string& path,
-                             Dim dim,
+                             Dim raw_dim,
                              const std::vector<ColumnSchema>& payload_schemas,
                              bool use_direct_io) {
     if (fd_ >= 0) {
@@ -57,7 +57,7 @@ Status DataFileReader::Open(const std::string& path,
     }
 
     path_ = path;
-    dim_ = dim;
+    dim_ = raw_dim;
     payload_schemas_ = payload_schemas;
 
     return Status::OK();

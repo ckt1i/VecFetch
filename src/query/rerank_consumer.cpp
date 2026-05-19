@@ -7,12 +7,13 @@
 #include <unordered_set>
 
 #include "vdb/common/distance.h"
+#include "vdb/simd/rerank_distance.h"
 
 namespace vdb {
 namespace query {
 
-RerankConsumer::RerankConsumer(SearchContext& ctx, Dim dim)
-    : ctx_(ctx), dim_(dim), vec_bytes_(dim * sizeof(float)) {}
+RerankConsumer::RerankConsumer(SearchContext& ctx, Dim raw_dim)
+    : ctx_(ctx), dim_(raw_dim), vec_bytes_(raw_dim * sizeof(float)) {}
 
 RerankConsumer::~RerankConsumer() = default;
 
@@ -102,12 +103,32 @@ void RerankConsumer::ExecuteBuffered() {
         std::chrono::steady_clock::now() - read_start).count();
 
     auto compute_start = std::chrono::steady_clock::now();
-    for (const auto& candidate : buffered_candidates_) {
-        const float* vec = reinterpret_cast<const float*>(candidate.vec_buf.get());
-        float dist = L2Sqr(ctx_.query_vec(), vec, dim_);
-        ctx_.collector().TryInsert(dist, candidate.addr);
-        ctx_.stats().total_reranked++;
-        ctx_.stats().reranked_candidates++;
+    if (ctx_.config().enable_rerank_batched_distance_simd) {
+        const uint32_t count = static_cast<uint32_t>(buffered_candidates_.size());
+        constexpr uint32_t kBatchSize = 32;
+        for (uint32_t base = 0; base < count; base += kBatchSize) {
+            const uint32_t batch_count = std::min(kBatchSize, count - base);
+            const float* vec_ptrs[kBatchSize] = {};
+            float dists[kBatchSize] = {};
+            for (uint32_t i = 0; i < batch_count; ++i) {
+                vec_ptrs[i] = reinterpret_cast<const float*>(
+                    buffered_candidates_[base + i].vec_buf.get());
+            }
+            simd::L2SqrBatch1xN(ctx_.query_vec(), vec_ptrs, batch_count, dim_, dists);
+            for (uint32_t i = 0; i < batch_count; ++i) {
+                ctx_.collector().TryInsert(dists[i], buffered_candidates_[base + i].addr);
+                ctx_.stats().total_reranked++;
+                ctx_.stats().reranked_candidates++;
+            }
+        }
+    } else {
+        for (const auto& candidate : buffered_candidates_) {
+            const float* vec = reinterpret_cast<const float*>(candidate.vec_buf.get());
+            float dist = L2Sqr(ctx_.query_vec(), vec, dim_);
+            ctx_.collector().TryInsert(dist, candidate.addr);
+            ctx_.stats().total_reranked++;
+            ctx_.stats().reranked_candidates++;
+        }
     }
     ctx_.stats().rerank_compute_ms += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - compute_start).count();

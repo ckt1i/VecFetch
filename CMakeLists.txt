@@ -190,6 +190,10 @@ add_library(vdb_simd STATIC
     src/simd/prepare_query.cpp
     src/simd/hadamard.cpp
     src/simd/signed_dot.cpp
+    src/simd/stage2_classify.cpp
+    src/simd/address_decode.cpp
+    src/simd/rerank_distance.cpp
+    src/simd/coarse_select.cpp
 )
 target_include_directories(vdb_simd PUBLIC
     $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>

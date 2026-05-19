@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +16,8 @@ namespace query {
 
 namespace {
 constexpr double kLowOverheadStage2Weight = 1.0;
+constexpr uint32_t kSubmitIntervalLimit = 4;
+constexpr uint32_t kSubmitTailMinBatch = 8;
 
 inline size_t NextPowerOfTwo(size_t value) {
     size_t result = 1;
@@ -95,7 +98,7 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
       isolated_submission_mode_(&cluster_reader != &data_reader ||
                                 config.submission_mode == SubmissionMode::Isolated),
       config_(config),
-      vec_bytes_(index.dim() * sizeof(float)),
+      vec_bytes_(index.logical_dim() * sizeof(float)),
       est_top_k_(config.top_k),
       use_crc_(config.crc_params != nullptr),
       estimator_(index.dim(), index.segment().rabitq_config().bits),
@@ -103,6 +106,9 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
               index.segment().rabitq_config().bits) {
     if (index.used_hadamard()) {
         query_wrapper_.rotated_q.resize(index.dim());
+    }
+    if (index.logical_dim() != index.dim()) {
+        query_wrapper_.padded_q.resize(index.dim(), 0.0f);
     }
     query_wrapper_.scratch.quant_query.reserve(index.dim());
     query_wrapper_.scratch.fastscan_lut.reserve(static_cast<size_t>(index.dim()) * 8 + 63);
@@ -143,6 +149,13 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     est_heap_.clear();
 
     auto t_search_start = std::chrono::steady_clock::now();
+    const float* effective_query_vec = query_vec;
+    if (index_.logical_dim() != index_.dim()) {
+        std::fill(query_wrapper_.padded_q.begin(), query_wrapper_.padded_q.end(), 0.0f);
+        std::memcpy(query_wrapper_.padded_q.data(), query_vec,
+                    static_cast<size_t>(index_.logical_dim()) * sizeof(float));
+        effective_query_vec = query_wrapper_.padded_q.data();
+    }
 
     if (config_.use_resident_clusters) {
         if (!index_.segment().resident_preload_enabled()) {
@@ -162,13 +175,18 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
         }
     }
 
+    index_.SetUseCoarseSelectSimd(config_.enable_coarse_select_simd);
+    index_.SetUseCoarseSelectPhase2(config_.enable_coarse_select_phase2);
+    SearchContext ctx(effective_query_vec, config_);
     // Phase 1.3: precompute P^T × query once when Hadamard rotation is used
     if (index_.used_hadamard()) {
-        index_.rotation().Apply(query_vec, query_wrapper_.rotated_q.data());
+        auto t_rot0 = std::chrono::steady_clock::now();
+        index_.rotation().Apply(effective_query_vec, query_wrapper_.rotated_q.data());
+        ctx.stats().probe_prepare_rotation_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_rot0).count();
     }
-
-    SearchContext ctx(query_vec, config_);
-    RerankConsumer reranker(ctx, index_.dim());
+    RerankConsumer reranker(ctx, index_.logical_dim());
 
     auto coarse_start = std::chrono::steady_clock::now();
     auto sorted_clusters = index_.FindNearestClusters(
@@ -899,9 +917,12 @@ void OverlapScheduler::ProbeCluster(
         std::chrono::steady_clock::now() - prepare_start).count();
     if (config_.enable_fine_grained_timing) {
         ctx.stats().probe_prepare_subtract_ms += prep_timing.subtract_norm_ms;
+        ctx.stats().probe_prepare_rotation_ms += prep_timing.rotation_ms;
         ctx.stats().probe_prepare_normalize_ms += prep_timing.normalize_sign_sum_maxabs_ms;
         ctx.stats().probe_prepare_quantize_ms += prep_timing.quantize_ms;
         ctx.stats().probe_prepare_lut_build_ms += prep_timing.lut_build_ms;
+        ctx.stats().probe_prepare_quant_lut_ms +=
+            prep_timing.quantize_ms + prep_timing.lut_build_ms;
     }
 
     // dynamic_d_k:
@@ -918,7 +939,11 @@ void OverlapScheduler::ProbeCluster(
     index::ProbeStats local_stats;
     auto classify_start = std::chrono::steady_clock::now();
     prober_.Probe(pc, prepared, prepared.margin_factor, dynamic_d_k,
-                  config_.enable_fine_grained_timing, sink, local_stats);
+                  config_.enable_address_decode_simd,
+                  config_.enable_fine_grained_timing,
+                  config_.enable_stage2_collect_block_first,
+                  config_.enable_stage2_scatter_batch_classify,
+                  sink, local_stats);
     const double classify_wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - classify_start).count();
     if (config_.enable_fine_grained_timing) {
@@ -978,7 +1003,6 @@ void OverlapScheduler::ProbeCluster(
 void OverlapScheduler::ProbeAndDrainInterleaved(
     SearchContext& ctx, RerankConsumer& reranker,
     const std::vector<ClusterID>& sorted_clusters) {
-    static constexpr uint32_t kCrossClusterSubmitInterval = 4;
     static constexpr uint32_t kPendingRequestFlushThreshold = 32;
 
     std::vector<IoCompletion> comps(128);
@@ -995,6 +1019,7 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
         vec_flush_threshold = std::min(vec_flush_threshold, capacity_for_vec);
     }
     uint32_t clusters_since_data_submit = 0;
+    float ema_req_per_cluster = static_cast<float>(vec_flush_threshold);
     auto record_submit = [&](AsyncReader& reader) {
         auto ts0 = std::chrono::steady_clock::now();
         uint32_t submitted = reader.Submit();
@@ -1022,9 +1047,10 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
         }
     };
 
-    auto flush_shared_reader = [&](bool force, bool prioritize_cluster_reads) {
+    auto flush_shared_reader = [&](bool force,
+                                  bool prioritize_cluster_reads,
+                                  bool vec_batch_ready) {
         if (cluster_reader_.prepped() == 0) return;
-        const bool vec_batch_ready = cluster_reader_.prepped() >= vec_flush_threshold;
         if (!force && !prioritize_cluster_reads && !vec_batch_ready) return;
         record_submit(cluster_reader_);
     };
@@ -1039,6 +1065,131 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
         if (data_reader_.prepped() > 0 &&
             (force || vec_batch_ready)) {
             record_submit(data_reader_);
+        }
+    };
+
+    enum class PendingFlushReason : uint8_t {
+        Hard,
+        Soft,
+        Tail,
+        StopSensitive,
+        Final,
+    };
+
+    auto emit_pending_with_reason = [&](PendingFlushReason reason) {
+        const uint32_t pending = PendingDataRequestCount();
+        if (pending == 0) return false;
+        EmitPendingDataRequests(ctx, pending);
+        ctx.stats().total_submit_window_flushes++;
+        if (reason == PendingFlushReason::Tail ||
+            reason == PendingFlushReason::Final) {
+            ctx.stats().total_submit_window_tail_flushes++;
+        }
+        if (reason == PendingFlushReason::StopSensitive) {
+            ctx.stats().total_submit_stop_flushes++;
+        }
+        return true;
+    };
+
+    auto force_flush_and_submit = [&](PendingFlushReason reason) {
+        const bool emitted = emit_pending_with_reason(reason);
+        if (isolated_submission_mode_) {
+            flush_isolated_readers(/*force=*/true,
+                                   /*prioritize_cluster_reads=*/false,
+                                   /*vec_batch_ready=*/true);
+        } else {
+            flush_shared_reader(/*force=*/true,
+                                /*prioritize_cluster_reads=*/false,
+                                /*vec_batch_ready=*/true);
+        }
+        return emitted;
+    };
+
+    auto stop_safe_flush = [&]() {
+        force_flush_and_submit(PendingFlushReason::StopSensitive);
+    };
+
+    auto apply_submit_policy = [&](bool prepared_cluster_reads,
+                                   bool final_cluster,
+                                   bool stop_sensitive,
+                                   uint32_t remaining_clusters) {
+        if (stop_sensitive) {
+            stop_safe_flush();
+            if (prepared_cluster_reads) {
+                if (isolated_submission_mode_) {
+                    flush_isolated_readers(/*force=*/true,
+                                           /*prioritize_cluster_reads=*/true,
+                                           /*vec_batch_ready=*/true);
+                } else {
+                    flush_shared_reader(/*force=*/true,
+                                        /*prioritize_cluster_reads=*/true,
+                                        /*vec_batch_ready=*/true);
+                }
+            }
+            clusters_since_data_submit = 0;
+            return;
+        }
+
+        const uint32_t pending = PendingDataRequestCount();
+        uint32_t dynamic_flush_threshold = vec_flush_threshold;
+        uint32_t dynamic_interval_limit = kSubmitIntervalLimit;
+        if (config_.enable_online_submit_tuning) {
+            const uint32_t tuned = static_cast<uint32_t>(std::lround(
+                2.0f * std::max(1.0f, ema_req_per_cluster)));
+            dynamic_flush_threshold = std::clamp(
+                tuned, config_.submit_batch_min, config_.submit_batch_max);
+            if (config_.io_queue_depth > 0) {
+                const uint32_t capacity_for_vec =
+                    std::max(1u, config_.io_queue_depth - reserve_slots);
+                dynamic_flush_threshold =
+                    std::min(dynamic_flush_threshold, capacity_for_vec);
+            }
+            if (ema_req_per_cluster < 8.0f) {
+                dynamic_interval_limit = 2;
+            } else if (ema_req_per_cluster < 16.0f) {
+                dynamic_interval_limit = 3;
+            }
+        }
+        const bool hard_flush =
+            pending >= kPendingRequestFlushThreshold;
+        const bool soft_flush = pending >= dynamic_flush_threshold;
+        const bool likely_cannot_fill_next_batch =
+            config_.enable_online_submit_tuning &&
+            pending > 0 &&
+            (static_cast<float>(pending) +
+             ema_req_per_cluster * static_cast<float>(remaining_clusters) <
+             static_cast<float>(dynamic_flush_threshold));
+        const bool tail_flush =
+            (final_cluster && pending > 0) ||
+            (pending >= kSubmitTailMinBatch &&
+             clusters_since_data_submit >= dynamic_interval_limit &&
+             likely_cannot_fill_next_batch);
+
+        bool emitted = false;
+        if (hard_flush) {
+            emitted = emit_pending_with_reason(PendingFlushReason::Hard);
+        } else if (soft_flush) {
+            emitted = emit_pending_with_reason(PendingFlushReason::Soft);
+        } else if (tail_flush) {
+            emitted = emit_pending_with_reason(PendingFlushReason::Tail);
+        }
+
+        if (isolated_submission_mode_) {
+            const bool vec_batch_ready = hard_flush || soft_flush || tail_flush;
+            flush_isolated_readers(/*force=*/hard_flush || final_cluster,
+                                   /*prioritize_cluster_reads=*/prepared_cluster_reads,
+                                   vec_batch_ready);
+            if (emitted && data_reader_.prepped() == 0) {
+                clusters_since_data_submit = 0;
+            }
+        } else {
+            const bool force_submit = hard_flush || final_cluster;
+            flush_shared_reader(/*force=*/force_submit,
+                                /*prioritize_cluster_reads=*/prepared_cluster_reads,
+                                /*vec_batch_ready=*/hard_flush || soft_flush || tail_flush);
+            if (emitted && cluster_reader_.prepped() == 0) {
+                clusters_since_data_submit = 0;
+            }
         }
     };
 
@@ -1058,11 +1209,7 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
             // 1. Wait until target cluster is ready (consuming other CQEs meanwhile).
             while (ready_clusters_.find(cid) == ready_clusters_.end()) {
                 if (isolated_submission_mode_) {
-                    if (PendingDataRequestCount() > 0) {
-                        EmitPendingDataRequests(ctx, PendingDataRequestCount());
-                        ctx.stats().total_submit_window_flushes++;
-                        ctx.stats().total_submit_window_tail_flushes++;
-                    }
+                    emit_pending_with_reason(PendingFlushReason::Final);
                     flush_isolated_readers(/*force=*/true,
                                            /*prioritize_cluster_reads=*/false,
                                            /*vec_batch_ready=*/true);
@@ -1073,13 +1220,10 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
                     }
                     drain_completions(data_reader_, /*wait_for_one=*/false);
                 } else {
-                    if (PendingDataRequestCount() > 0) {
-                        EmitPendingDataRequests(ctx, PendingDataRequestCount());
-                        ctx.stats().total_submit_window_flushes++;
-                        ctx.stats().total_submit_window_tail_flushes++;
-                    }
+                    emit_pending_with_reason(PendingFlushReason::Final);
                     flush_shared_reader(/*force=*/true,
-                                        /*prioritize_cluster_reads=*/false);
+                                        /*prioritize_cluster_reads=*/false,
+                                        /*vec_batch_ready=*/true);
                     drain_completions(cluster_reader_, /*wait_for_one=*/true);
                 }
             }
@@ -1100,6 +1244,7 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
         // Early stop
         if (config_.early_stop) {
             if (use_crc_) {
+                stop_safe_flush();
                 // CRC early stop: use RaBitQ estimate heap distance
                 float est_kth = (est_heap_.size() >= est_top_k_)
                     ? est_heap_.front().first
@@ -1117,23 +1262,12 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
                             static_cast<uint32_t>(sorted_clusters.size() - 1 - i);
                         ctx.stats().crc_clusters_probed =
                             static_cast<uint32_t>(i + 1);
+                        stop_safe_flush();
                         if (isolated_submission_mode_) {
-                            if (PendingDataRequestCount() > 0) {
-                                EmitPendingDataRequests(ctx, PendingDataRequestCount());
-                                ctx.stats().total_submit_window_flushes++;
-                                ctx.stats().total_submit_window_tail_flushes++;
-                            }
-                            flush_isolated_readers(/*force=*/true,
-                                                   /*prioritize_cluster_reads=*/false,
-                                                   /*vec_batch_ready=*/true);
+                            drain_completions(data_reader_, /*wait_for_one=*/false);
+                            drain_completions(cluster_reader_, /*wait_for_one=*/false);
                         } else {
-                            if (PendingDataRequestCount() > 0) {
-                                EmitPendingDataRequests(ctx, PendingDataRequestCount());
-                                ctx.stats().total_submit_window_flushes++;
-                                ctx.stats().total_submit_window_tail_flushes++;
-                            }
-                            flush_shared_reader(/*force=*/true,
-                                                /*prioritize_cluster_reads=*/false);
+                            drain_completions(cluster_reader_, /*wait_for_one=*/false);
                         }
                         break;
                     }
@@ -1145,23 +1279,12 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
                     ctx.stats().early_stopped = true;
                     ctx.stats().clusters_skipped =
                         static_cast<uint32_t>(sorted_clusters.size() - 1 - i);
+                    stop_safe_flush();
                     if (isolated_submission_mode_) {
-                        if (PendingDataRequestCount() > 0) {
-                            EmitPendingDataRequests(ctx, PendingDataRequestCount());
-                            ctx.stats().total_submit_window_flushes++;
-                            ctx.stats().total_submit_window_tail_flushes++;
-                        }
-                        flush_isolated_readers(/*force=*/true,
-                                               /*prioritize_cluster_reads=*/false,
-                                               /*vec_batch_ready=*/true);
+                        drain_completions(data_reader_, /*wait_for_one=*/false);
+                        drain_completions(cluster_reader_, /*wait_for_one=*/false);
                     } else {
-                        if (PendingDataRequestCount() > 0) {
-                            EmitPendingDataRequests(ctx, PendingDataRequestCount());
-                            ctx.stats().total_submit_window_flushes++;
-                            ctx.stats().total_submit_window_tail_flushes++;
-                        }
-                        flush_shared_reader(/*force=*/true,
-                                            /*prioritize_cluster_reads=*/false);
+                        drain_completions(cluster_reader_, /*wait_for_one=*/false);
                     }
                     break;
                 }
@@ -1187,66 +1310,30 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
                 prepared_cluster_reads = refill > 0;
             }
         }
-
-        if (isolated_submission_mode_) {
-            const bool vec_batch_ready =
-                PendingDataRequestCount() >= vec_flush_threshold ||
-                PendingDataRequestCount() >= kPendingRequestFlushThreshold ||
-                (clusters_since_data_submit >= kCrossClusterSubmitInterval &&
-                 PendingDataRequestCount() >= vec_flush_threshold);
-            if (vec_batch_ready && PendingDataRequestCount() > 0) {
-                EmitPendingDataRequests(ctx, PendingDataRequestCount());
-                ctx.stats().total_submit_window_flushes++;
-                if (clusters_since_data_submit >= kCrossClusterSubmitInterval &&
-                    PendingDataRequestCount() < kPendingRequestFlushThreshold) {
-                    ctx.stats().total_submit_window_tail_flushes++;
-                }
-            }
-            flush_isolated_readers(/*force=*/false,
-                                   /*prioritize_cluster_reads=*/prepared_cluster_reads,
-                                   vec_batch_ready);
-            if (vec_batch_ready && data_reader_.prepped() == 0) {
-                clusters_since_data_submit = 0;
-            }
-        } else {
-            const bool force_submit =
-                PendingDataRequestCount() >= kPendingRequestFlushThreshold ||
-                (clusters_since_data_submit >= kCrossClusterSubmitInterval &&
-                 PendingDataRequestCount() >= vec_flush_threshold);
-            if ((force_submit || prepared_cluster_reads) &&
-                PendingDataRequestCount() > 0) {
-                EmitPendingDataRequests(ctx, PendingDataRequestCount());
-                ctx.stats().total_submit_window_flushes++;
-                if (clusters_since_data_submit >= kCrossClusterSubmitInterval &&
-                    PendingDataRequestCount() < kPendingRequestFlushThreshold) {
-                    ctx.stats().total_submit_window_tail_flushes++;
-                }
-            }
-            flush_shared_reader(/*force=*/force_submit,
-                                /*prioritize_cluster_reads=*/prepared_cluster_reads);
-            if (force_submit && cluster_reader_.prepped() == 0) {
-                clusters_since_data_submit = 0;
-            }
+        const bool final_cluster = (i + 1 == sorted_clusters.size());
+        const uint32_t pending_before_policy = PendingDataRequestCount();
+        apply_submit_policy(prepared_cluster_reads,
+                            final_cluster,
+                            /*stop_sensitive=*/false,
+                            static_cast<uint32_t>(sorted_clusters.size() - 1 - i));
+        if (config_.enable_online_submit_tuning) {
+            const float alpha = std::clamp(config_.submit_ema_alpha, 0.0f, 1.0f);
+            ema_req_per_cluster =
+                (1.0f - alpha) * ema_req_per_cluster +
+                alpha * static_cast<float>(pending_before_policy);
         }
     }
 
     if (isolated_submission_mode_) {
-        if (PendingDataRequestCount() > 0) {
-            EmitPendingDataRequests(ctx, PendingDataRequestCount());
-            ctx.stats().total_submit_window_flushes++;
-            ctx.stats().total_submit_window_tail_flushes++;
-        }
+        emit_pending_with_reason(PendingFlushReason::Final);
         flush_isolated_readers(/*force=*/true,
                                /*prioritize_cluster_reads=*/false,
                                /*vec_batch_ready=*/true);
     } else {
-        if (PendingDataRequestCount() > 0) {
-            EmitPendingDataRequests(ctx, PendingDataRequestCount());
-            ctx.stats().total_submit_window_flushes++;
-            ctx.stats().total_submit_window_tail_flushes++;
-        }
-        flush_shared_reader(/*force=*/true,
-                            /*prioritize_cluster_reads=*/false);
+        emit_pending_with_reason(PendingFlushReason::Final);
+            flush_shared_reader(/*force=*/true,
+                                /*prioritize_cluster_reads=*/false,
+                                /*vec_batch_ready=*/true);
     }
 }
 

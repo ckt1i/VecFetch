@@ -374,7 +374,7 @@ TEST_F(ClusterStoreTest, Reader_LoadCodes_Batch_Bits4Roundtrip) {
         ASSERT_FALSE(codes[idx].code.empty());
         EXPECT_EQ(out_codes[i].code[0], codes[idx].code[0]);
         EXPECT_EQ(out_codes[i].ex_code, codes[idx].ex_code);
-        EXPECT_EQ(out_codes[i].ex_sign, codes[idx].ex_sign);
+        EXPECT_EQ(out_codes[i].ex_sign_packed, codes[idx].ex_sign_packed);
         EXPECT_FLOAT_EQ(out_codes[i].xipnorm, codes[idx].xipnorm);
 
         const auto addr = reader.GetAddress(0, idx);
@@ -1137,7 +1137,7 @@ TEST_F(ClusterStoreTest, ParseClusterBlock_Bits4MatchesLoadedData) {
         EXPECT_TRUE(std::equal(ex_view.code_abs, ex_view.code_abs + dim,
                                loaded[0].ex_code.begin()));
         EXPECT_TRUE(std::equal(ex_view.sign, ex_view.sign + dim,
-                               loaded[0].ex_sign.begin()));
+                               loaded[0].ex_sign_packed.begin()));
         EXPECT_FLOAT_EQ(ex_view.xipnorm, loaded[0].xipnorm);
         EXPECT_EQ(parsed.decoded_addresses[i].offset, addrs[i].offset);
         EXPECT_EQ(parsed.decoded_addresses[i].size, addrs[i].size);

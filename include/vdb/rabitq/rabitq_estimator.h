@@ -66,6 +66,7 @@ struct PreparedClusterQueryView {
 
 struct PrepareTimingBreakdown {
     double subtract_norm_ms = 0;
+    double rotation_ms = 0;
     double normalize_sign_sum_maxabs_ms = 0;
     double quantize_ms = 0;
     double lut_build_ms = 0;

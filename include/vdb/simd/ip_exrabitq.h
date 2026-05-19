@@ -31,6 +31,14 @@ float IPExRaBitQ(const float* VDB_RESTRICT query,
                  bool sign_packed,
                  Dim dim);
 
+/// Backward-compatible overload for legacy un-packed sign payloads.
+VDB_FORCE_INLINE float IPExRaBitQ(const float* VDB_RESTRICT query,
+                                  const uint8_t* VDB_RESTRICT code_abs,
+                                  const uint8_t* VDB_RESTRICT sign,
+                                  Dim dim) {
+    return IPExRaBitQ(query, code_abs, sign, false, dim);
+}
+
 /// Packed-sign specialized Stage2 kernel for v10 serving path.
 float IPExRaBitQPackedSign(const float* VDB_RESTRICT query,
                            const uint8_t* VDB_RESTRICT code_abs,

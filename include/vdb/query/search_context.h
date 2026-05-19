@@ -48,11 +48,20 @@ struct SearchConfig {
     const index::CalibrationResults* crc_params = nullptr;
     bool crc_no_break = false;  // experiment mode: evaluate CRC but never break
 
-    // Submit batching: Submit when prepped() SQEs reach N (0 = submit every probe, original behavior).
-    // NOTE: For workloads with many vec reads per cluster (e.g., ~26 reads/cluster with SQ depth=64),
-    // batching shifts overhead from uring_submit_ms to uring_prep_ms (auto-flush inside PrepRead)
-    // without reducing total latency. Keep at 0 unless SQ depth is increased significantly.
-    uint32_t submit_batch_size = 16;
+    // Submit batching: submit when pending vec requests reach N.
+    // `0` preserves the legacy "submit on pressure/final drain" behavior.
+    uint32_t submit_batch_size = 32;
+    bool enable_online_submit_tuning = false;
+    float submit_ema_alpha = 0.25f;
+    uint32_t submit_batch_min = 16;
+    uint32_t submit_batch_max = 48;
+
+    bool enable_address_decode_simd = true;
+    bool enable_rerank_batched_distance_simd = true;
+    bool enable_coarse_select_simd = true;
+    bool enable_coarse_select_phase2 = false;
+    bool enable_stage2_collect_block_first = true;
+    bool enable_stage2_scatter_batch_classify = true;
 };
 
 struct SearchStats {
@@ -68,6 +77,7 @@ struct SearchStats {
     uint32_t total_submit_calls = 0;
     uint32_t total_submit_window_flushes = 0;
     uint32_t total_submit_window_tail_flushes = 0;
+    uint32_t total_submit_stop_flushes = 0;
     uint32_t total_submit_window_requests = 0;
     uint32_t total_candidate_batches = 0;
     uint32_t total_crc_estimates_buffered = 0;
@@ -88,10 +98,12 @@ struct SearchStats {
     double coarse_topn_ms = 0;
     double probe_time_ms = 0;
     double probe_prepare_ms = 0;
+    double probe_prepare_rotation_ms = 0;
     double probe_prepare_subtract_ms = 0;
     double probe_prepare_normalize_ms = 0;
     double probe_prepare_quantize_ms = 0;
     double probe_prepare_lut_build_ms = 0;
+    double probe_prepare_quant_lut_ms = 0;
     double probe_stage1_ms = 0;
     double probe_stage1_estimate_ms = 0;
     double probe_stage1_mask_ms = 0;

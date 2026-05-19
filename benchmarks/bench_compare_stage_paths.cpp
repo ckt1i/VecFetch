@@ -304,8 +304,10 @@ int main(int argc, char* argv[]) {
             CollectSink sink_b;
             index::ProbeStats stats_a;
             index::ProbeStats stats_b;
-            prober_a.Probe(*cpa, va, mf_a, dyn_a, false, sink_a, stats_a);
-            prober_b.Probe(*cpb, vb, mf_b, dyn_b, false, sink_b, stats_b);
+            prober_a.Probe(*cpa, va, mf_a, dyn_a,
+                           false, false, false, false, sink_a, stats_a);
+            prober_b.Probe(*cpb, vb, mf_b, dyn_b,
+                           false, false, false, false, sink_b, stats_b);
             if (sink_a.est_dists.size() != sink_b.est_dists.size()) {
                 std::printf("CRC_PROBE_DIFF rank=%d cid=%u dyn(a,b)=%.9f,%.9f emitted_count(a,b)=%zu,%zu\n",
                             pr, cid_a, dyn_a, dyn_b, sink_a.est_dists.size(), sink_b.est_dists.size());

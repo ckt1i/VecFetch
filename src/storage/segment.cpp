@@ -17,7 +17,8 @@ Segment::~Segment() = default;
 
 Status Segment::Open(const std::string& dir,
                      const std::vector<ColumnSchema>& payload_schemas,
-                     bool use_direct_io) {
+                     bool use_direct_io,
+                     std::optional<Dim> raw_vector_dim) {
     const std::string clu_path = dir + "/cluster.clu";
     const std::string dat_path = dir + "/data.dat";
 
@@ -26,7 +27,9 @@ Status Segment::Open(const std::string& dir,
 
     // Open data file
     VDB_RETURN_IF_ERROR(dat_reader_.Open(dat_path,
-                                          clu_reader_.dim(),
+                                          raw_vector_dim.has_value()
+                                              ? *raw_vector_dim
+                                              : clu_reader_.dim(),
                                           payload_schemas,
                                           use_direct_io));
 

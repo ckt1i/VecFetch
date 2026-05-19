@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "vdb/simd/stage2_classify.h"
 #include "vdb/simd/fastscan.h"
 #include "vdb/simd/ip_exrabitq.h"
 #include "vdb/storage/pack_codes.h"
@@ -19,7 +20,6 @@ namespace index {
 
 namespace {
 
-constexpr double kLowOverheadStage2Weight = 1.0;
 constexpr uint32_t kStage2BatchSize = 8;
 
 bool DebugCompareCompactStage2Enabled() {
@@ -32,58 +32,6 @@ bool DebugCompareCompactStage2Enabled() {
 
 VDB_FORCE_INLINE uint32_t LaneMaskForCount(uint32_t count) {
     return (count >= 32u) ? 0xFFFFFFFFu : ((1u << count) - 1u);
-}
-
-VDB_FORCE_INLINE uint32_t Stage1SafeInMask(const float* dists,
-                                           const float* block_norms,
-                                           uint32_t count,
-                                           float safein_threshold_base,
-                                           float margin_factor) {
-    const float threshold_mul = 2.0f * margin_factor;
-#if defined(VDB_USE_AVX512)
-    __m512 vbase = _mm512_set1_ps(safein_threshold_base);
-    __m512 vmul = _mm512_set1_ps(threshold_mul);
-    __m512 vd = _mm512_loadu_ps(dists);
-    __m512 vn = _mm512_loadu_ps(block_norms);
-    __m512 vth = _mm512_sub_ps(vbase, _mm512_mul_ps(vmul, vn));
-    uint32_t mask = static_cast<uint32_t>(_mm512_cmp_ps_mask(vd, vth, _CMP_LT_OQ));
-    return mask & LaneMaskForCount(count);
-#elif defined(VDB_USE_AVX2)
-    __m256 vbase = _mm256_set1_ps(safein_threshold_base);
-    __m256 vmul = _mm256_set1_ps(threshold_mul);
-    __m256 vd0 = _mm256_loadu_ps(dists);
-    __m256 vn0 = _mm256_loadu_ps(block_norms);
-    __m256 vt0 = _mm256_sub_ps(vbase, _mm256_mul_ps(vmul, vn0));
-    uint32_t mask = static_cast<uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(vd0, vt0, _CMP_LT_OQ)));
-    if (count > 8) {
-        __m256 vd1 = _mm256_loadu_ps(dists + 8);
-        __m256 vn1 = _mm256_loadu_ps(block_norms + 8);
-        __m256 vt1 = _mm256_sub_ps(vbase, _mm256_mul_ps(vmul, vn1));
-        mask |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(vd1, vt1, _CMP_LT_OQ))) << 8;
-    }
-    if (count > 16) {
-        __m256 vd2 = _mm256_loadu_ps(dists + 16);
-        __m256 vn2 = _mm256_loadu_ps(block_norms + 16);
-        __m256 vt2 = _mm256_sub_ps(vbase, _mm256_mul_ps(vmul, vn2));
-        mask |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(vd2, vt2, _CMP_LT_OQ))) << 16;
-    }
-    if (count > 24) {
-        __m256 vd3 = _mm256_loadu_ps(dists + 24);
-        __m256 vn3 = _mm256_loadu_ps(block_norms + 24);
-        __m256 vt3 = _mm256_sub_ps(vbase, _mm256_mul_ps(vmul, vn3));
-        mask |= static_cast<uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(vd3, vt3, _CMP_LT_OQ))) << 24;
-    }
-    return mask & LaneMaskForCount(count);
-#else
-    uint32_t mask = 0;
-    for (uint32_t i = 0; i < count; ++i) {
-        const float threshold = safein_threshold_base - threshold_mul * block_norms[i];
-        if (dists[i] < threshold) {
-            mask |= (1u << i);
-        }
-    }
-    return mask;
-#endif
 }
 
 VDB_FORCE_INLINE uint32_t CompactMaskToIndices(uint32_t mask,
@@ -113,7 +61,10 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                            const rabitq::PreparedClusterQueryView& view,
                            float margin_factor,
                            float dynamic_d_k,
+                           bool enable_address_decode_simd,
                            bool enable_fine_grained_timing,
+                           bool enable_stage2_collect_block_first,
+                           bool enable_stage2_scatter_batch_classify,
                            ProbeResultSink& sink,
                            ProbeStats& stats) const {
     const rabitq::PreparedQuery& pq = *view.prepared;
@@ -161,7 +112,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
         // Stage 1c/1d: compact survivors and classify them in mask batches.
         const uint32_t lane_valid = LaneMaskForCount(count);
         const uint32_t maybe_in = (~so_mask) & lane_valid;
-        const uint32_t safein_mask = Stage1SafeInMask(
+        const uint32_t safein_mask = simd::FastScanSafeInMask(
             dists, block_norms, count, safein_threshold_base, margin_factor) & maybe_in;
         const uint32_t uncertain_mask = maybe_in & ~safein_mask;
 
@@ -211,6 +162,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
             Stage2LaneEntry lanes[kStage2BatchSize];
         };
         Stage2BlockScratch stage2_blocks[4];
+        const uint32_t base_stage2_block_id = base_idx / kStage2BatchSize;
         uint32_t stage2_block_count = 0;
         uint32_t stage2_candidate_count = 0;
         uint32_t stage2_block_lookups = 0;
@@ -238,22 +190,36 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                 auto collect_start = enable_fine_grained_timing
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
-                const uint32_t block_id = global_idx / kStage2BatchSize;
                 const uint32_t lane_id = global_idx % kStage2BatchSize;
                 Stage2BlockScratch* block = nullptr;
-                for (uint32_t bi = 0; bi < stage2_block_count; ++bi) {
-                    ++stage2_block_lookups;
-                    if (stage2_blocks[bi].block_id == block_id) {
-                        block = &stage2_blocks[bi];
+                if (enable_stage2_collect_block_first) {
+                    const uint32_t local_block_slot = j / kStage2BatchSize;
+                    const uint32_t block_id = base_stage2_block_id + local_block_slot;
+                    block = &stage2_blocks[local_block_slot];
+                    if (!block->used) {
+                        block->used = true;
+                        block->block_id = block_id;
+                        block->lane_mask = 0;
+                        ++stage2_block_count;
+                    } else {
                         ++stage2_block_reuses;
-                        break;
                     }
-                }
-                if (block == nullptr) {
-                    block = &stage2_blocks[stage2_block_count++];
-                    block->used = true;
-                    block->block_id = block_id;
-                    block->lane_mask = 0;
+                } else {
+                    const uint32_t block_id = global_idx / kStage2BatchSize;
+                    for (uint32_t bi = 0; bi < stage2_block_count; ++bi) {
+                        ++stage2_block_lookups;
+                        if (stage2_blocks[bi].block_id == block_id) {
+                            block = &stage2_blocks[bi];
+                            ++stage2_block_reuses;
+                            break;
+                        }
+                    }
+                    if (block == nullptr) {
+                        block = &stage2_blocks[stage2_block_count++];
+                        block->used = true;
+                        block->block_id = block_id;
+                        block->lane_mask = 0;
+                    }
                 }
                 Stage2LaneEntry& entry = block->lanes[lane_id];
                 entry.present = true;
@@ -297,8 +263,9 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                 : std::chrono::steady_clock::time_point{};
             const float* const rotated_query = pq.rotated.data();
 
-            for (uint32_t bi = 0; bi < stage2_block_count; ++bi) {
+            for (uint32_t bi = 0; bi < 4; ++bi) {
                 const Stage2BlockScratch& block = stage2_blocks[bi];
+                if (!block.used) continue;
                 alignas(64) float ip_raw_batch[kStage2BatchSize] = {};
                 query::ParsedCluster::ExRaBitQBatchBlockView block_view;
                 auto kernel_start = enable_fine_grained_timing
@@ -413,41 +380,84 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                 auto scatter_start = enable_fine_grained_timing
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
+                alignas(32) float lane_ip_raw[kStage2BatchSize] = {};
+                alignas(32) float lane_xipnorm[kStage2BatchSize] = {};
+                alignas(32) float lane_norm_oc[kStage2BatchSize] = {};
+                alignas(32) float lane_margin_s1[kStage2BatchSize] = {};
                 uint32_t chunk_idx = 0;
                 for (uint32_t lane = 0; lane < kStage2BatchSize; ++lane) {
                     if ((block.lane_mask & (1u << lane)) == 0) continue;
                     const Stage2LaneEntry& entry = block.lanes[lane];
-                    const float xipnorm = (pc.exrabitq_storage_version >= 11)
+                    lane_xipnorm[lane] = (pc.exrabitq_storage_version >= 11)
                         ? block_view.xipnorms[lane]
                         : entry.xipnorm;
-                    const float ip_raw = (pc.exrabitq_storage_version >= 11)
+                    lane_ip_raw[lane] = (pc.exrabitq_storage_version >= 11)
                         ? ip_raw_batch[lane]
                         : ip_raw_batch[chunk_idx++];
-                    const float ip_est = ip_raw * xipnorm;
+                    lane_norm_oc[lane] = entry.norm_oc;
+                    lane_margin_s1[lane] = entry.margin_s1;
+                }
 
-                    float est_dist_s2 = entry.norm_oc * entry.norm_oc + pq.norm_qc_sq
-                                      - 2.0f * entry.norm_oc * pq.norm_qc * ip_est;
-                    est_dist_s2 = std::max(est_dist_s2, 0.0f);
+                if (enable_stage2_scatter_batch_classify) {
+                    const simd::Stage2ClassifyMasks classify_masks = simd::Stage2ClassifyBatch(
+                        lane_ip_raw,
+                        lane_xipnorm,
+                        lane_norm_oc,
+                        lane_margin_s1,
+                        block.lane_mask,
+                        pq.norm_qc,
+                        pq.norm_qc_sq,
+                        1.0f / margin_s2_divisor_,
+                        conann_.d_k(),
+                        dynamic_d_k);
 
-                    const float margin_s2 = entry.margin_s1 / margin_s2_divisor_;
-                    const ResultClass rc_s2 =
-                        conann_.ClassifyAdaptive(est_dist_s2, margin_s2, dynamic_d_k);
+                    stats.s2_safein += static_cast<uint32_t>(__builtin_popcount(classify_masks.safein));
+                    stats.s2_safeout += static_cast<uint32_t>(__builtin_popcount(classify_masks.safeout));
+                    stats.s2_uncertain += static_cast<uint32_t>(__builtin_popcount(classify_masks.uncertain));
 
-                    if (rc_s2 == ResultClass::SafeIn) {
-                        ++stats.s2_safein;
-                    } else if (rc_s2 == ResultClass::SafeOut) {
-                        ++stats.s2_safeout;
-                        continue;
-                    } else {
-                        ++stats.s2_uncertain;
+                    const uint32_t keep_mask = classify_masks.safein | classify_masks.uncertain;
+                    for (uint32_t lane = 0; lane < kStage2BatchSize; ++lane) {
+                        if ((keep_mask & (1u << lane)) == 0) continue;
+                        const Stage2LaneEntry& entry = block.lanes[lane];
+                        batch.global_idx[batch.count] = entry.global_idx;
+                        batch.est_dist[batch.count] = entry.est_dist_s1;
+                        batch.cls[batch.count] = ((classify_masks.safein >> lane) & 1u) != 0
+                            ? CandidateClass::SafeIn
+                            : CandidateClass::Uncertain;
+                        batch.count++;
                     }
+                } else {
+                    for (uint32_t lane = 0; lane < kStage2BatchSize; ++lane) {
+                        if ((block.lane_mask & (1u << lane)) == 0) continue;
+                        const Stage2LaneEntry& entry = block.lanes[lane];
+                        const float xipnorm = lane_xipnorm[lane];
+                        const float ip_raw = lane_ip_raw[lane];
+                        const float ip_est = ip_raw * xipnorm;
 
-                    batch.global_idx[batch.count] = entry.global_idx;
-                    batch.est_dist[batch.count] = entry.est_dist_s1;
-                    batch.cls[batch.count] = (rc_s2 == ResultClass::SafeIn)
-                        ? CandidateClass::SafeIn
-                        : CandidateClass::Uncertain;
-                    batch.count++;
+                        float est_dist_s2 = entry.norm_oc * entry.norm_oc + pq.norm_qc_sq
+                                          - 2.0f * entry.norm_oc * pq.norm_qc * ip_est;
+                        est_dist_s2 = std::max(est_dist_s2, 0.0f);
+
+                        const float margin_s2 = entry.margin_s1 / margin_s2_divisor_;
+                        const ResultClass rc_s2 =
+                            conann_.ClassifyAdaptive(est_dist_s2, margin_s2, dynamic_d_k);
+
+                        if (rc_s2 == ResultClass::SafeIn) {
+                            ++stats.s2_safein;
+                        } else if (rc_s2 == ResultClass::SafeOut) {
+                            ++stats.s2_safeout;
+                            continue;
+                        } else {
+                            ++stats.s2_uncertain;
+                        }
+
+                        batch.global_idx[batch.count] = entry.global_idx;
+                        batch.est_dist[batch.count] = entry.est_dist_s1;
+                        batch.cls[batch.count] = (rc_s2 == ResultClass::SafeIn)
+                            ? CandidateClass::SafeIn
+                            : CandidateClass::Uncertain;
+                        batch.count++;
+                    }
                 }
                 if (enable_fine_grained_timing) {
                     stage2_scatter_ms += std::chrono::duration<double, std::milli>(
@@ -474,7 +484,13 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
         }
 
         if (batch.count > 0) {
-            pc.DecodeAddressBatch(batch.global_idx, batch.count, batch.decoded_addr);
+            if (enable_address_decode_simd) {
+                pc.DecodeAddressBatch(batch.global_idx, batch.count, batch.decoded_addr);
+            } else {
+                for (uint32_t i = 0; i < batch.count; ++i) {
+                    batch.decoded_addr[i] = pc.AddressAt(batch.global_idx[i]);
+                }
+            }
             sink.OnCandidates(batch);
         }
     }

@@ -603,3 +603,50 @@ TEST_F(IvfBuilderTest, SuperKMeansCosineIndex_UsesMetricAwareCentroidProbing) {
     ASSERT_GE(vertical_cluster, 0);
     EXPECT_EQ(nearest[0], static_cast<ClusterID>(vertical_cluster));
 }
+
+TEST_F(IvfBuilderTest, BlockedHadamardPermutedBuildAndOpen_768D_NoPadding) {
+    constexpr uint32_t N = 96;
+    constexpr Dim dim = 768;
+    constexpr uint32_t nlist = 4;
+
+    auto vecs = GenerateVectors(N, dim, 4040);
+
+    IvfBuilderConfig cfg;
+    cfg.nlist = nlist;
+    cfg.max_iterations = 5;
+    cfg.seed = 4040;
+    cfg.rabitq = {1, 64, 5.75f};
+    cfg.calibration_samples = 8;
+    cfg.calibration_topk = 4;
+    cfg.page_size = 1;
+    cfg.pad_non_power_of_two_to_pow2 = false;
+    cfg.use_blocked_hadamard_permuted = true;
+
+    IvfBuilder builder(cfg);
+    auto s = builder.Build(vecs.data(), N, dim, test_dir_);
+    ASSERT_TRUE(s.ok()) << s.message();
+
+    EXPECT_EQ(builder.logical_dim(), dim);
+    EXPECT_EQ(builder.effective_dim(), dim);
+    EXPECT_EQ(builder.padding_mode(), "none");
+    EXPECT_EQ(builder.rotation_mode(), "blocked_hadamard_permuted");
+    EXPECT_TRUE(fs::exists(test_dir_ + "/rotated_centroids.bin"));
+
+    const std::string sidecar = ReadFileToString(test_dir_ + "/build_metadata.json");
+    EXPECT_NE(sidecar.find("\"rotation_mode\": \"blocked_hadamard_permuted\""),
+              std::string::npos);
+    EXPECT_NE(sidecar.find("\"padding_mode\": \"none\""), std::string::npos);
+    EXPECT_NE(sidecar.find("\"logical_dim\": 768"), std::string::npos);
+    EXPECT_NE(sidecar.find("\"effective_dim\": 768"), std::string::npos);
+    EXPECT_NE(sidecar.find("\"rotation_seed\": 4040"), std::string::npos);
+    EXPECT_NE(sidecar.find("\"rotation_block_sizes\": [512, 256]"), std::string::npos);
+
+    IvfIndex idx;
+    ASSERT_TRUE(idx.Open(test_dir_).ok());
+    EXPECT_EQ(idx.logical_dim(), dim);
+    EXPECT_EQ(idx.effective_dim(), dim);
+    EXPECT_EQ(idx.padding_mode(), "none");
+    EXPECT_EQ(idx.rotation_mode(), "blocked_hadamard_permuted");
+    EXPECT_TRUE(idx.used_hadamard());
+    EXPECT_FALSE(idx.uses_padded_hadamard());
+}

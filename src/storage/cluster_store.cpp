@@ -65,8 +65,21 @@ inline bool PreadValue(int fd, off_t offset, T& out) {
 }
 
 inline bool PreadBytes(int fd, off_t offset, void* out, size_t len) {
-    ssize_t n = ::pread(fd, out, len, offset);
-    return n == static_cast<ssize_t>(len);
+    constexpr size_t kMaxChunk = 1u << 30;  // 1 GiB per syscall, stay below kernel short-read limits.
+    uint8_t* dst = static_cast<uint8_t*>(out);
+    size_t remaining = len;
+    off_t cur_off = offset;
+    while (remaining > 0) {
+        const size_t chunk = std::min(remaining, kMaxChunk);
+        ssize_t n = ::pread(fd, dst, chunk, cur_off);
+        if (n != static_cast<ssize_t>(chunk)) {
+            return false;
+        }
+        dst += chunk;
+        cur_off += static_cast<off_t>(chunk);
+        remaining -= chunk;
+    }
+    return true;
 }
 
 inline uint64_t RoundUp4K(uint64_t v) {

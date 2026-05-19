@@ -54,7 +54,7 @@ class DataFileWriter {
     /// @return Status
     Status Open(const std::string& path,
                 uint32_t cluster_id,
-                Dim dim,
+                Dim raw_dim,
                 const std::vector<ColumnSchema>& payload_schemas = {},
                 uint32_t page_size = kDefaultPageSize);
 

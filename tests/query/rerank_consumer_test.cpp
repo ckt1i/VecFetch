@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 #include "vdb/query/rerank_consumer.h"
@@ -22,20 +23,20 @@ class RerankConsumerTest : public ::testing::Test {
     }
 
     // Create a VEC_ONLY buffer from a float vector
-    std::unique_ptr<uint8_t[]> MakeVecBuf(const float* vec) {
-        auto buf = std::make_unique<uint8_t[]>(kVecBytes);
-        std::memcpy(buf.get(), vec, kVecBytes);
-        return buf;
+    AlignedBufPtr MakeVecBuf(const float* vec) {
+        auto* raw = static_cast<uint8_t*>(std::aligned_alloc(4096, 4096));
+        std::memcpy(raw, vec, kVecBytes);
+        return AlignedBufPtr(raw);
     }
 
     // Create an ALL buffer (vec + payload bytes)
-    std::unique_ptr<uint8_t[]> MakeAllBuf(const float* vec,
-                                           const uint8_t* payload,
-                                           uint32_t payload_len) {
-        auto buf = std::make_unique<uint8_t[]>(kVecBytes + payload_len);
-        std::memcpy(buf.get(), vec, kVecBytes);
-        std::memcpy(buf.get() + kVecBytes, payload, payload_len);
-        return buf;
+    AlignedBufPtr MakeAllBuf(const float* vec,
+                              const uint8_t* payload,
+                              uint32_t payload_len) {
+        auto* raw = static_cast<uint8_t*>(std::aligned_alloc(4096, 4096));
+        std::memcpy(raw, vec, kVecBytes);
+        std::memcpy(raw + kVecBytes, payload, payload_len);
+        return AlignedBufPtr(raw);
     }
 
     std::vector<float> query_;
@@ -91,8 +92,8 @@ TEST_F(RerankConsumerTest, ConsumePayload_TransfersOwnership) {
 
 TEST_F(RerankConsumerTest, CleanupUnusedCache) {
     // Insert some payloads
-    auto buf1 = std::make_unique<uint8_t[]>(4);
-    auto buf2 = std::make_unique<uint8_t[]>(4);
+    auto buf1 = AlignedBufPtr(static_cast<uint8_t*>(std::aligned_alloc(4096, 4096)));
+    auto buf2 = AlignedBufPtr(static_cast<uint8_t*>(std::aligned_alloc(4096, 4096)));
     consumer_->CachePayload(100, std::move(buf1));
     consumer_->CachePayload(200, std::move(buf2));
 

@@ -46,7 +46,7 @@ class DataFileReader {
     /// @param payload_schemas  Payload column definitions (must match writer)
     /// @return Status
     Status Open(const std::string& path,
-                Dim dim,
+                Dim raw_dim,
                 const std::vector<ColumnSchema>& payload_schemas = {},
                 bool use_direct_io = false);
 
@@ -56,7 +56,7 @@ class DataFileReader {
     /// Read a complete record: raw vector + all payload columns.
     ///
     /// @param addr        Physical address from AddressColumn
-    /// @param out_vec     Output vector buffer (caller pre-allocates dim floats)
+    /// @param out_vec     Output vector buffer (caller pre-allocates raw_dim floats)
     /// @param out_payload Output payload values (one per schema column)
     /// @return Status
     Status ReadRecord(const AddressEntry& addr,
@@ -78,14 +78,14 @@ class DataFileReader {
     /// Read only the raw vector from a record.
     ///
     /// @param addr     Physical address
-    /// @param out_vec  Output vector buffer (dim floats)
+    /// @param out_vec  Output vector buffer (raw_dim floats)
     /// @return Status
     Status ReadVector(const AddressEntry& addr, float* out_vec) const;
 
     /// Check if the reader is open.
     bool is_open() const { return fd_ >= 0; }
 
-    /// Vector dimensionality.
+    /// Raw-vector dimensionality.
     Dim dim() const { return dim_; }
 
     /// File path.

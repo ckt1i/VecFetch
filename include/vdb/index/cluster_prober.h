@@ -110,7 +110,10 @@ class ClusterProber {
                const rabitq::PreparedClusterQueryView& view,
                float margin_factor,
                float dynamic_d_k,
+               bool enable_address_decode_simd,
                bool enable_fine_grained_timing,
+               bool enable_stage2_collect_block_first,
+               bool enable_stage2_scatter_batch_classify,
                ProbeResultSink& sink,
                ProbeStats& stats) const;
 

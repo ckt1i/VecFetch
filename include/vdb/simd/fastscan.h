@@ -127,6 +127,16 @@ uint32_t FastScanSafeOutMask(const float* VDB_RESTRICT dists,
                               float est_kth,
                               float margin_factor);
 
+/// Compute a SafeIn bitmask for a batch of FastScan dists.
+///
+/// A lane is SafeIn when its estimated distance is below the static threshold
+/// minus the dynamic margin. Lanes beyond `count` are forced to 0.
+uint32_t FastScanSafeInMask(const float* VDB_RESTRICT dists,
+                             const float* VDB_RESTRICT block_norms,
+                             uint32_t count,
+                             float safein_threshold_base,
+                             float margin_factor);
+
 /// De-quantize FastScan raw_accu into final L2² distances for `count` vectors.
 ///
 /// For each lane v in [0, count):

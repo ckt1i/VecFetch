@@ -126,6 +126,7 @@ class OverlapScheduler {
         rabitq::PreparedQuery prepared;
         rabitq::ClusterPreparedScratch scratch;
         std::vector<float> rotated_q;
+        std::vector<float> padded_q;
     };
 
     struct QueryDedupSet {

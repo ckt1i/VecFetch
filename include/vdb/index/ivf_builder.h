@@ -126,6 +126,14 @@ struct IvfBuilderConfig {
 
     /// Number of Faiss k-means restarts.
     uint32_t faiss_nredo = 1;
+
+    /// Experimental mode: for non-power-of-two dimensions, zero-pad vectors
+    /// to the next power of two so the build path can use Hadamard rotation.
+    bool pad_non_power_of_two_to_pow2 = false;
+
+    /// When true, non-power-of-two dimensions can use blocked Hadamard with a
+    /// deterministic permutation instead of falling back to a dense random matrix.
+    bool use_blocked_hadamard_permuted = true;
 };
 
 // ============================================================================
@@ -202,6 +210,10 @@ class IvfBuilder {
     bool rair_strict_second_choice() const { return rair_strict_second_choice_; }
     ClusteringSource clustering_source() const { return clustering_source_; }
     CoarseBuilder coarse_builder() const { return coarse_builder_used_; }
+    Dim logical_dim() const { return logical_dim_; }
+    Dim effective_dim() const { return effective_dim_; }
+    const std::string& padding_mode() const { return padding_mode_; }
+    const std::string& rotation_mode() const { return rotation_mode_; }
 
     /// Get the centroids from the last Build() call (nlist × dim row-major).
     const std::vector<float>& centroids() const { return centroids_; }
@@ -223,7 +235,10 @@ class IvfBuilder {
     Status DeriveSecondaryAssignments(const float* vectors, uint32_t N, Dim dim);
 
     /// Phase C+D: write per-cluster files + global metadata.
-    Status WriteIndex(const float* vectors, uint32_t N, Dim dim,
+    Status WriteIndex(const float* raw_vectors,
+                      const float* encoded_vectors,
+                      uint32_t N,
+                      Dim dim,
                       const std::string& output_dir,
                       PayloadFn payload_fn);
 
@@ -239,6 +254,10 @@ class IvfBuilder {
     ClusteringSource clustering_source_ = ClusteringSource::Auto;
     CoarseBuilder coarse_builder_used_ = CoarseBuilder::Auto;
     std::string effective_metric_ = "l2";
+    Dim logical_dim_ = 0;
+    Dim effective_dim_ = 0;
+    std::string padding_mode_ = "none";
+    std::string rotation_mode_ = "random_matrix";
     ProgressCallback progress_cb_;
 };
 

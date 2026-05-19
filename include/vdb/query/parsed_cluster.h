@@ -8,6 +8,7 @@
 
 #include "vdb/common/macros.h"
 #include "vdb/common/types.h"
+#include "vdb/simd/address_decode.h"
 #include "vdb/storage/address_column.h"
 
 namespace vdb {
@@ -220,15 +221,11 @@ struct ParsedCluster {
                             uint32_t count,
                             AddressEntry* out) const {
         if (addresses_are_raw_v2 && raw_addresses != nullptr) {
-            for (uint32_t i = 0; i < count; ++i) {
-                out[i] = storage::AddressColumn::DecodeRawEntryV2(
-                    raw_addresses[vec_idxs[i]], address_page_size);
-            }
+            simd::DecodeAddressBatch(raw_addresses, vec_idxs, count,
+                                     address_page_size, out);
             return;
         }
-        for (uint32_t i = 0; i < count; ++i) {
-            out[i] = decoded_addresses[vec_idxs[i]];
-        }
+        simd::DecodeAddressBatch(decoded_addresses.data(), vec_idxs, count, out);
     }
 };
 
