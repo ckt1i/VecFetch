@@ -153,3 +153,40 @@ TEST_F(IoUringReaderTest, RegisteredFixedBufferReadWorks) {
 
     std::free(raw);
 }
+
+TEST_F(IoUringReaderTest, RegisteredFileIndexAndFixedFilePrepWork) {
+    auto reg_file_status = reader_->RegisterFiles(&fd_, 1);
+    if (!reg_file_status.ok()) {
+        GTEST_SKIP() << "io_uring file registration unavailable: "
+                     << reg_file_status.message();
+    }
+
+    void* raw = std::aligned_alloc(4096, 4096);
+    ASSERT_NE(raw, nullptr);
+    uint8_t* buf = static_cast<uint8_t*>(raw);
+    const uint8_t* bufs[] = {buf};
+    uint32_t capacities[] = {4096};
+
+    auto reg_buf_status = reader_->RegisterBuffers(bufs, capacities, 1);
+    if (!reg_buf_status.ok()) {
+        std::free(raw);
+        GTEST_SKIP() << "io_uring buffer registration unavailable: "
+                     << reg_buf_status.message();
+    }
+
+    const int fd_index = reader_->RegisteredFileIndex(fd_);
+    ASSERT_EQ(fd_index, 0);
+
+    constexpr uint64_t kTag = 0xD00DULL;
+    ASSERT_TRUE(reader_->PrepReadRegisteredBufferFixedFileTagged(
+                    fd_index, buf, 0, 16, 128, kTag).ok());
+    EXPECT_EQ(reader_->Submit(), 1u);
+
+    IoCompletion comp;
+    EXPECT_EQ(reader_->WaitAndPoll(&comp, 1), 1u);
+    EXPECT_EQ(comp.user_data, kTag);
+    EXPECT_EQ(comp.result, 16);
+    EXPECT_EQ(buf[0], static_cast<uint8_t>(128));
+
+    std::free(raw);
+}

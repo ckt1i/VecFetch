@@ -280,6 +280,80 @@ TEST(RotationMatrixTest, BlockedHadamardPermuted_SaveLoadRoundTrip) {
     fs::remove(tmp_path);
 }
 
+TEST(RotationMatrixTest, FhtKacRotator_Orthogonal) {
+    RotationMatrix P(768);
+    ASSERT_TRUE(P.GenerateFhtKacRotator(42, true));
+    EXPECT_TRUE(P.is_fast_hadamard());
+    EXPECT_TRUE(P.is_fht_kac_rotator());
+    EXPECT_EQ(P.fht_kac_padded_dim(), 768u);
+    EXPECT_EQ(P.fht_kac_trunc_dim(), 512u);
+    EXPECT_EQ(P.fht_kac_num_rounds(), 4u);
+    AssertOrthogonal(P, 1e-4f);
+}
+
+TEST(RotationMatrixTest, FhtKacRotator_RoundTrip) {
+    RotationMatrix P(768);
+    ASSERT_TRUE(P.GenerateFhtKacRotator(7, true));
+    std::vector<float> vec(768);
+    for (int i = 0; i < 768; ++i) vec[i] = static_cast<float>(i % 19 - 9);
+    AssertRoundTrip(P, vec.data(), 1e-3f);
+}
+
+TEST(RotationMatrixTest, FhtKacRotator_DeterministicMetadata) {
+    RotationMatrix P1(768), P2(768);
+    ASSERT_TRUE(P1.GenerateFhtKacRotator(123, true));
+    ASSERT_TRUE(P2.GenerateFhtKacRotator(123, true));
+    EXPECT_EQ(P1.seed(), P2.seed());
+    EXPECT_EQ(P1.fht_kac_padded_dim(), P2.fht_kac_padded_dim());
+    EXPECT_EQ(P1.fht_kac_trunc_dim(), P2.fht_kac_trunc_dim());
+    EXPECT_EQ(P1.fht_kac_num_rounds(), P2.fht_kac_num_rounds());
+    EXPECT_EQ(P1.fht_kac_signs(), P2.fht_kac_signs());
+}
+
+TEST(RotationMatrixTest, FhtKacRotator_FastVsDense) {
+    RotationMatrix P_fast(768), P_dense(768);
+    ASSERT_TRUE(P_fast.GenerateFhtKacRotator(42, true));
+    ASSERT_TRUE(P_dense.GenerateFhtKacRotator(42, false));
+
+    std::vector<float> vec(768), out_fast(768), out_dense(768);
+    for (int i = 0; i < 768; ++i) vec[i] = std::cos(static_cast<float>(i) * 0.07f);
+    P_fast.Apply(vec.data(), out_fast.data());
+    P_dense.Apply(vec.data(), out_dense.data());
+    for (int i = 0; i < 768; ++i) {
+        EXPECT_NEAR(out_fast[i], out_dense[i], 1e-4f) << "dim " << i;
+    }
+}
+
+TEST(RotationMatrixTest, FhtKacRotator_SaveLoadRoundTrip) {
+    namespace fs = std::filesystem;
+    const fs::path tmp_path =
+        fs::temp_directory_path() / "fht_kac_rotation_test.bin";
+    RotationMatrix saved(768);
+    ASSERT_TRUE(saved.GenerateFhtKacRotator(314, true));
+    ASSERT_TRUE(saved.Save(tmp_path.string()).ok());
+
+    auto loaded_or = RotationMatrix::Load(tmp_path.string(), 768);
+    ASSERT_TRUE(loaded_or.ok()) << loaded_or.status().message();
+    RotationMatrix loaded = std::move(loaded_or.value());
+
+    EXPECT_TRUE(loaded.is_fht_kac_rotator());
+    EXPECT_TRUE(loaded.is_fast_hadamard());
+    EXPECT_EQ(saved.seed(), loaded.seed());
+    EXPECT_EQ(saved.fht_kac_padded_dim(), loaded.fht_kac_padded_dim());
+    EXPECT_EQ(saved.fht_kac_trunc_dim(), loaded.fht_kac_trunc_dim());
+    EXPECT_EQ(saved.fht_kac_num_rounds(), loaded.fht_kac_num_rounds());
+    EXPECT_EQ(saved.fht_kac_signs(), loaded.fht_kac_signs());
+
+    std::vector<float> vec(768), out_saved(768), out_loaded(768);
+    for (int i = 0; i < 768; ++i) vec[i] = static_cast<float>((i % 11) - 5);
+    saved.Apply(vec.data(), out_saved.data());
+    loaded.Apply(vec.data(), out_loaded.data());
+    for (int i = 0; i < 768; ++i) {
+        EXPECT_NEAR(out_saved[i], out_loaded[i], 1e-5f) << "dim " << i;
+    }
+    fs::remove(tmp_path);
+}
+
 // ===========================================================================
 // Move semantics
 // ===========================================================================

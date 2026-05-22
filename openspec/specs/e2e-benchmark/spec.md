@@ -390,3 +390,153 @@ The benchmark output SHALL continue to expose Stage2 and end-to-end breakdown fi
 - **THEN** the output SHALL still include `avg_query_ms`
 - **AND** it SHALL still include `avg_probe_stage2_ms`
 - **AND** it SHALL still include the existing low-overhead query-path timing fields needed to explain the result
+
+## ADDED Requirements (from query-hotpath-submit-batch-stage2-refinement)
+
+### Requirement: E2E benchmark SHALL formalize the hot-path follow-up experiment protocol
+在线 E2E benchmark MUST 为本轮 `submit-batch` 与 Stage2 follow-up 提供稳定实验协议。该协议 MUST 支持在固定 operating point 下执行多次重复实验，并允许在同一批参数上导出 full E2E 与 query-only perf 结果，以区分真实收益与噪声。
+
+#### Scenario: Follow-up experiment repeats are comparable
+- **WHEN** 某个 `submit-batch` 或 Stage2 follow-up 变体被评估
+- **THEN** benchmark 协议 MUST 允许在固定 operating point 下重复执行多次
+- **AND** 输出 MUST 足以比较均值与离散度，而不是只保留单次结果
+
+#### Scenario: Query-only and E2E results are both available
+- **WHEN** follow-up 优化项进入正式评估
+- **THEN** 同一 operating point MUST 同时可获得 query-only perf 结果与 full E2E 结果
+- **AND** 两者 MUST 使用相同的查询参数和结果口径
+
+### Requirement: E2E benchmark SHALL expose adaptive submit attribution
+针对三层 flush `submit-batch`，benchmark 输出 MUST 足以解释 flush 机制本身是否带来收益，而不仅是最终总时间变化。输出 MUST 至少能够区分 flush 次数、flush 规模和 `probe_submit` 相关 CPU 成本。
+
+#### Scenario: Adaptive submit fields are exported
+- **WHEN** benchmark 在三层 flush 的 resident 路径上运行
+- **THEN** 结果 MUST 包含 flush 次数或等价统计
+- **AND** MUST 包含每次 flush 请求规模的聚合信息
+- **AND** `probe_submit_ms` 仍然 MUST 作为总提交 CPU 成本单独可见
+
+### Requirement: E2E benchmark SHALL preserve Stage2 follow-up attribution boundaries
+针对 Stage2 `collect/scatter` follow-up，benchmark 输出 MUST 继续支持区分 Stage2 内部成本边界。若某轮运行开启细粒度归因，结果 MUST 足以区分 collect、kernel 与 scatter 的变化；若运行于低开销口径，结果 MUST 至少保留总 Stage2 字段并显式说明口径限制。
+
+#### Scenario: Fine-grained Stage2 fields remain comparable when enabled
+- **WHEN** benchmark 以细粒度 Stage2 归因模式运行
+- **THEN** 输出 MUST 能够区分 Stage2 collect、kernel 与 scatter 的时间字段
+- **AND** 这些字段 MUST 可用于比较 follow-up 优化前后的变化
+
+#### Scenario: Low-overhead mode still declares attribution limits
+- **WHEN** benchmark 运行于低开销统计模式
+- **THEN** 输出 MUST 至少保留总 Stage2 时间字段
+- **AND** MUST 让分析结果能够区分"字段为零"是因为未计量还是因为成本确实消失
+
+## ADDED Requirements (from query-simd-consolidation-and-expansion)
+
+### Requirement: E2E benchmark SHALL expose query SIMD capability toggles in exported results
+The benchmark workflow SHALL make query-path SIMD capability toggles explicit in exported results so that SIMD-on, fallback, and mixed configurations can be compared under the same operating point. At minimum, exported metadata MUST be able to distinguish address-decode SIMD, rerank batched-distance SIMD, coarse-select SIMD, Stage2 block-first, and Stage2 batch-classify states when those capabilities are present.
+
+When a newly introduced SIMD runtime path is split into Phase 1 and Phase 2, exported metadata MUST be able to distinguish whether the run used:
+
+- fallback/reference
+- Phase 1 conservative implementation
+- Phase 2 stronger specialization
+
+#### Scenario: SIMD toggle state is exported
+- **WHEN** a benchmark run enables or disables a query-path SIMD capability
+- **THEN** the exported result MUST include the corresponding capability state
+- **AND** the result MUST remain identifiable as SIMD-on or fallback for later comparison
+
+#### Scenario: Phase 1 and Phase 2 runtime paths are benchmarked
+- **WHEN** a benchmark run compares a newly introduced SIMD runtime path across rollout phases
+- **THEN** the exported result MUST indicate whether the run used fallback, Phase 1, or Phase 2
+- **AND** that distinction MUST be sufficient to compare correctness and performance across phases
+
+### Requirement: Benchmark validation SHALL support both query-only and full E2E SIMD comparison
+The benchmark workflow SHALL support validating query-path SIMD capabilities under both `query_only` and `full_e2e` modes. Query-only runs MUST preserve stage breakdown observability, and full E2E runs MUST preserve recall comparison.
+
+#### Scenario: Query-only SIMD validation is run
+- **WHEN** a query-path SIMD capability is validated under `query_only`
+- **THEN** the result MUST export the relevant stage breakdown fields needed to attribute the SIMD change
+- **AND** those fields MUST remain comparable with the fallback path
+
+#### Scenario: Full E2E SIMD validation is run
+- **WHEN** a query-path SIMD capability is validated under `full_e2e`
+- **THEN** the result MUST report recall and latency under the same operating point as the fallback path
+- **AND** the result MUST be sufficient to determine whether semantics changed
+
+#### Scenario: Phase 2 SIMD validation is run
+- **WHEN** a newly introduced SIMD runtime path is validated in its Phase 2 form
+- **THEN** the benchmark MUST still be able to compare it directly against both fallback and Phase 1 under the same operating point
+- **AND** the result MUST be sufficient to determine whether Phase 2 provided benefit beyond Phase 1 without changing semantics
+
+## MODIFIED Requirements (from query-simd-consolidation-and-expansion)
+
+### Requirement: E2E benchmark 必须报告 Stage 1 和 Stage 2 的候选流统计
+用于 epsilon 验证和 resident 主路径分析的 benchmark 输出 MUST 包含分析候选流与 query 主路径变化所需的统计，而不能只输出最终延迟。除现有 Stage 1 / Stage 2 候选计数外，resident 主路径运行还 MUST 导出 `coarse_select_ms`、`probe_prepare_ms`、`probe_stage1_ms`、`probe_stage2_ms`、`probe_classify_ms` 和 `probe_submit_ms`。
+
+当 query-path SIMD 能力在细粒度诊断模式下被验证时，benchmark 输出还 MUST 保持 `probe_stage2_collect_ms`、`probe_stage2_kernel_ms`、`probe_stage2_scatter_ms` 等子项可见，并确保 current path 与 fallback path 在 `query_only` 与 `full_e2e` 两种模式下都能同口径比较。
+
+#### Scenario: 候选流统计被导出
+- **当** 一次 epsilon 验证运行结束时
+- **则** 输出中必须包含 `avg_total_probed`
+- **并且** 输出中必须包含 Stage 1 `SafeOut`
+- **并且** 输出中必须包含 Stage 2 `SafeOut`
+- **并且** 输出中必须包含 Stage 2 `Uncertain`
+- **并且** 输出中必须包含 `avg_probe_time_ms`
+
+#### Scenario: Resident query-path breakdown is exported
+- **WHEN** benchmark 在 resident 优化路径上运行
+- **THEN** 输出中 MUST 包含 `avg_coarse_select_ms`
+- **AND** MUST 包含 `avg_probe_prepare_ms`
+- **AND** MUST 包含 `avg_probe_stage1_ms`
+- **AND** MUST 包含 `avg_probe_stage2_ms`
+- **AND** MUST 包含 `avg_probe_classify_ms`
+- **AND** MUST 包含 `avg_probe_submit_ms`
+
+#### Scenario: Fine-grained Stage2 comparison is preserved
+- **WHEN** benchmark 以细粒度诊断模式验证 query-path SIMD
+- **THEN** 输出中 MUST 包含 `avg_probe_stage2_collect_ms`
+- **AND** MUST 包含 `avg_probe_stage2_kernel_ms`
+- **AND** MUST 包含 `avg_probe_stage2_scatter_ms`
+- **AND** 这些字段 MUST 能在 current path 与 fallback path 之间直接比较
+
+## ADDED Requirements (from nonpow2-padded-hadamard-rotation)
+
+### Requirement: E2E benchmark MUST preserve prepare and Stage1 fine-grained observability for fused-kernel comparison
+在 query 主路径继续推进 fused `quantize + lut_build` 和 Stage1 后续 SIMD 优化时，benchmark 输出 SHALL 保持 prepare 与 Stage1 的细粒度子项可见，以便同口径比较参考路径、保留两段版和融合版。对于 padded-Hadamard 评估，benchmark 输出还 MUST 显式报告 `logical_dim`、`effective_dim`、`padding_mode`、`rotation_mode`，并能区分 prepare 中的 rotation 成本与 quantize/LUT 成本。
+
+prepare 至少 MUST 包含：
+
+- `probe_prepare_subtract_ms`
+- `probe_prepare_normalize_ms`
+- `probe_prepare_quantize_ms`
+- `probe_prepare_lut_build_ms`
+
+Stage1 至少 MUST 包含：
+
+- `probe_stage1_estimate_ms`
+- `probe_stage1_mask_ms`
+- `probe_stage1_iterate_ms`
+- `probe_stage1_classify_only_ms`
+- `probe_submit_ms`
+
+#### Scenario: Fused prepare is benchmarked under the same field schema
+- **WHEN** 系统切换到 fused `quantize + lut_build` 路径
+- **THEN** benchmark 输出 MUST 仍然保留 prepare 四段字段
+- **AND** 这些字段 MUST 能与参考路径直接对比
+
+#### Scenario: Padded-Hadamard metadata is exported with query results
+- **WHEN** benchmark 在 padded-Hadamard 候选路径上运行
+- **THEN** 输出 MUST 包含 `logical_dim`、`effective_dim`、`padding_mode` 和 `rotation_mode`
+- **AND** 输出 MUST 足以区分 baseline random rotation 与 padded Hadamard
+
+### Requirement: E2E benchmark 必须输出新分段统计字段
+在线 E2E benchmark MUST 输出至少以下字段：`probe_ms`、`prefetch_submit_ms`、`prefetch_wait_ms`、`safein_payload_prefetch_ms`、`candidate_collect_ms`、`pool_vector_read_ms`、`rerank_compute_ms`、`remaining_payload_fetch_ms`、`e2e_ms`、`num_candidates_buffered`、`num_candidates_reranked`、`num_safein_payload_prefetched`、`num_remaining_payload_fetches`。对于 padded-Hadamard 比较，输出还 MUST 支持记录 prepare-rotation 与 prepare-quant-lut 两个总览字段。
+
+#### Scenario: benchmark 输出新统计字段
+- **WHEN** benchmark 完成一次查询轮次并写出结果
+- **THEN** 结果中必须包含约定的新分段时间和候选计数字段
+
+#### Scenario: Padded-Hadamard comparison exposes rotation tradeoff
+- **WHEN** benchmark 导出一条 padded-Hadamard 比较结果
+- **THEN** 结果 MUST 至少包含 `prepare_rotation_ms` 或等价字段
+- **AND** MUST 包含 `prepare_quant_lut_ms` 或等价字段
+- **AND** MUST 让使用者判断"更快的 rotation"是否被"更大的 effective_dim 线性成本"抵消

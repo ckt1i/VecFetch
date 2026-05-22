@@ -31,10 +31,17 @@ RotationMatrix::RotationMatrix(RotationMatrix&& other) noexcept
       block_sizes_(std::move(other.block_sizes_)),
       permutation_(std::move(other.permutation_)),
       inverse_permutation_(std::move(other.inverse_permutation_)),
+      fht_kac_padded_dim_(other.fht_kac_padded_dim_),
+      fht_kac_trunc_dim_(other.fht_kac_trunc_dim_),
+      fht_kac_num_rounds_(other.fht_kac_num_rounds_),
+      fht_kac_signs_(std::move(other.fht_kac_signs_)),
       seed_(other.seed_) {
     other.dim_ = 0;
     other.kind_ = RotationKind::RandomMatrix;
     other.use_fast_hadamard_ = false;
+    other.fht_kac_padded_dim_ = 0;
+    other.fht_kac_trunc_dim_ = 0;
+    other.fht_kac_num_rounds_ = 0;
     other.seed_ = 0;
 }
 
@@ -48,10 +55,17 @@ RotationMatrix& RotationMatrix::operator=(RotationMatrix&& other) noexcept {
         block_sizes_ = std::move(other.block_sizes_);
         permutation_ = std::move(other.permutation_);
         inverse_permutation_ = std::move(other.inverse_permutation_);
+        fht_kac_padded_dim_ = other.fht_kac_padded_dim_;
+        fht_kac_trunc_dim_ = other.fht_kac_trunc_dim_;
+        fht_kac_num_rounds_ = other.fht_kac_num_rounds_;
+        fht_kac_signs_ = std::move(other.fht_kac_signs_);
         seed_ = other.seed_;
         other.dim_ = 0;
         other.kind_ = RotationKind::RandomMatrix;
         other.use_fast_hadamard_ = false;
+        other.fht_kac_padded_dim_ = 0;
+        other.fht_kac_trunc_dim_ = 0;
+        other.fht_kac_num_rounds_ = 0;
         other.seed_ = 0;
     }
     return *this;
@@ -69,6 +83,10 @@ void RotationMatrix::GenerateRandom(uint64_t seed) {
     block_sizes_.clear();
     permutation_.clear();
     inverse_permutation_.clear();
+    fht_kac_padded_dim_ = 0;
+    fht_kac_trunc_dim_ = 0;
+    fht_kac_num_rounds_ = 0;
+    fht_kac_signs_.clear();
 
     const size_t L = dim_;
     const size_t n = L * L;
@@ -180,6 +198,22 @@ std::vector<uint32_t> GreedyPowerOf2Blocks(uint32_t dim) {
     return blocks;
 }
 
+uint32_t RoundUpToMultiple(uint32_t value, uint32_t multiple) {
+    if (multiple == 0) {
+        return value;
+    }
+    const uint32_t rem = value % multiple;
+    return rem == 0 ? value : (value + (multiple - rem));
+}
+
+uint32_t FloorPowerOf2(uint32_t value) {
+    uint32_t p = 1u;
+    while ((p << 1u) > p && (p << 1u) <= value) {
+        p <<= 1u;
+    }
+    return p;
+}
+
 void ApplyHadamardDiagonalBlock(const int8_t* signs,
                                 uint32_t block_size,
                                 float* values) {
@@ -239,6 +273,71 @@ void ApplyBlockedFastInverse(const std::vector<uint32_t>& permutation,
     }
 }
 
+void ApplyFhtKacSigns(const int8_t* signs, uint32_t dim, float* values) {
+    for (uint32_t i = 0; i < dim; ++i) {
+        values[i] *= static_cast<float>(signs[i]);
+    }
+}
+
+void ApplyNormalizedFwhtWindow(float* values, uint32_t start, uint32_t width) {
+    if (width == 0) {
+        return;
+    }
+    FWHT_InPlace(values + start, width);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(width));
+    for (uint32_t i = 0; i < width; ++i) {
+        values[start + i] *= scale;
+    }
+}
+
+void ApplyNormalizedHalfMix(float* values, uint32_t dim) {
+    const uint32_t half = dim / 2u;
+    const float scale = 0.7071067811865475f;
+    for (uint32_t i = 0; i < half; ++i) {
+        const float x = values[i];
+        const float y = values[i + half];
+        values[i] = (x + y) * scale;
+        values[i + half] = (x - y) * scale;
+    }
+}
+
+void ApplyFhtKacFast(const std::vector<int8_t>& signs,
+                     uint32_t dim,
+                     uint32_t trunc_dim,
+                     uint32_t num_rounds,
+                     const float* in,
+                     float* out) {
+    std::memcpy(out, in, static_cast<size_t>(dim) * sizeof(float));
+    for (uint32_t round = 0; round < num_rounds; ++round) {
+        ApplyFhtKacSigns(signs.data() + static_cast<size_t>(round) * dim, dim, out);
+        uint32_t start = 0;
+        if (trunc_dim != dim && (round & 1u) != 0u) {
+            start = dim - trunc_dim;
+        }
+        ApplyNormalizedFwhtWindow(out, start, trunc_dim);
+        ApplyNormalizedHalfMix(out, dim);
+    }
+}
+
+void ApplyFhtKacFastInverse(const std::vector<int8_t>& signs,
+                            uint32_t dim,
+                            uint32_t trunc_dim,
+                            uint32_t num_rounds,
+                            const float* in,
+                            float* out) {
+    std::memcpy(out, in, static_cast<size_t>(dim) * sizeof(float));
+    for (uint32_t round = num_rounds; round > 0; --round) {
+        const uint32_t idx = round - 1u;
+        ApplyNormalizedHalfMix(out, dim);
+        uint32_t start = 0;
+        if (trunc_dim != dim && (idx & 1u) != 0u) {
+            start = dim - trunc_dim;
+        }
+        ApplyNormalizedFwhtWindow(out, start, trunc_dim);
+        ApplyFhtKacSigns(signs.data() + static_cast<size_t>(idx) * dim, dim, out);
+    }
+}
+
 }  // namespace
 
 bool RotationMatrix::GenerateHadamard(uint64_t seed, bool use_fast_transform) {
@@ -252,6 +351,10 @@ bool RotationMatrix::GenerateHadamard(uint64_t seed, bool use_fast_transform) {
     block_sizes_.clear();
     permutation_.clear();
     inverse_permutation_.clear();
+    fht_kac_padded_dim_ = 0;
+    fht_kac_trunc_dim_ = 0;
+    fht_kac_num_rounds_ = 0;
+    fht_kac_signs_.clear();
 
     // Generate random diagonal signs
     std::mt19937_64 rng = MakeRng(seed);
@@ -294,6 +397,10 @@ bool RotationMatrix::GenerateBlockedHadamardPermuted(uint64_t seed,
     kind_ = RotationKind::BlockedHadamardPermuted;
     use_fast_hadamard_ = use_fast_transform;
     seed_ = seed;
+    fht_kac_padded_dim_ = 0;
+    fht_kac_trunc_dim_ = 0;
+    fht_kac_num_rounds_ = 0;
+    fht_kac_signs_.clear();
     block_sizes_ = GreedyPowerOf2Blocks(dim_);
     permutation_.resize(dim_);
     inverse_permutation_.resize(dim_);
@@ -324,6 +431,46 @@ bool RotationMatrix::GenerateBlockedHadamardPermuted(uint64_t seed,
     return true;
 }
 
+bool RotationMatrix::GenerateFhtKacRotator(uint64_t seed,
+                                           bool use_fast_transform) {
+    if (dim_ == 0) {
+        return false;
+    }
+
+    kind_ = RotationKind::FhtKacRotator;
+    use_fast_hadamard_ = use_fast_transform;
+    seed_ = seed;
+    diag_signs_.clear();
+    block_sizes_.clear();
+    permutation_.clear();
+    inverse_permutation_.clear();
+    fht_kac_padded_dim_ = RoundUpToMultiple(dim_, 64u);
+    fht_kac_trunc_dim_ = FloorPowerOf2(dim_);
+    fht_kac_num_rounds_ = 4u;
+    if (fht_kac_padded_dim_ != dim_) {
+        return false;
+    }
+
+    std::mt19937_64 rng = MakeRng(seed);
+    std::uniform_int_distribution<int> coin(0, 1);
+    fht_kac_signs_.resize(static_cast<size_t>(fht_kac_num_rounds_) * dim_);
+    for (size_t i = 0; i < fht_kac_signs_.size(); ++i) {
+        fht_kac_signs_[i] = coin(rng) ? +1 : -1;
+    }
+
+    data_.assign(static_cast<size_t>(dim_) * dim_, 0.0f);
+    std::vector<float> basis(dim_, 0.0f);
+    std::vector<float> row(dim_, 0.0f);
+    for (size_t i = 0; i < dim_; ++i) {
+        std::fill(basis.begin(), basis.end(), 0.0f);
+        basis[i] = 1.0f;
+        ApplyFhtKacFast(fht_kac_signs_, dim_, fht_kac_trunc_dim_,
+                        fht_kac_num_rounds_, basis.data(), row.data());
+        std::memcpy(data_.data() + i * dim_, row.data(), dim_ * sizeof(float));
+    }
+    return true;
+}
+
 // ============================================================================
 // Apply — P^T × in (encoding/query rotation)
 // ============================================================================
@@ -334,6 +481,9 @@ void RotationMatrix::Apply(const float* VDB_RESTRICT in,
 
     if (kind_ == RotationKind::BlockedHadamardPermuted && use_fast_hadamard_) {
         ApplyBlockedFast(permutation_, block_sizes_, diag_signs_, in, out);
+    } else if (kind_ == RotationKind::FhtKacRotator && use_fast_hadamard_) {
+        ApplyFhtKacFast(fht_kac_signs_, dim_, fht_kac_trunc_dim_,
+                        fht_kac_num_rounds_, in, out);
     } else if (use_fast_hadamard_) {
         // Fast path: O(L log L)
         // P^T = D^T H^T / √L = D H / √L  (since H is symmetric, D is diagonal)
@@ -383,6 +533,9 @@ void RotationMatrix::ApplyInverse(const float* VDB_RESTRICT in,
 
     if (kind_ == RotationKind::BlockedHadamardPermuted && use_fast_hadamard_) {
         ApplyBlockedFastInverse(permutation_, block_sizes_, diag_signs_, in, out);
+    } else if (kind_ == RotationKind::FhtKacRotator && use_fast_hadamard_) {
+        ApplyFhtKacFastInverse(fht_kac_signs_, dim_, fht_kac_trunc_dim_,
+                               fht_kac_num_rounds_, in, out);
     } else if (use_fast_hadamard_) {
         // P = (1/√L) H × D
         // P × in = (1/√L) H × (D × in)
@@ -432,15 +585,18 @@ Status RotationMatrix::Save(const std::string& path) const {
     const size_t data_bytes = static_cast<size_t>(dim_) * dim_ * sizeof(float);
     ofs.write(reinterpret_cast<const char*>(data_.data()), data_bytes);
 
-    // Write flags: bit0 = use_fast_hadamard_, bit1 = blocked-hadamard-permuted
+    // Write flags: bit0 = use_fast_hadamard_, bit1 = blocked-hadamard-permuted,
+    // bit2 = fht-kac-rotator.
     uint8_t flags = use_fast_hadamard_ ? 1u : 0u;
     if (kind_ == RotationKind::BlockedHadamardPermuted) {
         flags |= 2u;
+    } else if (kind_ == RotationKind::FhtKacRotator) {
+        flags |= 4u;
     }
     ofs.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
 
     // When Hadamard mode, write diag_signs (dim × int8)
-    if (use_fast_hadamard_) {
+    if (use_fast_hadamard_ && kind_ != RotationKind::FhtKacRotator) {
         ofs.write(reinterpret_cast<const char*>(diag_signs_.data()),
                   static_cast<std::streamsize>(diag_signs_.size()) * sizeof(int8_t));
     }
@@ -454,6 +610,17 @@ Status RotationMatrix::Save(const std::string& path) const {
                   static_cast<std::streamsize>(num_blocks) * sizeof(uint32_t));
         ofs.write(reinterpret_cast<const char*>(permutation_.data()),
                   static_cast<std::streamsize>(permutation_.size()) * sizeof(uint32_t));
+    } else if (flags & 4u) {
+        const uint64_t persisted_seed = seed_;
+        ofs.write(reinterpret_cast<const char*>(&persisted_seed), sizeof(persisted_seed));
+        ofs.write(reinterpret_cast<const char*>(&fht_kac_padded_dim_),
+                  sizeof(fht_kac_padded_dim_));
+        ofs.write(reinterpret_cast<const char*>(&fht_kac_trunc_dim_),
+                  sizeof(fht_kac_trunc_dim_));
+        ofs.write(reinterpret_cast<const char*>(&fht_kac_num_rounds_),
+                  sizeof(fht_kac_num_rounds_));
+        ofs.write(reinterpret_cast<const char*>(fht_kac_signs_.data()),
+                  static_cast<std::streamsize>(fht_kac_signs_.size()) * sizeof(int8_t));
     }
 
     if (!ofs.good()) {
@@ -497,7 +664,7 @@ StatusOr<RotationMatrix> RotationMatrix::Load(const std::string& path, Dim dim) 
 
     RotationMatrix result(dim, std::move(data));
 
-    if (flags & 1u) {
+    if ((flags & 1u) && !(flags & 4u)) {
         // Hadamard mode: read diag_signs (dim × int8)
         std::vector<int8_t> diag_signs(dim);
         ifs.read(reinterpret_cast<char*>(diag_signs.data()),
@@ -507,13 +674,16 @@ StatusOr<RotationMatrix> RotationMatrix::Load(const std::string& path, Dim dim) 
         }
         result.use_fast_hadamard_ = true;
         result.diag_signs_ = std::move(diag_signs);
+    } else if (flags & 4u) {
+        result.use_fast_hadamard_ = true;
     } else {
         result.use_fast_hadamard_ = false;
     }
 
     result.kind_ = (flags & 2u) ? RotationKind::BlockedHadamardPermuted
-                                : ((flags & 1u) ? RotationKind::Hadamard
-                                                : RotationKind::RandomMatrix);
+                                : ((flags & 4u) ? RotationKind::FhtKacRotator
+                                                : ((flags & 1u) ? RotationKind::Hadamard
+                                                                : RotationKind::RandomMatrix));
 
     if (flags & 2u) {
         uint64_t seed = 0;
@@ -555,6 +725,35 @@ StatusOr<RotationMatrix> RotationMatrix::Load(const std::string& path, Dim dim) 
         result.block_sizes_ = std::move(block_sizes);
         result.permutation_ = std::move(permutation);
         result.inverse_permutation_ = std::move(inverse);
+    } else if (flags & 4u) {
+        uint64_t seed = 0;
+        uint32_t padded_dim = 0;
+        uint32_t trunc_dim = 0;
+        uint32_t num_rounds = 0;
+        ifs.read(reinterpret_cast<char*>(&seed), sizeof(seed));
+        ifs.read(reinterpret_cast<char*>(&padded_dim), sizeof(padded_dim));
+        ifs.read(reinterpret_cast<char*>(&trunc_dim), sizeof(trunc_dim));
+        ifs.read(reinterpret_cast<char*>(&num_rounds), sizeof(num_rounds));
+        if (!ifs.good()) {
+            return Status::Corruption("Failed to read fht-kac metadata");
+        }
+        if (padded_dim != dim || RoundUpToMultiple(dim, 64u) != dim) {
+            return Status::Corruption("FhtKac padded dimension mismatch");
+        }
+        if (!IsPowerOf2(trunc_dim) || trunc_dim > dim) {
+            return Status::Corruption("FhtKac trunc_dim is invalid");
+        }
+        std::vector<int8_t> signs(static_cast<size_t>(num_rounds) * dim);
+        ifs.read(reinterpret_cast<char*>(signs.data()),
+                 static_cast<std::streamsize>(signs.size()) * sizeof(int8_t));
+        if (!ifs.good()) {
+            return Status::Corruption("Failed to read fht-kac sign payload");
+        }
+        result.seed_ = seed;
+        result.fht_kac_padded_dim_ = padded_dim;
+        result.fht_kac_trunc_dim_ = trunc_dim;
+        result.fht_kac_num_rounds_ = num_rounds;
+        result.fht_kac_signs_ = std::move(signs);
     } else {
         result.seed_ = 0;
     }

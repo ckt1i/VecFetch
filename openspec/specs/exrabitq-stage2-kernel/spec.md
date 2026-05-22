@@ -49,3 +49,7 @@ If Stage 2 layout changes are required after Stage 1, the system SHALL consider 
 #### Scenario: Compact layout is treated as a larger migration
 - **WHEN** compact ex-code layout is proposed
 - **THEN** the design SHALL treat it as a broader storage and migration change rather than as a kernel-only adjustment
+
+## 新增要求
+
+### Requirement: Stage 2 compact kernel 应将 sign handling 和 magnitude consumption 作为可分离的热路径组件来优化

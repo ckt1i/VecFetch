@@ -144,6 +144,7 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     CleanupPendingSlots();
     pending_all_plans_.clear();
     pending_vec_only_plans_.clear();
+    pending_vec_only_head_ = 0;
     next_to_submit_ = 0;
     inflight_clusters_ = 0;
     est_heap_.clear();
@@ -224,7 +225,8 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
 
 uint32_t OverlapScheduler::PendingDataRequestCount() const {
     return static_cast<uint32_t>(
-        pending_all_plans_.size() + pending_vec_only_plans_.size());
+        pending_all_plans_.size() +
+        (pending_vec_only_plans_.size() - pending_vec_only_head_));
 }
 
 void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
@@ -237,7 +239,6 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
 
     auto emit_all = [&](uint32_t count) {
         if (count == 0) return;
-        auto tp0 = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < count; ++i) {
             const ReadPlanEntry& plan = pending_all_plans_.front();
             uint8_t* buf = buffer_pool_.Acquire(plan.read_length);
@@ -246,45 +247,60 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
             pio.addr = plan.addr;
             pio.read_offset = plan.addr.offset;
             pio.read_length = plan.read_length;
-            const uint32_t slot_id =
-                AllocatePendingSlot(pio, buf, PendingBufferCleanup::Pool);
+            auto alloc_start = std::chrono::steady_clock::now();
+            const uint32_t slot_id = AllocatePendingSlot(
+                pio, buf, PendingBufferCleanup::Pool);
+            ctx.stats().probe_submit_pending_slot_alloc_ms +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - alloc_start).count();
+            auto prep_start = std::chrono::steady_clock::now();
             CheckPrepRead(data_reader_.PrepReadTagged(
                               dat_fd, buf, plan.read_length, plan.addr.offset,
                               slot_id),
                           "scheduler VEC_ALL");
+            const double prep_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - prep_start).count();
+            ctx.stats().uring_prep_ms += prep_ms;
+            ctx.stats().probe_submit_prep_read_ms += prep_ms;
+            ctx.stats().all_read_requests++;
             pending_all_plans_.pop_front();
         }
-        const double elapsed = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - tp0).count();
-        ctx.stats().uring_prep_ms += elapsed;
-        ctx.stats().probe_submit_prepare_all_ms += elapsed;
-        ctx.stats().probe_submit_emit_ms += elapsed;
-        ctx.stats().probe_submit_ms += elapsed;
     };
 
     auto emit_vec_only = [&](uint32_t count) {
         if (count == 0) return;
-        auto tp0 = std::chrono::steady_clock::now();
+        auto emit_start = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < count; ++i) {
-            const ReadPlanEntry& plan = pending_vec_only_plans_.front();
+            const VecOnlyReadPlan& plan = pending_vec_only_plans_[pending_vec_only_head_];
             uint8_t* buf = nullptr;
             uint16_t fixed_idx = 0;
             const bool use_fixed_buffer =
                 TryAcquireFixedVecBuffer(&buf, &fixed_idx);
+            if (use_fixed_buffer) {
+                ctx.stats().fixed_vec_buffer_hits++;
+            } else {
+                ctx.stats().fixed_vec_buffer_misses++;
+            }
             if (!use_fixed_buffer) {
                 buf = buffer_pool_.Acquire(vec_bytes_);
             }
-            PendingIO pio;
-            pio.type = PendingIO::Type::VEC_ONLY;
-            pio.addr = plan.addr;
-            pio.read_offset = plan.addr.offset;
-            pio.read_length = vec_bytes_;
-            const uint32_t slot_id = AllocatePendingSlot(
-                pio, buf,
+            auto alloc_start = std::chrono::steady_clock::now();
+            const uint32_t slot_id = AllocateVectorOnlyPendingSlot(
+                plan.addr, buf,
                 use_fixed_buffer ? PendingBufferCleanup::FixedVec
                                  : PendingBufferCleanup::Pool,
                 fixed_idx);
-            if (use_fixed_buffer && fixed_buffer_reader_ != nullptr) {
+            ctx.stats().probe_submit_pending_slot_alloc_ms +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - alloc_start).count();
+            auto prep_start = std::chrono::steady_clock::now();
+            if (use_fixed_buffer && fixed_buffer_reader_ != nullptr &&
+                data_fd_registered_index_ >= 0) {
+                CheckPrepRead(fixed_buffer_reader_->PrepReadRegisteredBufferFixedFileTagged(
+                                  data_fd_registered_index_, buf, fixed_idx,
+                                  vec_bytes_, plan.addr.offset, slot_id),
+                              "scheduler VEC_ONLY fixed");
+            } else if (use_fixed_buffer && fixed_buffer_reader_ != nullptr) {
                 CheckPrepRead(fixed_buffer_reader_->PrepReadRegisteredBufferTagged(
                                   dat_fd, buf, fixed_idx, vec_bytes_,
                                   plan.addr.offset, slot_id),
@@ -295,21 +311,28 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
                                   slot_id),
                               "scheduler VEC_ONLY");
             }
-            pending_vec_only_plans_.pop_front();
+            const double prep_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - prep_start).count();
+            ctx.stats().uring_prep_ms += prep_ms;
+            ctx.stats().probe_submit_prep_read_ms += prep_ms;
+            ctx.stats().vec_only_read_requests++;
+            ++pending_vec_only_head_;
         }
-        const double elapsed = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - tp0).count();
-        ctx.stats().uring_prep_ms += elapsed;
-        ctx.stats().probe_submit_prepare_vec_only_ms += elapsed;
-        ctx.stats().probe_submit_emit_ms += elapsed;
-        ctx.stats().probe_submit_ms += elapsed;
+        ctx.stats().probe_submit_vec_only_emit_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - emit_start).count();
     };
 
     const uint32_t all_take =
         std::min<uint32_t>(remaining, static_cast<uint32_t>(pending_all_plans_.size()));
+    auto emit_start = std::chrono::steady_clock::now();
     emit_all(all_take);
     remaining -= all_take;
     emit_vec_only(remaining);
+    const double emit_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - emit_start).count();
+    ctx.stats().probe_submit_emit_ms += emit_ms;
+    ctx.stats().probe_submit_ms += emit_ms;
     ctx.stats().probe_time_ms = ctx.stats().probe_prepare_ms +
         ctx.stats().probe_stage1_ms + ctx.stats().probe_stage2_ms +
         ctx.stats().probe_submit_ms;
@@ -483,6 +506,30 @@ uint32_t OverlapScheduler::AllocatePendingSlot(PendingIO io, uint8_t* buffer,
     return slot_id;
 }
 
+uint32_t OverlapScheduler::AllocateVectorOnlyPendingSlot(
+    AddressEntry addr, uint8_t* buffer, PendingBufferCleanup cleanup,
+    uint16_t fixed_buffer_index) {
+    uint32_t slot_id = 0;
+    if (!free_pending_slots_.empty()) {
+        slot_id = free_pending_slots_.back();
+        free_pending_slots_.pop_back();
+    } else {
+        slot_id = static_cast<uint32_t>(pending_slots_.size());
+        pending_slots_.emplace_back();
+    }
+
+    PendingSlot& slot = pending_slots_[slot_id];
+    slot.in_use = true;
+    slot.buffer = buffer;
+    slot.fixed_buffer_index = fixed_buffer_index;
+    slot.cleanup = cleanup;
+    slot.io.type = PendingIO::Type::VEC_ONLY;
+    slot.io.addr = addr;
+    slot.io.read_offset = addr.offset;
+    slot.io.read_length = vec_bytes_;
+    return slot_id;
+}
+
 OverlapScheduler::PendingSlot* OverlapScheduler::GetPendingSlot(
     uint64_t slot_token) {
     uint32_t slot_id = static_cast<uint32_t>(slot_token);
@@ -597,6 +644,8 @@ void OverlapScheduler::InitializeDataBufferSlab() {
 
     fixed_buffer_reader_ = uring_reader;
     fixed_vec_buffers_enabled_ = true;
+    data_fd_registered_index_ = uring_reader->RegisteredFileIndex(
+        index_.segment().data_reader().fd());
 }
 
 // ============================================================================
@@ -834,6 +883,7 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
     }
 
     void BuildReadPlans(const index::CandidateBatch& batch) {
+        auto all_start = std::chrono::steady_clock::now();
         for (uint32_t pos = 0; pos < scratch_.safein_all_count; ++pos) {
             const uint32_t unique_idx = scratch_.safein_all_indices[pos];
             const AddressEntry& addr = batch.decoded_addr[scratch_.unique_indices[unique_idx]];
@@ -844,20 +894,17 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
             sched_.pending_all_plans_.push_back(plan);
             ctx_.stats().total_submit_window_requests++;
         }
-
-        auto all_elapsed = std::chrono::steady_clock::now();
         prepare_all_ms_ += std::chrono::duration<double, std::milli>(
-            all_elapsed - all_elapsed).count();
+            std::chrono::steady_clock::now() - all_start).count();
+        auto vec_start = std::chrono::steady_clock::now();
         for (uint32_t pos = 0; pos < scratch_.vec_only_count; ++pos) {
             const uint32_t unique_idx = scratch_.vec_only_indices[pos];
             const AddressEntry& addr = batch.decoded_addr[scratch_.unique_indices[unique_idx]];
-            ReadPlanEntry plan;
-            plan.type = PendingIO::Type::VEC_ONLY;
-            plan.addr = addr;
-            plan.read_length = sched_.vec_bytes_;
-            sched_.pending_vec_only_plans_.push_back(plan);
+            sched_.pending_vec_only_plans_.push_back(VecOnlyReadPlan{addr});
             ctx_.stats().total_submit_window_requests++;
         }
+        prepare_vec_only_ms_ += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - vec_start).count();
     }
 
     OverlapScheduler& sched_;
@@ -1398,6 +1445,7 @@ void OverlapScheduler::FetchMissingPayloads(
         CheckPrepRead(data_reader_.PrepReadTagged(
                           fd, buf, payload_len, payload_off, slot_id),
                       "payload");
+        ctx.stats().payload_read_requests++;
     }
 
     if (data_reader_.prepped() > 0 || data_reader_.InFlight() > 0) {

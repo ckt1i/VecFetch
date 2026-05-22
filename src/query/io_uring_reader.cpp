@@ -9,6 +9,35 @@
 namespace vdb {
 namespace query {
 
+namespace {
+
+struct io_uring_sqe* AcquireSqeWithAutoFlush(struct io_uring* ring,
+                                            uint32_t* in_flight,
+                                            uint32_t* prepped,
+                                            std::string* error) {
+    struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
+    if (sqe != nullptr) {
+        return sqe;
+    }
+    int ret = io_uring_submit(ring);
+    if (ret < 0) {
+        if (error != nullptr) {
+            *error = std::string("io_uring auto-flush submit failed: ") +
+                     strerror(-ret);
+        }
+        return nullptr;
+    }
+    *in_flight += *prepped;
+    *prepped = 0;
+    sqe = io_uring_get_sqe(ring);
+    if (sqe == nullptr && error != nullptr) {
+        *error = "io_uring SQ full after auto-flush";
+    }
+    return sqe;
+}
+
+}  // namespace
+
 struct IoUringReader::Impl {
     struct io_uring ring;
     bool initialized = false;
@@ -125,21 +154,11 @@ Status IoUringReader::RegisterBuffers(const uint8_t* const* bufs,
 Status IoUringReader::PrepReadFixedTagged(int fd_index, uint8_t* buf,
                                           uint32_t len, uint64_t offset,
                                           uint64_t user_data) {
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&impl_->ring);
-    if (!sqe) {
-        int ret = io_uring_submit(&impl_->ring);
-        if (ret < 0) {
-            return Status::IOError(
-                std::string("io_uring auto-flush submit failed: ") +
-                strerror(-ret));
-        }
-        in_flight_ += prepped_;
-        prepped_ = 0;
-
-        sqe = io_uring_get_sqe(&impl_->ring);
-        if (!sqe) {
-            return Status::IOError("io_uring SQ full after auto-flush");
-        }
+    std::string error;
+    struct io_uring_sqe* sqe = AcquireSqeWithAutoFlush(
+        &impl_->ring, &in_flight_, &prepped_, &error);
+    if (sqe == nullptr) {
+        return Status::IOError(error);
     }
     io_uring_prep_read(sqe, fd_index, buf, len, offset);
     sqe->flags |= IOSQE_FIXED_FILE;
@@ -162,58 +181,61 @@ Status IoUringReader::PrepReadRegisteredBufferTagged(int fd, uint8_t* buf,
     if (!impl_->buffers_registered) {
         return Status::InvalidArgument("registered buffer requested before registration");
     }
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&impl_->ring);
-    if (!sqe) {
-        int ret = io_uring_submit(&impl_->ring);
-        if (ret < 0) {
-            return Status::IOError(
-                std::string("io_uring auto-flush submit failed: ") +
-                strerror(-ret));
-        }
-        in_flight_ += prepped_;
-        prepped_ = 0;
-
-        sqe = io_uring_get_sqe(&impl_->ring);
-        if (!sqe) {
-            return Status::IOError("io_uring SQ full after auto-flush");
-        }
-    }
-
-    int fd_idx = impl_->files_registered ? impl_->FindFdIndex(fd) : -1;
+    const int fd_idx = RegisteredFileIndex(fd);
     if (fd_idx >= 0) {
-        io_uring_prep_read_fixed(sqe, fd_idx, buf, len, offset, buf_index);
-        sqe->flags |= IOSQE_FIXED_FILE;
-    } else {
-        io_uring_prep_read_fixed(sqe, fd, buf, len, offset, buf_index);
+        return PrepReadRegisteredBufferFixedFileTagged(
+            fd_idx, buf, buf_index, len, offset, user_data);
     }
+
+    std::string error;
+    struct io_uring_sqe* sqe = AcquireSqeWithAutoFlush(
+        &impl_->ring, &in_flight_, &prepped_, &error);
+    if (sqe == nullptr) {
+        return Status::IOError(error);
+    }
+    io_uring_prep_read_fixed(sqe, fd, buf, len, offset, buf_index);
     io_uring_sqe_set_data64(sqe, user_data);
     ++prepped_;
     return Status::OK();
 }
 
+Status IoUringReader::PrepReadRegisteredBufferFixedFileTagged(
+    int fd_index, uint8_t* buf, uint16_t buf_index, uint32_t len,
+    uint64_t offset, uint64_t user_data) {
+    if (!impl_->buffers_registered) {
+        return Status::InvalidArgument("registered buffer requested before registration");
+    }
+    if (fd_index < 0) {
+        return Status::InvalidArgument("invalid registered file index");
+    }
+    std::string error;
+    struct io_uring_sqe* sqe = AcquireSqeWithAutoFlush(
+        &impl_->ring, &in_flight_, &prepped_, &error);
+    if (sqe == nullptr) {
+        return Status::IOError(error);
+    }
+    io_uring_prep_read_fixed(sqe, fd_index, buf, len, offset, buf_index);
+    sqe->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data64(sqe, user_data);
+    ++prepped_;
+    return Status::OK();
+}
+
+int IoUringReader::RegisteredFileIndex(int fd) const {
+    return impl_->files_registered ? impl_->FindFdIndex(fd) : -1;
+}
+
 Status IoUringReader::PrepReadTagged(int fd, uint8_t* buf,
                                      uint32_t len, uint64_t offset,
                                      uint64_t user_data) {
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&impl_->ring);
-    if (!sqe) {
-        // SQ full — flush current SQEs to kernel, then retry.
-        int ret = io_uring_submit(&impl_->ring);
-        if (ret < 0) {
-            return Status::IOError(
-                std::string("io_uring auto-flush submit failed: ") +
-                strerror(-ret));
-        }
-        in_flight_ += prepped_;
-        prepped_ = 0;
-
-        sqe = io_uring_get_sqe(&impl_->ring);
-        if (!sqe) {
-            return Status::IOError(
-                "io_uring SQ full after auto-flush");
-        }
+    std::string error;
+    struct io_uring_sqe* sqe = AcquireSqeWithAutoFlush(
+        &impl_->ring, &in_flight_, &prepped_, &error);
+    if (sqe == nullptr) {
+        return Status::IOError(error);
     }
     // Automatically use FIXED_FILE if this fd was registered
-    int fd_idx = impl_->files_registered ? impl_->FindFdIndex(fd) : -1;
+    int fd_idx = RegisteredFileIndex(fd);
     if (fd_idx >= 0) {
         io_uring_prep_read(sqe, fd_idx, buf, len, offset);
         sqe->flags |= IOSQE_FIXED_FILE;

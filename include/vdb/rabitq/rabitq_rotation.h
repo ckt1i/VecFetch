@@ -16,6 +16,7 @@ enum class RotationKind : uint8_t {
     RandomMatrix = 0,
     Hadamard = 1,
     BlockedHadamardPermuted = 2,
+    FhtKacRotator = 3,
 };
 
 // ============================================================================
@@ -109,6 +110,14 @@ class RotationMatrix {
     bool GenerateBlockedHadamardPermuted(uint64_t seed = 0,
                                          bool use_fast_transform = true);
 
+    /// Generate an FHT+Kac rotator for non-power-of-two dimensions.
+    ///
+    /// The transform runs a fixed 4-round sequence:
+    ///   sign flip -> alternating normalized FWHT window -> normalized half mix
+    /// The dense matrix is still materialized for debugging and parity checks.
+    bool GenerateFhtKacRotator(uint64_t seed = 0,
+                               bool use_fast_transform = true);
+
     /// Apply the rotation: out = P^T × in (forward rotation for encoding).
     ///
     /// This computes P^{-1} × in = P^T × in since P is orthogonal.
@@ -141,6 +150,9 @@ class RotationMatrix {
     bool is_blocked_hadamard_permuted() const {
         return kind_ == RotationKind::BlockedHadamardPermuted;
     }
+    bool is_fht_kac_rotator() const {
+        return kind_ == RotationKind::FhtKacRotator;
+    }
     uint64_t seed() const { return seed_; }
 
     /// Random diagonal signs for Hadamard mode (length = dim).
@@ -151,6 +163,10 @@ class RotationMatrix {
     const std::vector<uint32_t>& inverse_permutation() const {
         return inverse_permutation_;
     }
+    uint32_t fht_kac_padded_dim() const { return fht_kac_padded_dim_; }
+    uint32_t fht_kac_trunc_dim() const { return fht_kac_trunc_dim_; }
+    uint32_t fht_kac_num_rounds() const { return fht_kac_num_rounds_; }
+    const std::vector<int8_t>& fht_kac_signs() const { return fht_kac_signs_; }
 
     /// Save the rotation matrix to a binary file.
     ///
@@ -177,6 +193,10 @@ class RotationMatrix {
     std::vector<uint32_t> block_sizes_;
     std::vector<uint32_t> permutation_;
     std::vector<uint32_t> inverse_permutation_;
+    uint32_t fht_kac_padded_dim_ = 0;
+    uint32_t fht_kac_trunc_dim_ = 0;
+    uint32_t fht_kac_num_rounds_ = 0;
+    std::vector<int8_t> fht_kac_signs_;
     uint64_t seed_ = 0;
 };
 

@@ -124,6 +124,12 @@ class IoUringReader : public AsyncReader {
                                           uint16_t buf_index,
                                           uint32_t len, uint64_t offset,
                                           uint64_t user_data);
+    Status PrepReadRegisteredBufferFixedFileTagged(int fd_index, uint8_t* buf,
+                                                   uint16_t buf_index,
+                                                   uint32_t len,
+                                                   uint64_t offset,
+                                                   uint64_t user_data);
+    int RegisteredFileIndex(int fd) const;
 
     uint32_t Submit() override;
     uint32_t Poll(IoCompletion* out, uint32_t max_count) override;

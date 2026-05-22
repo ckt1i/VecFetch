@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <limits>
@@ -88,6 +89,9 @@ class OverlapScheduler {
     uint32_t AllocatePendingSlot(PendingIO io, uint8_t* buffer,
                                  PendingBufferCleanup cleanup,
                                  uint16_t fixed_buffer_index = 0);
+    uint32_t AllocateVectorOnlyPendingSlot(AddressEntry addr, uint8_t* buffer,
+                                           PendingBufferCleanup cleanup,
+                                           uint16_t fixed_buffer_index = 0);
     PendingSlot* GetPendingSlot(uint64_t slot_token);
     void ReleasePendingSlot(uint32_t slot_id);
     void CleanupPendingSlot(PendingSlot& slot);
@@ -163,6 +167,10 @@ class OverlapScheduler {
         uint32_t read_length = 0;
     };
 
+    struct VecOnlyReadPlan {
+        AddressEntry addr;
+    };
+
     using PreparedClusterQueryView = rabitq::PreparedClusterQueryView;
     PreparedClusterQueryView PrepareClusterQueryView(const SearchContext& ctx,
                                                      uint32_t cluster_id,
@@ -174,11 +182,13 @@ class OverlapScheduler {
     QueryDedupSet submitted_candidate_offsets_;
     SubmitScratch submit_scratch_;
     std::deque<ReadPlanEntry> pending_all_plans_;
-    std::deque<ReadPlanEntry> pending_vec_only_plans_;
+    std::vector<VecOnlyReadPlan> pending_vec_only_plans_;
+    size_t pending_vec_only_head_ = 0;
     uint32_t next_to_submit_ = 0;
     uint32_t inflight_clusters_ = 0;
 
     uint32_t vec_bytes_;
+    int data_fd_registered_index_ = -1;
 
     // CRC early stop state (reset per Search() call)
     index::CrcStopper crc_stopper_;

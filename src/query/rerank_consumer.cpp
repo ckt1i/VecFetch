@@ -1,9 +1,10 @@
 #include "vdb/query/rerank_consumer.h"
 
 #include <chrono>
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <algorithm>
 #include <unordered_set>
 
 #include "vdb/common/distance.h"
@@ -13,28 +14,65 @@ namespace vdb {
 namespace query {
 
 RerankConsumer::RerankConsumer(SearchContext& ctx, Dim raw_dim)
-    : ctx_(ctx), dim_(raw_dim), vec_bytes_(raw_dim * sizeof(float)) {}
+    : ctx_(ctx),
+      dim_(raw_dim),
+      vec_bytes_(raw_dim * sizeof(float)),
+      aligned_vec_bytes_((vec_bytes_ + 4095u) & ~4095u) {
+    buffered_candidates_.reserve(1024);
+    GrowVectorChunk(aligned_vec_bytes_ * 1024u);
+}
 
 RerankConsumer::~RerankConsumer() = default;
 
+bool RerankConsumer::GrowVectorChunk(uint32_t min_capacity) {
+    const uint32_t chunk_capacity = std::max(aligned_vec_bytes_ * 1024u, min_capacity);
+    auto alloc_start = std::chrono::steady_clock::now();
+    uint8_t* raw = static_cast<uint8_t*>(
+        std::aligned_alloc(4096, chunk_capacity));
+    ctx_.stats().rerank_vec_alloc_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - alloc_start).count();
+    if (raw == nullptr) {
+        return false;
+    }
+    vector_chunks_.push_back(
+        VectorChunk{AlignedBufPtr(raw), chunk_capacity, 0});
+    return true;
+}
+
+const float* RerankConsumer::AllocateVectorCopy(const uint8_t* src) {
+    if (vector_chunks_.empty() ||
+        vector_chunks_.back().used + aligned_vec_bytes_ > vector_chunks_.back().capacity) {
+        if (!GrowVectorChunk(aligned_vec_bytes_)) {
+            std::fprintf(stderr, "FATAL: aligned_alloc failed for rerank vector slab (%u bytes)\n",
+                         aligned_vec_bytes_);
+            std::abort();
+        }
+    }
+    VectorChunk& chunk = vector_chunks_.back();
+    uint8_t* dst = chunk.storage.get() + chunk.used;
+    auto copy_start = std::chrono::steady_clock::now();
+    std::memcpy(dst, src, vec_bytes_);
+    ctx_.stats().rerank_vec_copy_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - copy_start).count();
+    chunk.used += aligned_vec_bytes_;
+    return reinterpret_cast<const float*>(dst);
+}
+
+void RerankConsumer::ResetVectorChunks() {
+    for (auto& chunk : vector_chunks_) {
+        chunk.used = 0;
+    }
+}
+
 void RerankConsumer::ConsumeVec(uint8_t* buf, AddressEntry addr) {
-    uint32_t aligned_vec_bytes = (vec_bytes_ + 4095u) & ~4095u;
-    uint8_t* vec_copy = static_cast<uint8_t*>(
-        std::aligned_alloc(4096, aligned_vec_bytes));
-    std::memcpy(vec_copy, buf, vec_bytes_);
     buffered_candidates_.push_back(
-        BufferedCandidate{addr, AlignedBufPtr(vec_copy)});
+        BufferedCandidate{addr, AllocateVectorCopy(buf)});
     ctx_.stats().buffered_candidates++;
 }
 
 void RerankConsumer::ConsumeAll(uint8_t* buf, AddressEntry addr) {
-    const float* vec = reinterpret_cast<const float*>(buf);
-    uint32_t aligned_vec_bytes = (vec_bytes_ + 4095u) & ~4095u;
-    uint8_t* vec_copy = static_cast<uint8_t*>(
-        std::aligned_alloc(4096, aligned_vec_bytes));
-    std::memcpy(vec_copy, vec, vec_bytes_);
     buffered_candidates_.push_back(
-        BufferedCandidate{addr, AlignedBufPtr(vec_copy)});
+        BufferedCandidate{addr, AllocateVectorCopy(buf)});
     ctx_.stats().buffered_candidates++;
 
     if (addr.size > vec_bytes_) {
@@ -111,8 +149,7 @@ void RerankConsumer::ExecuteBuffered() {
             const float* vec_ptrs[kBatchSize] = {};
             float dists[kBatchSize] = {};
             for (uint32_t i = 0; i < batch_count; ++i) {
-                vec_ptrs[i] = reinterpret_cast<const float*>(
-                    buffered_candidates_[base + i].vec_buf.get());
+                vec_ptrs[i] = buffered_candidates_[base + i].vec;
             }
             simd::L2SqrBatch1xN(ctx_.query_vec(), vec_ptrs, batch_count, dim_, dists);
             for (uint32_t i = 0; i < batch_count; ++i) {
@@ -123,8 +160,7 @@ void RerankConsumer::ExecuteBuffered() {
         }
     } else {
         for (const auto& candidate : buffered_candidates_) {
-            const float* vec = reinterpret_cast<const float*>(candidate.vec_buf.get());
-            float dist = L2Sqr(ctx_.query_vec(), vec, dim_);
+            float dist = L2Sqr(ctx_.query_vec(), candidate.vec, dim_);
             ctx_.collector().TryInsert(dist, candidate.addr);
             ctx_.stats().total_reranked++;
             ctx_.stats().reranked_candidates++;
@@ -133,6 +169,7 @@ void RerankConsumer::ExecuteBuffered() {
     ctx_.stats().rerank_compute_ms += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - compute_start).count();
     buffered_candidates_.clear();
+    ResetVectorChunks();
 }
 
 uint32_t RerankConsumer::BufferedCount() const {

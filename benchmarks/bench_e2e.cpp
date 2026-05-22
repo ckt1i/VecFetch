@@ -475,6 +475,9 @@ struct QueryResult {
     double probe_submit_prepare_vec_only_ms = 0;
     double probe_submit_prepare_all_ms = 0;
     double probe_submit_emit_ms = 0;
+    double probe_submit_vec_only_emit_ms = 0;
+    double probe_submit_pending_slot_alloc_ms = 0;
+    double probe_submit_prep_read_ms = 0;
     double rerank_cpu_ms = 0;
     double prefetch_submit_ms = 0;
     double prefetch_wait_ms = 0;
@@ -482,6 +485,8 @@ struct QueryResult {
     double candidate_collect_ms = 0;
     double pool_vector_read_ms = 0;
     double rerank_compute_ms = 0;
+    double rerank_vec_alloc_ms = 0;
+    double rerank_vec_copy_ms = 0;
     double remaining_payload_fetch_ms = 0;
     double uring_prep_ms = 0;
     double uring_submit_ms = 0;
@@ -491,6 +496,11 @@ struct QueryResult {
     uint32_t submit_window_flushes = 0;
     uint32_t submit_window_tail_flushes = 0;
     uint32_t submit_stop_flushes = 0;
+    uint32_t vec_only_read_requests = 0;
+    uint32_t all_read_requests = 0;
+    uint32_t payload_read_requests = 0;
+    uint32_t fixed_vec_buffer_hits = 0;
+    uint32_t fixed_vec_buffer_misses = 0;
     double submit_window_requests = 0;
     double candidate_batches_per_cluster = 0;
     double crc_estimates_buffered_per_cluster = 0;
@@ -563,6 +573,9 @@ struct RoundMetrics {
     double avg_probe_submit_prepare_vec_only = 0;
     double avg_probe_submit_prepare_all = 0;
     double avg_probe_submit_emit = 0;
+    double avg_probe_submit_vec_only_emit = 0;
+    double avg_probe_submit_pending_slot_alloc = 0;
+    double avg_probe_submit_prep_read = 0;
     double avg_rerank_cpu = 0;
     double avg_prefetch_submit = 0;
     double avg_prefetch_wait = 0;
@@ -570,6 +583,8 @@ struct RoundMetrics {
     double avg_candidate_collect = 0;
     double avg_pool_vector_read = 0;
     double avg_rerank_compute = 0;
+    double avg_rerank_vec_alloc = 0;
+    double avg_rerank_vec_copy = 0;
     double avg_remaining_payload_fetch = 0;
     double avg_uring_prep = 0;
     double avg_uring_submit = 0;
@@ -580,6 +595,11 @@ struct RoundMetrics {
     double avg_submit_window_tail_flushes = 0;
     double avg_submit_stop_flushes = 0;
     double avg_submit_window_requests = 0;
+    double avg_vec_only_read_requests = 0;
+    double avg_all_read_requests = 0;
+    double avg_payload_read_requests = 0;
+    double avg_fixed_vec_buffer_hits = 0;
+    double avg_fixed_vec_buffer_misses = 0;
     double avg_probed_clusters = 0;
     double avg_probed = 0;
     double avg_safe_in = 0;
@@ -702,6 +722,12 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.probe_submit_prepare_all_ms =
             results.stats().probe_submit_prepare_all_ms;
         qr.probe_submit_emit_ms = results.stats().probe_submit_emit_ms;
+        qr.probe_submit_vec_only_emit_ms =
+            results.stats().probe_submit_vec_only_emit_ms;
+        qr.probe_submit_pending_slot_alloc_ms =
+            results.stats().probe_submit_pending_slot_alloc_ms;
+        qr.probe_submit_prep_read_ms =
+            results.stats().probe_submit_prep_read_ms;
         qr.rerank_cpu_ms = results.stats().rerank_cpu_ms;
         qr.prefetch_submit_ms = results.stats().prefetch_submit_ms;
         qr.prefetch_wait_ms = results.stats().prefetch_wait_ms;
@@ -709,6 +735,8 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.candidate_collect_ms = results.stats().candidate_collect_ms;
         qr.pool_vector_read_ms = results.stats().pool_vector_read_ms;
         qr.rerank_compute_ms = results.stats().rerank_compute_ms;
+        qr.rerank_vec_alloc_ms = results.stats().rerank_vec_alloc_ms;
+        qr.rerank_vec_copy_ms = results.stats().rerank_vec_copy_ms;
         qr.remaining_payload_fetch_ms = results.stats().remaining_payload_fetch_ms;
         qr.uring_prep_ms = results.stats().uring_prep_ms;
         qr.uring_submit_ms = results.stats().uring_submit_ms;
@@ -719,6 +747,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.submit_window_tail_flushes =
             results.stats().total_submit_window_tail_flushes;
         qr.submit_stop_flushes = results.stats().total_submit_stop_flushes;
+        qr.vec_only_read_requests = results.stats().vec_only_read_requests;
+        qr.all_read_requests = results.stats().all_read_requests;
+        qr.payload_read_requests = results.stats().payload_read_requests;
+        qr.fixed_vec_buffer_hits = results.stats().fixed_vec_buffer_hits;
+        qr.fixed_vec_buffer_misses = results.stats().fixed_vec_buffer_misses;
         qr.submit_window_requests =
             static_cast<double>(results.stats().total_submit_window_requests);
         qr.crc_decision_ms = results.stats().crc_decision_ms;
@@ -843,10 +876,14 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_probe_submit_prepare_vec_only = 0;
     double sum_probe_submit_prepare_all = 0;
     double sum_probe_submit_emit = 0;
+    double sum_probe_submit_vec_only_emit = 0;
+    double sum_probe_submit_pending_slot_alloc = 0;
+    double sum_probe_submit_prep_read = 0;
     double sum_rerank_cpu = 0;
     double sum_prefetch_submit = 0, sum_prefetch_wait = 0;
     double sum_safein_payload_prefetch = 0, sum_candidate_collect = 0;
     double sum_pool_vector_read = 0, sum_rerank_compute = 0;
+    double sum_rerank_vec_alloc = 0, sum_rerank_vec_copy = 0;
     double sum_remaining_payload_fetch = 0;
     double sum_uring_prep = 0, sum_uring_submit = 0;
     double sum_parse_cluster = 0, sum_fetch_missing = 0;
@@ -855,6 +892,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_submit_window_tail_flushes = 0;
     double sum_submit_stop_flushes = 0;
     double sum_submit_window_requests = 0;
+    double sum_vec_only_read_requests = 0;
+    double sum_all_read_requests = 0;
+    double sum_payload_read_requests = 0;
+    double sum_fixed_vec_buffer_hits = 0;
+    double sum_fixed_vec_buffer_misses = 0;
     double sum_candidate_batches_per_cluster = 0;
     double sum_crc_estimates_buffered_per_cluster = 0;
     double sum_crc_estimates_merged_per_cluster = 0;
@@ -915,6 +957,12 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_probe_submit_prepare_all +=
             qresults[qi].probe_submit_prepare_all_ms;
         sum_probe_submit_emit += qresults[qi].probe_submit_emit_ms;
+        sum_probe_submit_vec_only_emit +=
+            qresults[qi].probe_submit_vec_only_emit_ms;
+        sum_probe_submit_pending_slot_alloc +=
+            qresults[qi].probe_submit_pending_slot_alloc_ms;
+        sum_probe_submit_prep_read +=
+            qresults[qi].probe_submit_prep_read_ms;
         sum_rerank_cpu += qresults[qi].rerank_cpu_ms;
         sum_prefetch_submit += qresults[qi].prefetch_submit_ms;
         sum_prefetch_wait += qresults[qi].prefetch_wait_ms;
@@ -922,6 +970,8 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_candidate_collect += qresults[qi].candidate_collect_ms;
         sum_pool_vector_read += qresults[qi].pool_vector_read_ms;
         sum_rerank_compute += qresults[qi].rerank_compute_ms;
+        sum_rerank_vec_alloc += qresults[qi].rerank_vec_alloc_ms;
+        sum_rerank_vec_copy += qresults[qi].rerank_vec_copy_ms;
         sum_remaining_payload_fetch += qresults[qi].remaining_payload_fetch_ms;
         sum_uring_prep += qresults[qi].uring_prep_ms;
         sum_uring_submit += qresults[qi].uring_submit_ms;
@@ -933,6 +983,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
             qresults[qi].submit_window_tail_flushes;
         sum_submit_stop_flushes += qresults[qi].submit_stop_flushes;
         sum_submit_window_requests += qresults[qi].submit_window_requests;
+        sum_vec_only_read_requests += qresults[qi].vec_only_read_requests;
+        sum_all_read_requests += qresults[qi].all_read_requests;
+        sum_payload_read_requests += qresults[qi].payload_read_requests;
+        sum_fixed_vec_buffer_hits += qresults[qi].fixed_vec_buffer_hits;
+        sum_fixed_vec_buffer_misses += qresults[qi].fixed_vec_buffer_misses;
         sum_candidate_batches_per_cluster += qresults[qi].candidate_batches_per_cluster;
         sum_crc_estimates_buffered_per_cluster +=
             qresults[qi].crc_estimates_buffered_per_cluster;
@@ -987,6 +1042,10 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_probe_submit_prepare_vec_only = sum_probe_submit_prepare_vec_only / Q;
     m.avg_probe_submit_prepare_all = sum_probe_submit_prepare_all / Q;
     m.avg_probe_submit_emit = sum_probe_submit_emit / Q;
+    m.avg_probe_submit_vec_only_emit = sum_probe_submit_vec_only_emit / Q;
+    m.avg_probe_submit_pending_slot_alloc =
+        sum_probe_submit_pending_slot_alloc / Q;
+    m.avg_probe_submit_prep_read = sum_probe_submit_prep_read / Q;
     m.avg_rerank_cpu = sum_rerank_cpu / Q;
     m.avg_prefetch_submit = sum_prefetch_submit / Q;
     m.avg_prefetch_wait = sum_prefetch_wait / Q;
@@ -994,6 +1053,8 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_candidate_collect = sum_candidate_collect / Q;
     m.avg_pool_vector_read = sum_pool_vector_read / Q;
     m.avg_rerank_compute = sum_rerank_compute / Q;
+    m.avg_rerank_vec_alloc = sum_rerank_vec_alloc / Q;
+    m.avg_rerank_vec_copy = sum_rerank_vec_copy / Q;
     m.avg_remaining_payload_fetch = sum_remaining_payload_fetch / Q;
     m.avg_uring_prep = sum_uring_prep / Q;
     m.avg_uring_submit = sum_uring_submit / Q;
@@ -1004,6 +1065,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_submit_window_tail_flushes = sum_submit_window_tail_flushes / Q;
     m.avg_submit_stop_flushes = sum_submit_stop_flushes / Q;
     m.avg_submit_window_requests = sum_submit_window_requests / Q;
+    m.avg_vec_only_read_requests = sum_vec_only_read_requests / Q;
+    m.avg_all_read_requests = sum_all_read_requests / Q;
+    m.avg_payload_read_requests = sum_payload_read_requests / Q;
+    m.avg_fixed_vec_buffer_hits = sum_fixed_vec_buffer_hits / Q;
+    m.avg_fixed_vec_buffer_misses = sum_fixed_vec_buffer_misses / Q;
     m.avg_candidate_batches_per_cluster = sum_candidate_batches_per_cluster / Q;
     m.avg_crc_estimates_buffered_per_cluster =
         sum_crc_estimates_buffered_per_cluster / Q;
@@ -1075,6 +1141,13 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     Log("  %s: submit_prepare_vec_only=%.3f ms  submit_prepare_all=%.3f ms  submit_emit=%.3f ms\n",
         label, m.avg_probe_submit_prepare_vec_only,
         m.avg_probe_submit_prepare_all, m.avg_probe_submit_emit);
+    Log("  %s: submit_vec_only_emit=%.3f ms  submit_slot_alloc=%.3f ms  submit_prep_read=%.3f ms\n",
+        label, m.avg_probe_submit_vec_only_emit,
+        m.avg_probe_submit_pending_slot_alloc, m.avg_probe_submit_prep_read);
+    Log("  %s: vec_only_reads=%.1f  all_reads=%.1f  payload_reads=%.1f  fixed_buf_hit/miss=%.1f/%.1f\n",
+        label, m.avg_vec_only_read_requests, m.avg_all_read_requests,
+        m.avg_payload_read_requests, m.avg_fixed_vec_buffer_hits,
+        m.avg_fixed_vec_buffer_misses);
     Log("  %s: stage1_estimate=%.3f ms  stage1_mask=%.3f ms  stage1_iterate=%.3f ms  stage1_classify=%.3f ms\n",
         label, m.avg_probe_stage1_estimate, m.avg_probe_stage1_mask,
         m.avg_probe_stage1_iterate, m.avg_probe_stage1_classify_only);
@@ -1221,6 +1294,8 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--pad-to-pow2", 0);
     int arg_blocked_hadamard_permuted =
         GetIntArg(argc, argv, "--blocked-hadamard-permuted", 1);
+    int arg_fht_kac_rotator =
+        GetIntArg(argc, argv, "--fht-kac-rotator", 0);
 
     bool arg_cold = HasFlag(argc, argv, "--cold");
     bool arg_direct_io = HasFlag(argc, argv, "--direct-io");
@@ -1603,6 +1678,7 @@ int main(int argc, char* argv[]) {
         cfg.pad_non_power_of_two_to_pow2 = (arg_pad_to_pow2 != 0);
         cfg.use_blocked_hadamard_permuted =
             (arg_blocked_hadamard_permuted != 0);
+        cfg.use_fht_kac_rotator = (arg_fht_kac_rotator != 0);
         cfg.payload_schemas = {
             {0, "id",      DType::INT64,  false},
             {1, "caption", DType::STRING, false},
@@ -2245,6 +2321,7 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("epsilon_percentile", arg_epsilon_percentile) << ",\n";
         f << "    " << JBool("pad_to_pow2", arg_pad_to_pow2 != 0) << ",\n";
         f << "    " << JBool("blocked_hadamard_permuted", arg_blocked_hadamard_permuted != 0) << ",\n";
+        f << "    " << JBool("fht_kac_rotator", arg_fht_kac_rotator != 0) << ",\n";
         f << "    " << JStr("assignment_mode", resolved_assignment_mode) << ",\n";
         f << "    " << JStr("coarse_builder", arg_coarse_builder) << ",\n";
         f << "    " << JStr("requested_metric", index.requested_metric()) << ",\n";
@@ -2412,6 +2489,9 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_probe_submit_prepare_vec_only_ms", metrics.avg_probe_submit_prepare_vec_only) << ",\n";
         f << "    " << JNum("avg_probe_submit_prepare_all_ms", metrics.avg_probe_submit_prepare_all) << ",\n";
         f << "    " << JNum("avg_probe_submit_emit_ms", metrics.avg_probe_submit_emit) << ",\n";
+        f << "    " << JNum("avg_probe_submit_vec_only_emit_ms", metrics.avg_probe_submit_vec_only_emit) << ",\n";
+        f << "    " << JNum("avg_probe_submit_pending_slot_alloc_ms", metrics.avg_probe_submit_pending_slot_alloc) << ",\n";
+        f << "    " << JNum("avg_probe_submit_prep_read_ms", metrics.avg_probe_submit_prep_read) << ",\n";
         f << "    " << JNum("avg_rerank_cpu_ms", metrics.avg_rerank_cpu) << ",\n";
         f << "    " << JNum("avg_prefetch_submit_ms", metrics.avg_prefetch_submit) << ",\n";
         f << "    " << JNum("avg_prefetch_wait_ms", metrics.avg_prefetch_wait) << ",\n";
@@ -2419,6 +2499,8 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_candidate_collect_ms", metrics.avg_candidate_collect) << ",\n";
         f << "    " << JNum("avg_pool_vector_read_ms", metrics.avg_pool_vector_read) << ",\n";
         f << "    " << JNum("avg_rerank_compute_ms", metrics.avg_rerank_compute) << ",\n";
+        f << "    " << JNum("avg_rerank_vec_alloc_ms", metrics.avg_rerank_vec_alloc) << ",\n";
+        f << "    " << JNum("avg_rerank_vec_copy_ms", metrics.avg_rerank_vec_copy) << ",\n";
         f << "    " << JNum("avg_remaining_payload_fetch_ms", metrics.avg_remaining_payload_fetch) << ",\n";
         f << "    " << JNum("avg_uring_prep_ms", metrics.avg_uring_prep) << ",\n";
         f << "    " << JNum("avg_uring_submit_ms", metrics.avg_uring_submit) << ",\n";
@@ -2429,6 +2511,11 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_submit_window_tail_flushes", metrics.avg_submit_window_tail_flushes) << ",\n";
         f << "    " << JNum("avg_submit_stop_flushes", metrics.avg_submit_stop_flushes) << ",\n";
         f << "    " << JNum("avg_submit_window_requests", metrics.avg_submit_window_requests) << ",\n";
+        f << "    " << JNum("avg_vec_only_read_requests", metrics.avg_vec_only_read_requests) << ",\n";
+        f << "    " << JNum("avg_all_read_requests", metrics.avg_all_read_requests) << ",\n";
+        f << "    " << JNum("avg_payload_read_requests", metrics.avg_payload_read_requests) << ",\n";
+        f << "    " << JNum("avg_fixed_vec_buffer_hits", metrics.avg_fixed_vec_buffer_hits) << ",\n";
+        f << "    " << JNum("avg_fixed_vec_buffer_misses", metrics.avg_fixed_vec_buffer_misses) << ",\n";
         f << "    " << JNum("avg_probed_clusters", metrics.avg_probed_clusters) << ",\n";
         f << "    " << JNum("avg_candidate_batches_per_cluster", metrics.avg_candidate_batches_per_cluster) << ",\n";
         f << "    " << JNum("avg_crc_estimates_buffered_per_cluster", metrics.avg_crc_estimates_buffered_per_cluster) << ",\n";
@@ -2505,12 +2592,17 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("probe_submit_prepare_vec_only_ms", qr.probe_submit_prepare_vec_only_ms) << ",\n";
             f << "      " << JNum("probe_submit_prepare_all_ms", qr.probe_submit_prepare_all_ms) << ",\n";
             f << "      " << JNum("probe_submit_emit_ms", qr.probe_submit_emit_ms) << ",\n";
+            f << "      " << JNum("probe_submit_vec_only_emit_ms", qr.probe_submit_vec_only_emit_ms) << ",\n";
+            f << "      " << JNum("probe_submit_pending_slot_alloc_ms", qr.probe_submit_pending_slot_alloc_ms) << ",\n";
+            f << "      " << JNum("probe_submit_prep_read_ms", qr.probe_submit_prep_read_ms) << ",\n";
             f << "      " << JNum("prefetch_submit_ms", qr.prefetch_submit_ms) << ",\n";
             f << "      " << JNum("prefetch_wait_ms", qr.prefetch_wait_ms) << ",\n";
             f << "      " << JNum("safein_payload_prefetch_ms", qr.safein_payload_prefetch_ms) << ",\n";
             f << "      " << JNum("candidate_collect_ms", qr.candidate_collect_ms) << ",\n";
             f << "      " << JNum("pool_vector_read_ms", qr.pool_vector_read_ms) << ",\n";
             f << "      " << JNum("rerank_compute_ms", qr.rerank_compute_ms) << ",\n";
+            f << "      " << JNum("rerank_vec_alloc_ms", qr.rerank_vec_alloc_ms) << ",\n";
+            f << "      " << JNum("rerank_vec_copy_ms", qr.rerank_vec_copy_ms) << ",\n";
             f << "      " << JNum("remaining_payload_fetch_ms", qr.remaining_payload_fetch_ms) << ",\n";
             f << "      " << JInt("num_candidates_buffered", qr.num_candidates_buffered) << ",\n";
             f << "      " << JInt("num_candidates_reranked", qr.num_candidates_reranked) << ",\n";
@@ -2520,6 +2612,11 @@ int main(int argc, char* argv[]) {
             f << "      " << JInt("submit_window_flushes", qr.submit_window_flushes) << ",\n";
             f << "      " << JInt("submit_window_tail_flushes", qr.submit_window_tail_flushes) << ",\n";
             f << "      " << JInt("submit_stop_flushes", qr.submit_stop_flushes) << ",\n";
+            f << "      " << JInt("vec_only_read_requests", qr.vec_only_read_requests) << ",\n";
+            f << "      " << JInt("all_read_requests", qr.all_read_requests) << ",\n";
+            f << "      " << JInt("payload_read_requests", qr.payload_read_requests) << ",\n";
+            f << "      " << JInt("fixed_vec_buffer_hits", qr.fixed_vec_buffer_hits) << ",\n";
+            f << "      " << JInt("fixed_vec_buffer_misses", qr.fixed_vec_buffer_misses) << ",\n";
             f << "      " << JNum("submit_window_requests", qr.submit_window_requests) << ",\n";
             f << "      " << JNum("crc_decision_ms", qr.crc_decision_ms) << ",\n";
             f << "      " << JNum("crc_buffer_ms", qr.crc_buffer_ms) << ",\n";

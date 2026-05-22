@@ -134,6 +134,11 @@ struct IvfBuilderConfig {
     /// When true, non-power-of-two dimensions can use blocked Hadamard with a
     /// deterministic permutation instead of falling back to a dense random matrix.
     bool use_blocked_hadamard_permuted = true;
+
+    /// When true, non-power-of-two dimensions can use the fixed-round
+    /// FHT+Kac rotator. For non-64-multiple dimensions, this path pads only
+    /// to the next multiple of 64.
+    bool use_fht_kac_rotator = false;
 };
 
 // ============================================================================

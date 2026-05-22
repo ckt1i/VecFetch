@@ -54,6 +54,14 @@ uint32_t NextPowerOf2(uint32_t n) {
     return p;
 }
 
+uint32_t RoundUpToMultiple(uint32_t value, uint32_t multiple) {
+    if (multiple == 0) {
+        return value;
+    }
+    const uint32_t rem = value % multiple;
+    return rem == 0 ? value : (value + (multiple - rem));
+}
+
 std::vector<float> PadRowsToDim(const float* vectors, uint32_t rows,
                                 uint32_t old_dim, uint32_t new_dim) {
     std::vector<float> padded(static_cast<size_t>(rows) * new_dim, 0.0f);
@@ -175,7 +183,25 @@ Status IvfBuilder::Build(const float* vectors, uint32_t N, Dim dim,
     const float* calibration_queries = config_.calibration_queries;
     Dim build_dim = dim;
 
-    if (config_.pad_non_power_of_two_to_pow2 && !IsPowerOf2(dim)) {
+    if (!IsPowerOf2(dim) && config_.use_fht_kac_rotator) {
+        effective_dim_ = static_cast<Dim>(RoundUpToMultiple(dim, 64u));
+        build_dim = effective_dim_;
+        padding_mode_ = (effective_dim_ == logical_dim_) ? "none"
+                                                         : "zero_pad_to_64_multiple";
+        if (build_dim != dim) {
+            padded_vectors = PadRowsToDim(vectors, N, dim, build_dim);
+            build_vectors = padded_vectors.data();
+            if (config_.calibration_queries != nullptr &&
+                config_.num_calibration_queries > 0) {
+                padded_calibration_queries = PadRowsToDim(
+                    config_.calibration_queries,
+                    config_.num_calibration_queries,
+                    dim,
+                    build_dim);
+                calibration_queries = padded_calibration_queries.data();
+            }
+        }
+    } else if (config_.pad_non_power_of_two_to_pow2 && !IsPowerOf2(dim)) {
         effective_dim_ = static_cast<Dim>(NextPowerOf2(dim));
         build_dim = effective_dim_;
         padding_mode_ = "zero_pad_to_pow2";
@@ -240,6 +266,10 @@ Status IvfBuilder::RunKMeans(const float* vectors, uint32_t N, Dim dim) {
         auto& c = c_or.value();
         if (c.cols == dim) {
             centroids_.assign(c.data.begin(), c.data.end());
+        } else if (config_.use_fht_kac_rotator &&
+                   c.cols == logical_dim_ &&
+                   dim == effective_dim_) {
+            centroids_ = PadRowsToDim(c.data.data(), c.rows, c.cols, dim);
         } else if (config_.pad_non_power_of_two_to_pow2 &&
                    c.cols == logical_dim_ &&
                    dim == effective_dim_) {
@@ -709,6 +739,13 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
             rotation_mode_ = (logical_dim_ != dim) ? "hadamard_padded" : "hadamard";
         }
     } else if (!config_.pad_non_power_of_two_to_pow2 &&
+               config_.use_fht_kac_rotator) {
+        used_hadamard = rotation.GenerateFhtKacRotator(
+            config_.seed, /*use_fast_transform=*/true);
+        if (used_hadamard) {
+            rotation_mode_ = "fht_kac_rotator";
+        }
+    } else if (!config_.pad_non_power_of_two_to_pow2 &&
                config_.use_blocked_hadamard_permuted) {
         used_hadamard = rotation.GenerateBlockedHadamardPermuted(
             config_.seed, /*use_fast_transform=*/true);
@@ -1082,6 +1119,9 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
             << "  \"rotation_seed\": " << rotation.seed() << ",\n"
             << "  \"rotation_block_sizes\": "
             << JsonUIntArray(rotation.block_sizes()) << ",\n"
+            << "  \"rotation_padded_dim\": " << rotation.fht_kac_padded_dim() << ",\n"
+            << "  \"rotation_trunc_dim\": " << rotation.fht_kac_trunc_dim() << ",\n"
+            << "  \"rotation_num_rounds\": " << rotation.fht_kac_num_rounds() << ",\n"
             << "  \"nlist\": " << K << ",\n"
             << "  \"assignment_mode\": \"" << AssignmentModeName(assignment_mode_) << "\",\n"
             << "  \"assignment_factor\": " << config_.assignment_factor << ",\n"

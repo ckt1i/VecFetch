@@ -49,3 +49,27 @@ _deps/
 
 # Test outputs
 Testing/
+# Added by code-review-graph
+.code-review-graph/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.mcp
+*.opencode*
+.agents*
+.aris*
+.claude*
+.codex*
+.cursor*
+.windsurfrules*
+AGENTS.md
+GENIMI.md
+CLAUDE.md
+.mcp.json
+
+# perf files
+profile_output/

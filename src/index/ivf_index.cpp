@@ -317,7 +317,9 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
     }
     rotation_ = std::make_unique<rabitq::RotationMatrix>(std::move(rot_result.value()));
     if (rotation_mode_ == "random_matrix") {
-        if (rotation_->is_blocked_hadamard_permuted()) {
+        if (rotation_->is_fht_kac_rotator()) {
+            rotation_mode_ = "fht_kac_rotator";
+        } else if (rotation_->is_blocked_hadamard_permuted()) {
             rotation_mode_ = "blocked_hadamard_permuted";
         } else if (rotation_->is_fast_hadamard()) {
             rotation_mode_ = (logical_dim_ != dim_) ? "hadamard_padded" : "hadamard";
@@ -352,7 +354,9 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
             return Status::IOError("Failed to read rotated_centroids.bin");
         }
         if (rotation_mode_ == "random_matrix") {
-            if (rotation_->is_blocked_hadamard_permuted()) {
+            if (rotation_->is_fht_kac_rotator()) {
+                rotation_mode_ = "fht_kac_rotator";
+            } else if (rotation_->is_blocked_hadamard_permuted()) {
                 rotation_mode_ = "blocked_hadamard_permuted";
             } else {
                 rotation_mode_ = (logical_dim_ != dim_) ? "hadamard_padded" : "hadamard";

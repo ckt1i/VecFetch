@@ -79,6 +79,11 @@ struct SearchStats {
     uint32_t total_submit_window_tail_flushes = 0;
     uint32_t total_submit_stop_flushes = 0;
     uint32_t total_submit_window_requests = 0;
+    uint32_t vec_only_read_requests = 0;
+    uint32_t all_read_requests = 0;
+    uint32_t payload_read_requests = 0;
+    uint32_t fixed_vec_buffer_hits = 0;
+    uint32_t fixed_vec_buffer_misses = 0;
     uint32_t total_candidate_batches = 0;
     uint32_t total_crc_estimates_buffered = 0;
     uint32_t total_crc_estimates_merged = 0;
@@ -122,6 +127,9 @@ struct SearchStats {
     double probe_submit_prepare_vec_only_ms = 0;
     double probe_submit_prepare_all_ms = 0;
     double probe_submit_emit_ms = 0;
+    double probe_submit_vec_only_emit_ms = 0;
+    double probe_submit_pending_slot_alloc_ms = 0;
+    double probe_submit_prep_read_ms = 0;
     double rerank_time_ms = 0;
     double rerank_cpu_ms = 0;
     double total_time_ms = 0;
@@ -141,6 +149,8 @@ struct SearchStats {
     double candidate_collect_ms = 0;        // Organize buffered candidates before batch rerank
     double pool_vector_read_ms = 0;         // Batch read/visit of prefetched vectors from memory pool
     double rerank_compute_ms = 0;           // Batch L2/top-k compute
+    double rerank_vec_alloc_ms = 0;         // Vector slab growth / allocation
+    double rerank_vec_copy_ms = 0;          // Copy vector bytes into rerank storage
     double remaining_payload_fetch_ms = 0;  // Final missing payload fetch
     double crc_decision_ms = 0;             // Time spent inside CrcStopper::ShouldStop
     double crc_buffer_ms = 0;               // Time spent buffering CRC estimates

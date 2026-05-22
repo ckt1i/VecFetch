@@ -129,6 +129,17 @@ TEST_F(OverlapSchedulerTest, StatsArePopulated) {
 
     auto results = scheduler.Search(query.data());
     EXPECT_GT(results.size(), 0u);
+    EXPECT_EQ(results.stats().fixed_vec_buffer_hits, 0u);
+    EXPECT_EQ(results.stats().fixed_vec_buffer_misses,
+              results.stats().vec_only_read_requests);
+    EXPECT_EQ(results.stats().payload_read_requests, 0u);
+    EXPECT_EQ(results.stats().vec_only_read_requests +
+              results.stats().all_read_requests,
+              results.stats().total_submit_window_requests);
+    EXPECT_GE(results.stats().probe_submit_pending_slot_alloc_ms, 0.0);
+    EXPECT_GE(results.stats().probe_submit_prep_read_ms, 0.0);
+    EXPECT_GE(results.stats().rerank_vec_alloc_ms, 0.0);
+    EXPECT_GE(results.stats().rerank_vec_copy_ms, 0.0);
 }
 
 // ============================================================================

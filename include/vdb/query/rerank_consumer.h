@@ -1,9 +1,10 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
-#include <vector>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "vdb/common/types.h"
 #include "vdb/query/parsed_cluster.h"
@@ -26,7 +27,7 @@ class RerankConsumer {
  public:
     struct BufferedCandidate {
         AddressEntry addr;
-        AlignedBufPtr vec_buf;
+        const float* vec = nullptr;
     };
 
     /// @param ctx   SearchContext (provides query_vec and collector)
@@ -66,10 +67,22 @@ class RerankConsumer {
     uint32_t BufferedCount() const;
 
  private:
+    struct VectorChunk {
+        AlignedBufPtr storage;
+        uint32_t capacity = 0;
+        uint32_t used = 0;
+    };
+
+    const float* AllocateVectorCopy(const uint8_t* src);
+    bool GrowVectorChunk(uint32_t min_capacity);
+    void ResetVectorChunks();
+
     SearchContext& ctx_;
     Dim dim_;
     uint32_t vec_bytes_;  // raw_dim * sizeof(float)
+    uint32_t aligned_vec_bytes_;
     std::vector<BufferedCandidate> buffered_candidates_;
+    std::vector<VectorChunk> vector_chunks_;
 
     // Payload cache: addr.offset → owned payload buffer (freed via free())
     std::unordered_map<uint64_t, AlignedBufPtr> payload_cache_;
