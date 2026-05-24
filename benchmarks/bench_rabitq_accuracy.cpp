@@ -104,7 +104,7 @@ static float Percentile(std::vector<float>& v, float p) {
 
 int main(int argc, char* argv[]) {
     std::string data_dir = GetArg(argc, argv, "--dataset",
-                                  "/home/zcq/VDB/data/coco_1k");
+                                  "/home/zcq/VDB/data/coco_100k");
     std::string base_path = GetArg(argc, argv, "--base", "");
     std::string query_path = GetArg(argc, argv, "--query", "");
     uint32_t nlist = static_cast<uint32_t>(GetIntArg(argc, argv, "--nlist", 32));

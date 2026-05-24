@@ -99,6 +99,7 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
                                 config.submission_mode == SubmissionMode::Isolated),
       config_(config),
       vec_bytes_(index.logical_dim() * sizeof(float)),
+      aligned_vec_bytes_((vec_bytes_ + 4095u) & ~4095u),
       est_top_k_(config.top_k),
       use_crc_(config.crc_params != nullptr),
       estimator_(index.dim(), index.segment().rabitq_config().bits),
@@ -133,6 +134,9 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
 OverlapScheduler::~OverlapScheduler() {
     CleanupPendingSlots();
     for (uint8_t* buf : fixed_vec_buffers_) {
+        std::free(buf);
+    }
+    for (uint8_t* buf : vec_only_owned_buffers_) {
         std::free(buf);
     }
 }
@@ -236,6 +240,7 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
     if (remaining == 0) return;
 
     const int dat_fd = index_.segment().data_reader().fd();
+    const bool detailed_timing = config_.enable_hotpath_detailed_timing;
 
     auto emit_all = [&](uint32_t count) {
         if (count == 0) return;
@@ -247,21 +252,29 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
             pio.addr = plan.addr;
             pio.read_offset = plan.addr.offset;
             pio.read_length = plan.read_length;
-            auto alloc_start = std::chrono::steady_clock::now();
-            const uint32_t slot_id = AllocatePendingSlot(
-                pio, buf, PendingBufferCleanup::Pool);
-            ctx.stats().probe_submit_pending_slot_alloc_ms +=
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - alloc_start).count();
-            auto prep_start = std::chrono::steady_clock::now();
-            CheckPrepRead(data_reader_.PrepReadTagged(
-                              dat_fd, buf, plan.read_length, plan.addr.offset,
-                              slot_id),
-                          "scheduler VEC_ALL");
-            const double prep_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - prep_start).count();
-            ctx.stats().uring_prep_ms += prep_ms;
-            ctx.stats().probe_submit_prep_read_ms += prep_ms;
+            uint32_t slot_id = 0;
+            if (detailed_timing) {
+                auto alloc_start = std::chrono::steady_clock::now();
+                slot_id = AllocatePendingSlot(pio, buf, PendingBufferCleanup::Pool);
+                ctx.stats().probe_submit_pending_slot_alloc_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - alloc_start).count();
+                auto prep_start = std::chrono::steady_clock::now();
+                CheckPrepRead(data_reader_.PrepReadTagged(
+                                  dat_fd, buf, plan.read_length, plan.addr.offset,
+                                  slot_id),
+                              "scheduler VEC_ALL");
+                const double prep_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - prep_start).count();
+                ctx.stats().uring_prep_ms += prep_ms;
+                ctx.stats().probe_submit_prep_read_ms += prep_ms;
+            } else {
+                slot_id = AllocatePendingSlot(pio, buf, PendingBufferCleanup::Pool);
+                CheckPrepRead(data_reader_.PrepReadTagged(
+                                  dat_fd, buf, plan.read_length, plan.addr.offset,
+                                  slot_id),
+                              "scheduler VEC_ALL");
+            }
             ctx.stats().all_read_requests++;
             pending_all_plans_.pop_front();
         }
@@ -282,39 +295,65 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
                 ctx.stats().fixed_vec_buffer_misses++;
             }
             if (!use_fixed_buffer) {
-                buf = buffer_pool_.Acquire(vec_bytes_);
+                buf = AcquireVecOnlyBuffer();
             }
-            auto alloc_start = std::chrono::steady_clock::now();
-            const uint32_t slot_id = AllocateVectorOnlyPendingSlot(
-                plan.addr, buf,
-                use_fixed_buffer ? PendingBufferCleanup::FixedVec
-                                 : PendingBufferCleanup::Pool,
-                fixed_idx);
-            ctx.stats().probe_submit_pending_slot_alloc_ms +=
-                std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - alloc_start).count();
-            auto prep_start = std::chrono::steady_clock::now();
-            if (use_fixed_buffer && fixed_buffer_reader_ != nullptr &&
-                data_fd_registered_index_ >= 0) {
-                CheckPrepRead(fixed_buffer_reader_->PrepReadRegisteredBufferFixedFileTagged(
-                                  data_fd_registered_index_, buf, fixed_idx,
-                                  vec_bytes_, plan.addr.offset, slot_id),
-                              "scheduler VEC_ONLY fixed");
-            } else if (use_fixed_buffer && fixed_buffer_reader_ != nullptr) {
-                CheckPrepRead(fixed_buffer_reader_->PrepReadRegisteredBufferTagged(
-                                  dat_fd, buf, fixed_idx, vec_bytes_,
-                                  plan.addr.offset, slot_id),
-                              "scheduler VEC_ONLY fixed");
+            uint32_t slot_id = 0;
+            if (detailed_timing) {
+                auto alloc_start = std::chrono::steady_clock::now();
+                slot_id = AllocateVectorOnlyPendingSlot(
+                    plan.addr, buf,
+                    use_fixed_buffer ? PendingBufferCleanup::FixedVec
+                                     : PendingBufferCleanup::VecPool,
+                    fixed_idx);
+                ctx.stats().probe_submit_pending_slot_alloc_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - alloc_start).count();
+                auto prep_start = std::chrono::steady_clock::now();
+                if (use_fixed_buffer && fixed_buffer_reader_ != nullptr &&
+                    data_fd_registered_index_ >= 0) {
+                    CheckPrepRead(fixed_buffer_reader_->PrepReadRegisteredBufferFixedFileTagged(
+                                      data_fd_registered_index_, buf, fixed_idx,
+                                      vec_bytes_, plan.addr.offset, slot_id),
+                                  "scheduler VEC_ONLY fixed");
+                } else if (use_fixed_buffer && fixed_buffer_reader_ != nullptr) {
+                    CheckPrepRead(fixed_buffer_reader_->PrepReadRegisteredBufferTagged(
+                                      dat_fd, buf, fixed_idx, vec_bytes_,
+                                      plan.addr.offset, slot_id),
+                                  "scheduler VEC_ONLY fixed");
+                } else {
+                    CheckPrepRead(data_reader_.PrepReadTagged(
+                                      dat_fd, buf, vec_bytes_, plan.addr.offset,
+                                      slot_id),
+                                  "scheduler VEC_ONLY");
+                }
+                const double prep_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - prep_start).count();
+                ctx.stats().uring_prep_ms += prep_ms;
+                ctx.stats().probe_submit_prep_read_ms += prep_ms;
             } else {
-                CheckPrepRead(data_reader_.PrepReadTagged(
-                                  dat_fd, buf, vec_bytes_, plan.addr.offset,
-                                  slot_id),
-                              "scheduler VEC_ONLY");
+                slot_id = AllocateVectorOnlyPendingSlot(
+                    plan.addr, buf,
+                    use_fixed_buffer ? PendingBufferCleanup::FixedVec
+                                     : PendingBufferCleanup::VecPool,
+                    fixed_idx);
+                if (use_fixed_buffer && fixed_buffer_reader_ != nullptr &&
+                    data_fd_registered_index_ >= 0) {
+                    CheckPrepRead(fixed_buffer_reader_->PrepReadRegisteredBufferFixedFileTagged(
+                                      data_fd_registered_index_, buf, fixed_idx,
+                                      vec_bytes_, plan.addr.offset, slot_id),
+                                  "scheduler VEC_ONLY fixed");
+                } else if (use_fixed_buffer && fixed_buffer_reader_ != nullptr) {
+                    CheckPrepRead(fixed_buffer_reader_->PrepReadRegisteredBufferTagged(
+                                      dat_fd, buf, fixed_idx, vec_bytes_,
+                                      plan.addr.offset, slot_id),
+                                  "scheduler VEC_ONLY fixed");
+                } else {
+                    CheckPrepRead(data_reader_.PrepReadTagged(
+                                      dat_fd, buf, vec_bytes_, plan.addr.offset,
+                                      slot_id),
+                                  "scheduler VEC_ONLY");
+                }
             }
-            const double prep_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - prep_start).count();
-            ctx.stats().uring_prep_ms += prep_ms;
-            ctx.stats().probe_submit_prep_read_ms += prep_ms;
             ctx.stats().vec_only_read_requests++;
             ++pending_vec_only_head_;
         }
@@ -556,6 +595,61 @@ void OverlapScheduler::ReleaseFixedVecBuffer(uint16_t buffer_index) {
     free_fixed_vec_buffers_.push_back(buffer_index);
 }
 
+uint8_t* OverlapScheduler::AcquireVecOnlyBuffer() {
+    if (!free_vec_only_buffers_.empty()) {
+        uint8_t* buf = free_vec_only_buffers_.back();
+        free_vec_only_buffers_.pop_back();
+        return buf;
+    }
+    uint8_t* raw = static_cast<uint8_t*>(
+        std::aligned_alloc(4096, aligned_vec_bytes_));
+    if (!raw) {
+        std::fprintf(stderr,
+                     "FATAL: aligned_alloc failed for vec-only buffer (%u bytes)\n",
+                     aligned_vec_bytes_);
+        std::abort();
+    }
+    vec_only_owned_buffers_.push_back(raw);
+    return raw;
+}
+
+void OverlapScheduler::ReleaseVecOnlyBuffer(uint8_t* buf) {
+    if (buf == nullptr) return;
+    free_vec_only_buffers_.push_back(buf);
+}
+
+void OverlapScheduler::ReleaseVectorOnlyPendingSlot(uint32_t slot_id) {
+    if (slot_id >= pending_slots_.size()) return;
+    PendingSlot& slot = pending_slots_[slot_id];
+    if (!slot.in_use) return;
+
+    if (slot.buffer != nullptr) {
+        switch (slot.cleanup) {
+            case PendingBufferCleanup::FixedVec:
+                ReleaseFixedVecBuffer(slot.fixed_buffer_index);
+                break;
+            case PendingBufferCleanup::VecPool:
+                ReleaseVecOnlyBuffer(slot.buffer);
+                break;
+            case PendingBufferCleanup::Pool:
+                buffer_pool_.Release(slot.buffer);
+                break;
+            case PendingBufferCleanup::Free:
+                std::free(slot.buffer);
+                break;
+            case PendingBufferCleanup::None:
+                break;
+        }
+    }
+
+    slot.in_use = false;
+    slot.buffer = nullptr;
+    slot.fixed_buffer_index = 0;
+    slot.cleanup = PendingBufferCleanup::None;
+    slot.io = PendingIO{};
+    free_pending_slots_.push_back(slot_id);
+}
+
 void OverlapScheduler::CleanupPendingSlot(PendingSlot& slot) {
     if (!slot.in_use || !slot.buffer) return;
 
@@ -565,6 +659,9 @@ void OverlapScheduler::CleanupPendingSlot(PendingSlot& slot) {
             break;
         case PendingBufferCleanup::Pool:
             buffer_pool_.Release(slot.buffer);
+            break;
+        case PendingBufferCleanup::VecPool:
+            ReleaseVecOnlyBuffer(slot.buffer);
             break;
         case PendingBufferCleanup::FixedVec:
             ReleaseFixedVecBuffer(slot.fixed_buffer_index);
@@ -603,13 +700,20 @@ void OverlapScheduler::InitializeDataBufferSlab() {
         return;
     }
 
-    fixed_vec_buffers_.reserve(config_.io_queue_depth);
-    fixed_vec_buffer_capacities_.reserve(config_.io_queue_depth);
-    free_fixed_vec_buffers_.reserve(config_.io_queue_depth);
-    const uint32_t aligned_vec_bytes = (vec_bytes_ + 4095u) & ~4095u;
-    for (uint32_t i = 0; i < config_.io_queue_depth; ++i) {
+    const uint32_t fixed_buffer_count =
+        config_.fixed_vec_buffer_count > 0
+            ? config_.fixed_vec_buffer_count
+            : config_.io_queue_depth;
+    if (fixed_buffer_count == 0) {
+        return;
+    }
+
+    fixed_vec_buffers_.reserve(fixed_buffer_count);
+    fixed_vec_buffer_capacities_.reserve(fixed_buffer_count);
+    free_fixed_vec_buffers_.reserve(fixed_buffer_count);
+    for (uint32_t i = 0; i < fixed_buffer_count; ++i) {
         uint8_t* buf = static_cast<uint8_t*>(
-            std::aligned_alloc(4096, aligned_vec_bytes));
+            std::aligned_alloc(4096, aligned_vec_bytes_));
         if (!buf) {
             for (uint8_t* allocated : fixed_vec_buffers_) {
                 std::free(allocated);
@@ -620,7 +724,7 @@ void OverlapScheduler::InitializeDataBufferSlab() {
             return;
         }
         fixed_vec_buffers_.push_back(buf);
-        fixed_vec_buffer_capacities_.push_back(aligned_vec_bytes);
+        fixed_vec_buffer_capacities_.push_back(aligned_vec_bytes_);
         free_fixed_vec_buffers_.push_back(
             static_cast<uint16_t>(fixed_vec_buffers_.size() - 1));
     }
@@ -732,6 +836,7 @@ void OverlapScheduler::DispatchCompletion(
     const uint32_t slot_id = static_cast<uint32_t>(slot_token);
     uint8_t* buf = slot->buffer;
     PendingIO io = slot->io;
+    bool release_slot = true;
 
     switch (io.type) {
         case PendingIO::Type::CLUSTER_BLOCK: {
@@ -755,7 +860,8 @@ void OverlapScheduler::DispatchCompletion(
         }
         case PendingIO::Type::VEC_ONLY: {
             reranker.ConsumeVec(buf, io.addr);
-            CleanupPendingSlot(*slot);
+            ReleaseVectorOnlyPendingSlot(slot_id);
+            release_slot = false;
             break;
         }
         case PendingIO::Type::VEC_ALL: {
@@ -770,7 +876,9 @@ void OverlapScheduler::DispatchCompletion(
             // ConsumePayload takes ownership — don't release
             break;
     }
-    ReleasePendingSlot(slot_id);
+    if (release_slot) {
+        ReleasePendingSlot(slot_id);
+    }
 }
 
 // ============================================================================
@@ -1031,11 +1139,13 @@ void OverlapScheduler::ProbeCluster(
         ctx.stats().probe_submit_ms;
 
     // Aggregate classification statistics into SearchContext.
-    // total_safe_in  = S1 SafeIn (I/O submitted)
-    // total_safe_out = S1 SafeOut (skipped)
-    // total_uncertain = final Uncertain candidates (S1 uncertain minus S2 eliminations)
+    // total_safe_in    = S1 SafeIn (I/O submitted)
+    // total_safe_out   = S1 SafeOut (skipped)
+    // s1_uncertain_raw = raw Stage 1 Uncertain population (input to Stage 2)
+    // total_uncertain  = final Uncertain candidates after Stage 2 elimination
     ctx.stats().total_safe_in   += local_stats.s1_safein;
     ctx.stats().total_safe_out  += local_stats.s1_safeout;
+    ctx.stats().s1_uncertain_raw += local_stats.s1_uncertain;
     ctx.stats().s2_safe_in      += local_stats.s2_safein;
     ctx.stats().s2_safe_out     += local_stats.s2_safeout;
     ctx.stats().s2_uncertain    += local_stats.s2_uncertain;

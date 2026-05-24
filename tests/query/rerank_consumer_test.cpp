@@ -57,7 +57,7 @@ TEST_F(RerankConsumerTest, ConsumeVec_InsertsToCollector) {
 
     EXPECT_EQ(ctx_->collector().Size(), 1u);
     EXPECT_EQ(ctx_->stats().total_reranked, 1u);
-    EXPECT_GE(ctx_->stats().rerank_vec_copy_ms, 0.0);
+    EXPECT_EQ(ctx_->stats().rerank_vec_copy_ms, 0.0);
 }
 
 TEST_F(RerankConsumerTest, ConsumeAll_CachesPayload) {
@@ -130,6 +130,21 @@ TEST_F(RerankConsumerTest, VectorSlabResetsAcrossExecuteBuffered) {
     consumer_->ExecuteBuffered();
 
     EXPECT_EQ(ctx_->stats().total_reranked, 3u);
+    EXPECT_EQ(ctx_->stats().rerank_vec_alloc_ms, 0.0);
+    EXPECT_EQ(ctx_->stats().rerank_vec_copy_ms, 0.0);
+}
+
+TEST_F(RerankConsumerTest, DetailedHotpathTiming_PopulatesVectorTimingStats) {
+    config_.enable_hotpath_detailed_timing = true;
+    ctx_ = std::make_unique<SearchContext>(query_.data(), config_);
+    consumer_ = std::make_unique<RerankConsumer>(*ctx_, kDim);
+
+    float vec[] = {2.0f, 0.0f, 0.0f, 0.0f};
+    auto buf = MakeVecBuf(vec);
+
+    consumer_->ConsumeVec(buf.get(), AddressEntry{123, kVecBytes});
+    consumer_->ExecuteBuffered();
+
     EXPECT_GE(ctx_->stats().rerank_vec_alloc_ms, 0.0);
-    EXPECT_GT(ctx_->stats().rerank_vec_copy_ms, 0.0);
+    EXPECT_GE(ctx_->stats().rerank_vec_copy_ms, 0.0);
 }

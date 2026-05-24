@@ -43,6 +43,7 @@ struct SearchConfig {
     CluReadMode clu_read_mode = CluReadMode::Window;
     bool use_resident_clusters = false;
     bool enable_fine_grained_timing = true;
+    bool enable_hotpath_detailed_timing = false;
 
     // CRC early stop parameters (nullptr = use legacy d_k early stop)
     const index::CalibrationResults* crc_params = nullptr;
@@ -55,6 +56,7 @@ struct SearchConfig {
     float submit_ema_alpha = 0.25f;
     uint32_t submit_batch_min = 16;
     uint32_t submit_batch_max = 48;
+    uint32_t fixed_vec_buffer_count = 0;
 
     bool enable_address_decode_simd = true;
     bool enable_rerank_batched_distance_simd = true;
@@ -68,6 +70,7 @@ struct SearchStats {
     uint32_t total_probed = 0;
     uint32_t total_safe_in = 0;
     uint32_t total_safe_out = 0;
+    uint32_t s1_uncertain_raw = 0;
     uint32_t total_uncertain = 0;
     uint32_t total_io_submitted = 0;
     uint32_t total_reranked = 0;

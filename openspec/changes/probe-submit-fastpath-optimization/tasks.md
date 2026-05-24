@@ -30,6 +30,8 @@
 
 ## 5. 验证与调优
 
+- [x] 5.0 增加独立的 `enable_hotpath_detailed_timing` 开关，默认关闭热路径逐请求 instrumentation，并保留按需重开的诊断能力。
+
 - [ ] 5.1 运行受影响的 query、async-reader、buffer-pool、rerank-consumer 和 e2e benchmark 测试。
 - [ ] 5.2 在 MSMARCO `fht_kac_rotator` query-only resident/full-preload benchmark 上做优化前后对比，检查 `avg_query_time_ms`、`probe_submit_ms`、`probe_submit_prepare_vec_only_ms`、`uring_submit_ms`、`io_wait_ms` 和 candidate 数量。
 - [ ] 5.3 对优化后的路径运行 `perf stat` 和延迟启动的 `perf record`，确认 allocator 和 vector-only submit 的开销下降。

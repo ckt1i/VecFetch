@@ -136,10 +136,113 @@ TEST_F(OverlapSchedulerTest, StatsArePopulated) {
     EXPECT_EQ(results.stats().vec_only_read_requests +
               results.stats().all_read_requests,
               results.stats().total_submit_window_requests);
+    EXPECT_EQ(results.stats().probe_submit_pending_slot_alloc_ms, 0.0);
+    EXPECT_EQ(results.stats().probe_submit_prep_read_ms, 0.0);
+    EXPECT_EQ(results.stats().rerank_vec_alloc_ms, 0.0);
+    EXPECT_EQ(results.stats().rerank_vec_copy_ms, 0.0);
+}
+
+TEST_F(OverlapSchedulerTest, StageUncertainStatsRemainConsistent) {
+    PreadFallbackReader reader;
+    SearchConfig config;
+    config.top_k = kTopK;
+    config.nprobe = kNprobe;
+    config.early_stop = false;
+
+    OverlapScheduler scheduler(*index_, reader, config);
+
+    std::vector<float> query(kDim, 0.0f);
+    query[0] = 1.0f;
+
+    auto results = scheduler.Search(query.data());
+    const auto& stats = results.stats();
+
+    EXPECT_EQ(stats.total_uncertain,
+              stats.s1_uncertain_raw - stats.s2_safe_in - stats.s2_safe_out);
+    if (stats.s2_safe_in + stats.s2_safe_out + stats.s2_uncertain > 0) {
+        EXPECT_EQ(stats.s1_uncertain_raw,
+                  stats.s2_safe_in + stats.s2_safe_out + stats.s2_uncertain);
+        EXPECT_EQ(stats.total_uncertain, stats.s2_uncertain);
+    } else {
+        EXPECT_EQ(stats.total_uncertain, stats.s1_uncertain_raw);
+    }
+}
+
+TEST_F(OverlapSchedulerTest, DetailedHotpathTiming_PopulatesStats) {
+    PreadFallbackReader reader;
+    SearchConfig config;
+    config.top_k = kTopK;
+    config.nprobe = kNprobe;
+    config.enable_hotpath_detailed_timing = true;
+
+    OverlapScheduler scheduler(*index_, reader, config);
+
+    std::vector<float> query(kDim, 0.0f);
+    query[0] = 1.0f;
+
+    auto results = scheduler.Search(query.data());
+    EXPECT_GT(results.size(), 0u);
     EXPECT_GE(results.stats().probe_submit_pending_slot_alloc_ms, 0.0);
     EXPECT_GE(results.stats().probe_submit_prep_read_ms, 0.0);
     EXPECT_GE(results.stats().rerank_vec_alloc_ms, 0.0);
     EXPECT_GE(results.stats().rerank_vec_copy_ms, 0.0);
+}
+
+TEST_F(OverlapSchedulerTest, FixedVecBufferCountFallbackPreservesPreadBehavior) {
+    PreadFallbackReader reader;
+    SearchConfig config;
+    config.top_k = kTopK;
+    config.nprobe = kNprobe;
+    config.fixed_vec_buffer_count = 128;
+
+    OverlapScheduler scheduler(*index_, reader, config);
+
+    std::vector<float> query(kDim, 0.0f);
+    query[0] = 1.0f;
+
+    auto results = scheduler.Search(query.data());
+    EXPECT_GT(results.size(), 0u);
+    EXPECT_EQ(results.stats().fixed_vec_buffer_hits, 0u);
+    EXPECT_EQ(results.stats().fixed_vec_buffer_misses,
+              results.stats().vec_only_read_requests);
+}
+
+TEST_F(OverlapSchedulerTest, IoUringFixedVecBufferCountCanEnableFixedHits) {
+    IoUringReader reader;
+    auto init_status = reader.Init(16, 64);
+    if (!init_status.ok()) {
+        GTEST_SKIP() << "io_uring not available: " << init_status.message();
+    }
+
+    const int data_fd = index_->segment().data_reader().fd();
+    ASSERT_GE(data_fd, 0);
+    auto reg_status = reader.RegisterFiles(&data_fd, 1);
+    if (!reg_status.ok()) {
+        GTEST_SKIP() << "file registration unavailable: " << reg_status.message();
+    }
+
+    SearchConfig config;
+    config.top_k = kTopK;
+    config.nprobe = kNprobe;
+    config.clu_read_mode = CluReadMode::FullPreload;
+    config.use_resident_clusters = true;
+    config.early_stop = false;
+    config.io_queue_depth = 16;
+    config.fixed_vec_buffer_count = 2;
+
+    auto preload_status = index_->segment().PreloadAllClusters();
+    ASSERT_TRUE(preload_status.ok()) << preload_status.message();
+
+    OverlapScheduler scheduler(*index_, reader, config);
+
+    std::vector<float> query(kDim, 0.0f);
+    query[0] = 1.0f;
+
+    auto results = scheduler.Search(query.data());
+
+    EXPECT_GT(results.size(), 0u);
+    EXPECT_GT(results.stats().vec_only_read_requests, 0u);
+    EXPECT_GT(results.stats().fixed_vec_buffer_hits, 0u);
 }
 
 // ============================================================================

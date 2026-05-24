@@ -1262,6 +1262,8 @@ int main(int argc, char* argv[]) {
     int arg_epsilon_samples = GetIntArg(argc, argv, "--epsilon-samples", 100);
     float arg_epsilon_percentile = GetFloatArg(argc, argv, "--epsilon-percentile", 0.99f);
     int arg_io_queue_depth = GetIntArg(argc, argv, "--io-queue-depth", 64);
+    int arg_fixed_vec_buffer_count =
+        GetIntArg(argc, argv, "--fixed-vec-buffer-count", 0);
     int arg_cluster_submit_reserve =
         GetIntArg(argc, argv, "--cluster-submit-reserve", 8);
     std::string arg_submission_mode =
@@ -1269,12 +1271,14 @@ int main(int argc, char* argv[]) {
     std::string arg_clu_read_mode =
         GetStringArg(argc, argv, "--clu-read-mode", "window");
     int arg_use_resident_clusters =
-        GetIntArg(argc, argv, "--use-resident-clusters", 0);
+        GetIntArg(argc, argv, "--use-resident-clusters", 1);
     int arg_query_only = GetIntArg(argc, argv, "--query-only", 0);
     int arg_skip_gt = GetIntArg(argc, argv, "--skip-gt", 0);
     std::string arg_gt_file = GetStringArg(argc, argv, "--gt-file", "");
     int arg_fine_grained_timing =
         GetIntArg(argc, argv, "--fine-grained-timing", 0);
+    int arg_hotpath_detailed_timing =
+        GetIntArg(argc, argv, "--hotpath-detailed-timing", 0);
     int arg_submit_online = GetIntArg(argc, argv, "--submit-online", 0);
     float arg_submit_ema_alpha =
         GetFloatArg(argc, argv, "--submit-ema-alpha", 0.25f);
@@ -1994,6 +1998,8 @@ int main(int argc, char* argv[]) {
     search_cfg.prefetch_depth = static_cast<uint32_t>(
         GetIntArg(argc, argv, "--prefetch-depth", 16));
     search_cfg.io_queue_depth = static_cast<uint32_t>(arg_io_queue_depth);
+    search_cfg.fixed_vec_buffer_count =
+        static_cast<uint32_t>(std::max(arg_fixed_vec_buffer_count, 0));
     search_cfg.cluster_submit_reserve = static_cast<uint32_t>(
         std::max(arg_cluster_submit_reserve, 1));
     search_cfg.use_sqpoll = arg_sqpoll;
@@ -2007,6 +2013,8 @@ int main(int argc, char* argv[]) {
             : CluReadMode::Window;
     search_cfg.use_resident_clusters = (arg_use_resident_clusters != 0);
     search_cfg.enable_fine_grained_timing = (arg_fine_grained_timing != 0);
+    search_cfg.enable_hotpath_detailed_timing =
+        (arg_hotpath_detailed_timing != 0);
     search_cfg.crc_params = crc_loaded ? &calib_results : nullptr;
     search_cfg.crc_no_break = (arg_crc_no_break != 0);
     search_cfg.initial_prefetch = static_cast<uint32_t>(
@@ -2236,6 +2244,9 @@ int main(int argc, char* argv[]) {
         metrics.avg_coarse_score, metrics.avg_coarse_topn, metrics.avg_probe);
     Log("  avg_probed_clusters=%.1f\n", metrics.avg_probed_clusters);
     Log("  fine_grained_timing=%d\n", search_cfg.enable_fine_grained_timing ? 1 : 0);
+    Log("  hotpath_detailed_timing=%d\n",
+        search_cfg.enable_hotpath_detailed_timing ? 1 : 0);
+    Log("  fixed_vec_buffer_count=%u\n", search_cfg.fixed_vec_buffer_count);
     if (!search_cfg.enable_fine_grained_timing) {
         Log("  timing_mode=low_overhead_coarse_split (stage1/stage2 are workload-weighted classify splits)\n");
     }
@@ -2342,6 +2353,7 @@ int main(int argc, char* argv[]) {
         f << "    " << JBool("early_stop", search_cfg.early_stop) << ",\n";
         f << "    " << JInt("prefetch_depth", search_cfg.prefetch_depth) << ",\n";
         f << "    " << JInt("io_queue_depth", search_cfg.io_queue_depth) << ",\n";
+        f << "    " << JInt("fixed_vec_buffer_count", search_cfg.fixed_vec_buffer_count) << ",\n";
         f << "    " << JInt("cluster_submit_reserve", search_cfg.cluster_submit_reserve) << ",\n";
         f << "    " << JBool("iopoll_requested", arg_iopoll) << ",\n";
         f << "    " << JBool("sqpoll_requested", arg_sqpoll) << ",\n";
@@ -2350,6 +2362,7 @@ int main(int argc, char* argv[]) {
         f << "    " << JStr("clu_read_mode", arg_clu_read_mode) << ",\n";
         f << "    " << JBool("use_resident_clusters", search_cfg.use_resident_clusters) << ",\n";
         f << "    " << JBool("enable_fine_grained_timing", search_cfg.enable_fine_grained_timing) << ",\n";
+        f << "    " << JBool("enable_hotpath_detailed_timing", search_cfg.enable_hotpath_detailed_timing) << ",\n";
         f << "    " << JBool("enable_address_decode_simd", search_cfg.enable_address_decode_simd) << ",\n";
         f << "    " << JBool("enable_rerank_batched_distance_simd", search_cfg.enable_rerank_batched_distance_simd) << ",\n";
         f << "    " << JBool("enable_coarse_select_simd", search_cfg.enable_coarse_select_simd) << ",\n";
@@ -2357,9 +2370,11 @@ int main(int argc, char* argv[]) {
         f << "    " << JBool("enable_online_submit_tuning", search_cfg.enable_online_submit_tuning) << ",\n";
         f << "    " << JNum("submit_ema_alpha", search_cfg.submit_ema_alpha) << ",\n";
         f << "    " << JStr("timing_mode",
-                             search_cfg.enable_fine_grained_timing
-                                 ? "fine_grained_diagnostic"
-                                 : "low_overhead_coarse_split") << "\n";
+                             search_cfg.enable_hotpath_detailed_timing
+                                 ? "hotpath_detailed_diagnostic"
+                                 : (search_cfg.enable_fine_grained_timing
+                                        ? "fine_grained_diagnostic"
+                                        : "low_overhead_coarse_split")) << "\n";
         f << "  },\n";
         f << "  \"crc_config\": {\n";
         f << "    " << JBool("enabled", arg_crc_enable != 0) << ",\n";

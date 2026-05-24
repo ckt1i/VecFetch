@@ -26,11 +26,16 @@ RerankConsumer::~RerankConsumer() = default;
 
 bool RerankConsumer::GrowVectorChunk(uint32_t min_capacity) {
     const uint32_t chunk_capacity = std::max(aligned_vec_bytes_ * 1024u, min_capacity);
-    auto alloc_start = std::chrono::steady_clock::now();
+    const bool detailed_timing = ctx_.config().enable_hotpath_detailed_timing;
+    const auto alloc_start = detailed_timing ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
     uint8_t* raw = static_cast<uint8_t*>(
         std::aligned_alloc(4096, chunk_capacity));
-    ctx_.stats().rerank_vec_alloc_ms += std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - alloc_start).count();
+    if (detailed_timing) {
+        ctx_.stats().rerank_vec_alloc_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - alloc_start).count();
+    }
     if (raw == nullptr) {
         return false;
     }
@@ -50,10 +55,15 @@ const float* RerankConsumer::AllocateVectorCopy(const uint8_t* src) {
     }
     VectorChunk& chunk = vector_chunks_.back();
     uint8_t* dst = chunk.storage.get() + chunk.used;
-    auto copy_start = std::chrono::steady_clock::now();
+    const bool detailed_timing = ctx_.config().enable_hotpath_detailed_timing;
+    const auto copy_start = detailed_timing ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
     std::memcpy(dst, src, vec_bytes_);
-    ctx_.stats().rerank_vec_copy_ms += std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - copy_start).count();
+    if (detailed_timing) {
+        ctx_.stats().rerank_vec_copy_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - copy_start).count();
+    }
     chunk.used += aligned_vec_bytes_;
     return reinterpret_cast<const float*>(dst);
 }

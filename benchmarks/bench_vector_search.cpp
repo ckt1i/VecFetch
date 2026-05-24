@@ -409,6 +409,7 @@ int main(int argc, char* argv[]) {
     // Aggregate stats
     uint64_t s1_safein = 0, s1_safeout = 0, s1_uncertain = 0;
     uint64_t s2_safein = 0, s2_safeout = 0, s2_uncertain = 0;
+    uint64_t final_uncertain = 0;
     uint64_t total_probed_clusters = 0;
     uint32_t early_stop_count = 0;
 
@@ -429,12 +430,13 @@ int main(int argc, char* argv[]) {
 
         // Aggregate stats
         const auto& st = sr.stats();
-        s1_safein    += st.total_safe_in;
-        s1_safeout   += st.total_safe_out;
-        s1_uncertain += st.total_uncertain;
-        s2_safein    += st.s2_safe_in;
-        s2_safeout   += st.s2_safe_out;
-        s2_uncertain += st.s2_uncertain;
+        s1_safein       += st.total_safe_in;
+        s1_safeout      += st.total_safe_out;
+        s1_uncertain    += st.s1_uncertain_raw;
+        s2_safein       += st.s2_safe_in;
+        s2_safeout      += st.s2_safe_out;
+        s2_uncertain    += st.s2_uncertain;
+        final_uncertain += st.total_uncertain;
         total_probed_clusters += st.crc_clusters_probed > 0
             ? st.crc_clusters_probed
             : (static_cast<uint32_t>(nprobe) - st.clusters_skipped);
@@ -516,6 +518,8 @@ int main(int argc, char* argv[]) {
     Log("  avg_probed      = %.2f / %u clusters\n", avg_probed, nprobe);
     Log("  early_stop_rate = %.4f\n", early_stop_rate);
 
+    // Stage 1 Uncertain is the raw FastScan population that flows into Stage 2.
+    // Stage 2 Uncertain is the unresolved remainder after ExRaBitQ re-classification.
     Log("\n  --- Stage 1 (FastScan) ---\n");
     Log("    SafeIn    = %lu (%.2f%%)\n", s1_safein, pct(s1_safein, s1_total));
     Log("    SafeOut   = %lu (%.2f%%)\n", s1_safeout, pct(s1_safeout, s1_total));
@@ -527,6 +531,7 @@ int main(int argc, char* argv[]) {
         Log("    SafeIn    = %lu (%.2f%%)\n", s2_safein, pct(s2_safein, s2_total));
         Log("    SafeOut   = %lu (%.2f%%)\n", s2_safeout, pct(s2_safeout, s2_total));
         Log("    Uncertain = %lu (%.2f%%)\n", s2_uncertain, pct(s2_uncertain, s2_total));
+        Log("    Final Uncertain = %lu\n", final_uncertain);
     }
 
     if (use_crc) {

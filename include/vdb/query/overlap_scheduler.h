@@ -43,6 +43,7 @@ class OverlapScheduler {
         None,
         Free,
         Pool,
+        VecPool,
         FixedVec,
     };
 
@@ -96,6 +97,9 @@ class OverlapScheduler {
     void ReleasePendingSlot(uint32_t slot_id);
     void CleanupPendingSlot(PendingSlot& slot);
     void CleanupPendingSlots();
+    uint8_t* AcquireVecOnlyBuffer();
+    void ReleaseVecOnlyBuffer(uint8_t* buf);
+    void ReleaseVectorOnlyPendingSlot(uint32_t slot_id);
     void InitializeDataBufferSlab();
     bool TryAcquireFixedVecBuffer(uint8_t** buffer, uint16_t* buffer_index);
     void ReleaseFixedVecBuffer(uint16_t buffer_index);
@@ -118,6 +122,8 @@ class OverlapScheduler {
     std::vector<uint8_t*> fixed_vec_buffers_;
     std::vector<uint32_t> fixed_vec_buffer_capacities_;
     std::vector<uint16_t> free_fixed_vec_buffers_;
+    std::vector<uint8_t*> vec_only_owned_buffers_;
+    std::vector<uint8_t*> free_vec_only_buffers_;
     IoUringReader* fixed_buffer_reader_ = nullptr;
     bool fixed_vec_buffers_enabled_ = false;
 
@@ -188,6 +194,7 @@ class OverlapScheduler {
     uint32_t inflight_clusters_ = 0;
 
     uint32_t vec_bytes_;
+    uint32_t aligned_vec_bytes_ = 0;
     int data_fd_registered_index_ = -1;
 
     // CRC early stop state (reset per Search() call)
