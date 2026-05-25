@@ -190,7 +190,10 @@ TEST_F(IvfIndexTest, ConANN_LoadedCorrectly) {
     // d_k should still be positive after calibration.
     EXPECT_GT(idx.conann().epsilon(), 0.0f);
     EXPECT_GT(idx.conann().d_k(), 0.0f);
+    EXPECT_FLOAT_EQ(idx.conann().safein_d_k(), idx.conann().legacy_d_k());
+    EXPECT_FALSE(idx.conann().has_safein_d_k());
 }
+
 
 TEST_F(IvfIndexTest, SegmentAccessible) {
     IvfIndex idx;

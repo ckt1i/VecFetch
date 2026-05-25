@@ -61,7 +61,8 @@ struct ClusterPreparedScratch {
 struct PreparedClusterQueryView {
     const PreparedQuery*          prepared = nullptr;
     const ClusterPreparedScratch*  scratch = nullptr;
-    float                          margin_factor = 0.0f;
+    float                          safein_margin_factor = 0.0f;
+    float                          safeout_margin_factor = 0.0f;
 };
 
 struct PrepareTimingBreakdown {

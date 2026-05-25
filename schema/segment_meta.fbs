@@ -165,6 +165,15 @@ table ConANNParams {
     // Phase 2 新增: FastScan 专用 epsilon + rotated centroids 标志
     eps_ip_fs: float;                // ε_ip FastScan 校准值 (同 epsilon, 显式标注来源)
     has_rotated_centroids: bool = false;  // true 当且仅当 rotated_centroids.bin 已写入
+
+    // SafeIn 专用 d_k 及其来源
+    safein_d_k: float = 0.0;
+    safein_dk_space: uint8 = 0;              // 0=exact_l2, 1=rabitq_s2
+    safein_dk_percentile: float = 0.0;
+    safein_dk_calibration_samples: uint32 = 0;
+    safein_dk_search_scope: uint8 = 0;       // 0=full_database, 1=nprobe
+    safein_dk_nprobe: uint32 = 0;
+    safein_dk_bits: uint8 = 0;
 }
 
 // ============================================================

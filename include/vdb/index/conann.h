@@ -37,11 +37,20 @@ namespace index {
 ///
 class ConANN {
  public:
-    /// Construct a ConANN classifier with explicit epsilon and d_k values.
+    /// Construct a ConANN classifier with legacy exact d_k semantics.
     ///
     /// @param epsilon  ε_ip: inner-product estimation error bound (P95)
-    /// @param d_k      Precomputed global top-k reference distance (L2²)
+    /// @param d_k      Precomputed legacy top-k reference distance (L2²)
     ConANN(float epsilon, float d_k);
+
+    /// Construct a ConANN classifier with separate legacy and SafeIn d_k.
+    ///
+    /// @param epsilon      ε_ip: inner-product estimation error bound (P95)
+    /// @param legacy_d_k   Legacy exact-space top-k reference distance (L2²)
+    /// @param safein_d_k   SafeIn threshold center in the active metric space
+    /// @param has_safein_d_k  Whether safein_d_k was explicitly calibrated
+    ConANN(float epsilon, float legacy_d_k, float safein_d_k,
+           bool has_safein_d_k);
 
     /// Construct from RaBitQ config and a precomputed d_k.
     ///
@@ -73,9 +82,9 @@ class ConANN {
 
     /// Classify with dynamic SafeOut threshold.
     ///
-    /// SafeOut uses dynamic_d_k (from RaBitQ estimate heap) instead of static d_k,
-    /// enabling progressively tighter pruning as the estimate heap stabilizes.
-    /// SafeIn remains static (uses construction-time d_k_) for safety.
+    /// SafeOut uses dynamic_d_k (from RaBitQ estimate heap) instead of static d_k.
+    /// SafeIn remains static and uses safein_d_k_ when available, otherwise
+    /// falls back to the legacy d_k_ for backward compatibility.
     ///
     /// @param approx_dist  Approximate squared L2 distance from RaBitQ
     /// @param margin       Dynamic distance error bound for this (cluster, query)
@@ -84,7 +93,16 @@ class ConANN {
     VDB_FORCE_INLINE ResultClass ClassifyAdaptive(float approx_dist, float margin,
                                                    float dynamic_d_k) const {
         if (approx_dist > dynamic_d_k + 2 * margin) return ResultClass::SafeOut;
-        if (approx_dist < d_k_ - 2 * margin)         return ResultClass::SafeIn;
+        if (approx_dist < safein_d_k_ - 2 * margin)  return ResultClass::SafeIn;
+        return ResultClass::Uncertain;
+    }
+
+    VDB_FORCE_INLINE ResultClass ClassifyAdaptive(float approx_dist,
+                                                  float safein_margin,
+                                                  float safeout_margin,
+                                                  float dynamic_d_k) const {
+        if (approx_dist > dynamic_d_k + 2 * safeout_margin) return ResultClass::SafeOut;
+        if (approx_dist < safein_d_k_ - 2 * safein_margin) return ResultClass::SafeIn;
         return ResultClass::Uncertain;
     }
 
@@ -148,6 +166,16 @@ class ConANN {
     /// Get the precomputed global top-k reference distance.
     float d_k() const { return d_k_; }
 
+    /// Get the legacy exact-space top-k reference distance.
+    float legacy_d_k() const { return d_k_; }
+
+    /// Get the SafeIn threshold center. Falls back to legacy d_k for old
+    /// indexes that do not carry SafeIn-specific calibration.
+    float safein_d_k() const { return safein_d_k_; }
+
+    /// Whether the loaded index carries an explicit SafeIn d_k.
+    bool has_safein_d_k() const { return has_safein_d_k_; }
+
     /// Get the SafeIn threshold: d_k − 2ε.
     float tau_in() const { return tau_in_; }
 
@@ -156,9 +184,11 @@ class ConANN {
 
  private:
     float epsilon_;    // ε_ip: inner-product estimation error bound
-    float d_k_;        // Global precomputed top-k reference distance
-    float tau_in_;     // = d_k − 2ε
-    float tau_out_;    // = d_k + 2ε
+    float d_k_;        // Legacy precomputed exact-space top-k reference distance
+    float safein_d_k_; // SafeIn threshold center, or legacy d_k_ as fallback
+    bool has_safein_d_k_;
+    float tau_in_;     // = safein_d_k − 2ε
+    float tau_out_;    // = legacy d_k + 2ε
 };
 
 }  // namespace index

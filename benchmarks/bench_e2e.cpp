@@ -46,8 +46,10 @@
 #include "vdb/query/async_reader.h"
 #include "vdb/query/overlap_scheduler.h"
 #include "vdb/simd/distance_l2.h"
+#include "rabitq_bench_calibration.h"
 
 using namespace vdb;
+using namespace vdb::bench;
 using namespace vdb::index;
 using namespace vdb::query;
 
@@ -1458,6 +1460,31 @@ int main(int argc, char* argv[]) {
     float arg_override_eps_ip = GetFloatArg(argc, argv, "--override-eps-ip", -1.0f);
     float arg_override_d_k = GetFloatArg(argc, argv, "--override-d-k", -1.0f);
     int arg_crc_samples = GetIntArg(argc, argv, "--crc-samples", 1000);
+    float arg_safein_dk_percentile =
+        GetFloatArg(argc, argv, "--safein-dk-percentile", -1.0f);
+    int arg_safein_dk_samples =
+        GetIntArg(argc, argv, "--safein-dk-samples", 0);
+    float arg_safein_epsilon_percentile =
+        GetFloatArg(argc, argv, "--safein-epsilon-percentile", -1.0f);
+    float arg_safeout_epsilon_percentile =
+        GetFloatArg(argc, argv, "--safeout-epsilon-percentile", -1.0f);
+    int arg_enable_stage1_safein =
+        GetIntArg(argc, argv, "--enable-stage1-safein", 1);
+    auto safein_dk_scope_or = ParseSafeInDkSearchScopeArg(
+        GetStringArg(argc, argv, "--safein-dk-search-scope", "full"));
+    if (!safein_dk_scope_or.ok()) {
+        std::fprintf(stderr, "%s\n", safein_dk_scope_or.status().ToString().c_str());
+        return 1;
+    }
+    SafeInDkSearchScope arg_safein_dk_search_scope = safein_dk_scope_or.value();
+    int arg_safein_dk_nprobe =
+        GetIntArg(argc, argv, "--safein-dk-nprobe", arg_nprobe);
+    if (arg_enable_stage1_safein != 0 && arg_enable_stage1_safein != 1) {
+        std::fprintf(stderr,
+                     "Invalid --enable-stage1-safein: %d (expected 0 or 1)\n",
+                     arg_enable_stage1_safein);
+        return 1;
+    }
 
     std::string ds_name = DatasetName(data_dir);
     std::string ts = Timestamp();
@@ -1628,6 +1655,7 @@ int main(int argc, char* argv[]) {
         arg_index_dir.empty() ? "rebuilt" : "reused";
     const std::string resolved_index_dir = NormalizePath(index_dir);
     double training_time_ms = 0.0;
+    std::vector<uint32_t> built_assignments;
 
     if (arg_index_dir.empty()) {
         fs::create_directories(index_dir);
@@ -1712,6 +1740,7 @@ int main(int argc, char* argv[]) {
             std::fprintf(stderr, "Build failed: %s\n", s.ToString().c_str());
             return 1;
         }
+        built_assignments = builder.assignments();
         Log("  Build time: %.1f ms\n", training_time_ms);
     } else {
         Log("\n[Phase C] Skipped (using pre-built index: %s)\n", index_dir.c_str());
@@ -1751,6 +1780,129 @@ int main(int argc, char* argv[]) {
         index.OverrideConANN(eps, dk);
         Log("  Override params applied: eps_ip=%.6f  d_k=%.6f\n",
             index.conann().epsilon(), index.conann().d_k());
+    }
+
+    const float loaded_eps_ip = index.conann().epsilon();
+    const float loaded_d_k = index.conann().d_k();
+    float runtime_safein_d_k = index.conann().safein_d_k();
+    if (runtime_safein_d_k <= 0.0f) {
+        runtime_safein_d_k = index.conann().d_k();
+    }
+    float runtime_safein_epsilon = index.conann().epsilon();
+    float runtime_safeout_epsilon = index.conann().epsilon();
+    const bool split_safein_safeout_eps =
+        arg_safein_epsilon_percentile >= 0.0f &&
+        arg_safeout_epsilon_percentile >= 0.0f;
+
+    std::unordered_map<int64_t, uint32_t> image_id_to_row;
+    image_id_to_row.reserve(static_cast<size_t>(N));
+    for (uint32_t row = 0; row < N; ++row) {
+        image_id_to_row[img_ids.data[row]] = row;
+    }
+
+    std::vector<std::vector<uint32_t>> cluster_members_for_stats;
+    bool have_cluster_members_for_stats = false;
+    if (!arg_index_dir.empty() && !image_id_to_row.empty()) {
+        auto recover_status = RecoverClusterMembersFromIndex(
+            index, image_id_to_row, &cluster_members_for_stats);
+        if (!recover_status.ok()) {
+            std::fprintf(stderr,
+                         "Failed to recover cluster members from index payload: %s\n",
+                         recover_status.ToString().c_str());
+            return 1;
+        }
+        have_cluster_members_for_stats = true;
+    } else if (!built_assignments.empty()) {
+        BuildClusterMembers(built_assignments, index.nlist(),
+                            &cluster_members_for_stats);
+        have_cluster_members_for_stats = true;
+    } else if (!arg_assignments.empty()) {
+        auto assignments_or = LoadAssignments(arg_assignments, N);
+        if (!assignments_or.ok()) {
+            std::fprintf(stderr, "Failed to load assignments: %s\n",
+                         assignments_or.status().ToString().c_str());
+            return 1;
+        }
+        BuildClusterMembers(assignments_or.value(), index.nlist(),
+                            &cluster_members_for_stats);
+        have_cluster_members_for_stats = true;
+    }
+
+    if (arg_safein_dk_percentile >= 0.0f ||
+        arg_safein_epsilon_percentile >= 0.0f ||
+        arg_safeout_epsilon_percentile >= 0.0f) {
+        if (!have_cluster_members_for_stats) {
+            std::fprintf(stderr,
+                         "SafeIn/SafeOut runtime calibration requires payload ids, "
+                         "fresh assignments, or --assignments.\n");
+            return 1;
+        }
+        std::vector<std::vector<rabitq::RaBitQCode>> all_codes;
+        std::vector<uint32_t> calibration_cluster_subset;
+        const std::vector<uint32_t>* calibration_cluster_subset_ptr = nullptr;
+        if (arg_safein_dk_search_scope == SafeInDkSearchScope::NProbe) {
+            const uint32_t dk_queries = (arg_safein_dk_samples > 0)
+                ? std::min<uint32_t>(static_cast<uint32_t>(arg_safein_dk_samples), Q)
+                : Q;
+            std::vector<uint32_t> sample_qids(dk_queries);
+            std::iota(sample_qids.begin(), sample_qids.end(), 0u);
+            std::unordered_set<uint32_t> cluster_set;
+            cluster_set.reserve(static_cast<size_t>(dk_queries) *
+                                static_cast<size_t>(std::max(1, arg_safein_dk_nprobe)));
+            for (uint32_t qi : sample_qids) {
+                const float* q = qry_emb.data.data() + static_cast<size_t>(qi) * dim;
+                const auto probed = index.FindNearestClusters(
+                    q, static_cast<uint32_t>(std::max(1, arg_safein_dk_nprobe)));
+                for (ClusterID cid : probed) cluster_set.insert(cid);
+            }
+            calibration_cluster_subset.assign(cluster_set.begin(), cluster_set.end());
+            std::sort(calibration_cluster_subset.begin(),
+                      calibration_cluster_subset.end());
+            calibration_cluster_subset_ptr = &calibration_cluster_subset;
+            Log("  SafeIn calibration cluster subset: %zu clusters (scope=nprobe, nprobe=%d)\n",
+                calibration_cluster_subset.size(), arg_safein_dk_nprobe);
+        }
+        EncodeAllCodes(img_emb.data, N, dim, cluster_members_for_stats,
+                       index.centroids(), index.rotation(),
+                       static_cast<uint8_t>(arg_bits),
+                       calibration_cluster_subset_ptr, &all_codes);
+
+        if (arg_safein_dk_percentile >= 0.0f) {
+            const uint32_t dk_queries = (arg_safein_dk_samples > 0)
+                ? static_cast<uint32_t>(arg_safein_dk_samples)
+                : Q;
+            runtime_safein_d_k = CalibrateRabitqSafeInDk(
+                qry_emb.data.data(), Q, dim, GT_K, dk_queries,
+                arg_safein_dk_percentile, cluster_members_for_stats, all_codes,
+                index.centroids(), index.rotation(), static_cast<uint8_t>(arg_bits),
+                static_cast<uint64_t>(arg_seed), &index,
+                arg_safein_dk_search_scope,
+                static_cast<uint32_t>(std::max(1, arg_safein_dk_nprobe)));
+        }
+        if (arg_safein_epsilon_percentile >= 0.0f) {
+            runtime_safein_epsilon = CalibrateSplitEpsilon(
+                all_codes, cluster_members_for_stats, img_emb.data.data(),
+                index.centroids(), index.rotation(), dim,
+                static_cast<uint32_t>(arg_epsilon_samples),
+                arg_safein_epsilon_percentile, static_cast<uint64_t>(arg_seed),
+                runtime_safein_d_k, static_cast<uint8_t>(arg_bits),
+                calibration_cluster_subset_ptr);
+        }
+        if (arg_safeout_epsilon_percentile >= 0.0f) {
+            runtime_safeout_epsilon = CalibrateSplitEpsilon(
+                all_codes, cluster_members_for_stats, img_emb.data.data(),
+                index.centroids(), index.rotation(), dim,
+                static_cast<uint32_t>(arg_epsilon_samples),
+                arg_safeout_epsilon_percentile, static_cast<uint64_t>(arg_seed),
+                runtime_safein_d_k, static_cast<uint8_t>(arg_bits),
+                calibration_cluster_subset_ptr);
+        }
+        index.OverrideConANN(runtime_safeout_epsilon, index.conann().legacy_d_k(),
+                             runtime_safein_d_k, true);
+        Log("  Runtime SafeIn/SafeOut overrides: safein_d_k=%.6f safein_eps=%.6f safeout_eps=%.6f scope=%s nprobe=%d\n",
+            runtime_safein_d_k, runtime_safein_epsilon, runtime_safeout_epsilon,
+            arg_safein_dk_search_scope == SafeInDkSearchScope::NProbe ? "nprobe" : "full",
+            arg_safein_dk_nprobe);
     }
 
     CalibrationResults calib_results;
@@ -2032,8 +2184,21 @@ int main(int argc, char* argv[]) {
         (arg_rerank_batched_distance_simd != 0);
     search_cfg.enable_coarse_select_simd = (arg_coarse_select_simd != 0);
     search_cfg.enable_coarse_select_phase2 = (arg_coarse_select_phase2 != 0);
+    search_cfg.enable_stage1_safein = (arg_enable_stage1_safein != 0);
     search_cfg.enable_stage2_collect_block_first = (arg_stage2_block_first != 0);
     search_cfg.enable_stage2_scatter_batch_classify = (arg_stage2_batch_classify != 0);
+    if (arg_safein_epsilon_percentile >= 0.0f) {
+        search_cfg.safein_epsilon_override = runtime_safein_epsilon;
+    }
+    if (arg_safeout_epsilon_percentile >= 0.0f) {
+        search_cfg.safeout_epsilon_override = runtime_safeout_epsilon;
+    }
+    if (split_safein_safeout_eps) {
+        search_cfg.enable_stage2_scatter_batch_classify = false;
+    }
+    if (have_cluster_members_for_stats) {
+        search_cfg.false_stats_cluster_members = &cluster_members_for_stats;
+    }
 
     if (search_cfg.use_resident_clusters) {
         if (search_cfg.clu_read_mode != CluReadMode::FullPreload) {
@@ -2367,8 +2532,13 @@ int main(int argc, char* argv[]) {
         f << "    " << JBool("enable_rerank_batched_distance_simd", search_cfg.enable_rerank_batched_distance_simd) << ",\n";
         f << "    " << JBool("enable_coarse_select_simd", search_cfg.enable_coarse_select_simd) << ",\n";
         f << "    " << JBool("enable_coarse_select_phase2", search_cfg.enable_coarse_select_phase2) << ",\n";
+        f << "    " << JBool("enable_stage1_safein", search_cfg.enable_stage1_safein) << ",\n";
+        f << "    " << JBool("enable_stage2_scatter_batch_classify",
+                             search_cfg.enable_stage2_scatter_batch_classify) << ",\n";
         f << "    " << JBool("enable_online_submit_tuning", search_cfg.enable_online_submit_tuning) << ",\n";
         f << "    " << JNum("submit_ema_alpha", search_cfg.submit_ema_alpha) << ",\n";
+        f << "    " << JNum("safein_epsilon_override", search_cfg.safein_epsilon_override) << ",\n";
+        f << "    " << JNum("safeout_epsilon_override", search_cfg.safeout_epsilon_override) << ",\n";
         f << "    " << JStr("timing_mode",
                              search_cfg.enable_hotpath_detailed_timing
                                  ? "hotpath_detailed_diagnostic"
@@ -2396,8 +2566,22 @@ int main(int argc, char* argv[]) {
         f << "    " << JInt("seed", arg_seed) << "\n";
         f << "  },\n";
         f << "  \"runtime_index\": {\n";
-        f << "    " << JNum("loaded_eps_ip", index.conann().epsilon()) << ",\n";
-        f << "    " << JNum("loaded_d_k", index.conann().d_k()) << ",\n";
+        f << "    " << JNum("loaded_eps_ip", loaded_eps_ip) << ",\n";
+        f << "    " << JNum("loaded_d_k", loaded_d_k) << ",\n";
+        f << "    " << JNum("runtime_eps_ip", index.conann().epsilon()) << ",\n";
+        f << "    " << JNum("runtime_d_k", index.conann().d_k()) << ",\n";
+        f << "    " << JNum("runtime_safein_d_k", runtime_safein_d_k) << ",\n";
+        f << "    " << JNum("runtime_safein_epsilon", runtime_safein_epsilon) << ",\n";
+        f << "    " << JNum("runtime_safeout_epsilon", runtime_safeout_epsilon) << ",\n";
+        f << "    " << JNum("safein_dk_percentile", arg_safein_dk_percentile) << ",\n";
+        f << "    " << JInt("safein_dk_samples", arg_safein_dk_samples) << ",\n";
+        f << "    " << JStr("safein_dk_search_scope",
+                             arg_safein_dk_search_scope == SafeInDkSearchScope::NProbe
+                                 ? "nprobe"
+                                 : "full") << ",\n";
+        f << "    " << JInt("safein_dk_nprobe", arg_safein_dk_nprobe) << ",\n";
+        f << "    " << JNum("safein_epsilon_percentile", arg_safein_epsilon_percentile) << ",\n";
+        f << "    " << JNum("safeout_epsilon_percentile", arg_safeout_epsilon_percentile) << ",\n";
         f << "    " << JStr("assignment_mode", AssignmentModeName(index.assignment_mode())) << ",\n";
         f << "    " << JStr("coarse_builder", CoarseBuilderName(index.coarse_builder())) << ",\n";
         f << "    " << JStr("requested_metric", index.requested_metric()) << ",\n";
@@ -2427,8 +2611,13 @@ int main(int argc, char* argv[]) {
         f << "    " << JStr("exrabitq_storage_format",
                             ExRaBitQStorageFormatName(
                                 index.segment().cluster_reader().file_version())) << ",\n";
-        f << "    " << JNum("loaded_eps_ip", index.conann().epsilon()) << ",\n";
-        f << "    " << JNum("loaded_d_k", index.conann().d_k()) << ",\n";
+        f << "    " << JNum("loaded_eps_ip", loaded_eps_ip) << ",\n";
+        f << "    " << JNum("loaded_d_k", loaded_d_k) << ",\n";
+        f << "    " << JNum("runtime_eps_ip", index.conann().epsilon()) << ",\n";
+        f << "    " << JNum("runtime_d_k", index.conann().d_k()) << ",\n";
+        f << "    " << JNum("runtime_safein_d_k", runtime_safein_d_k) << ",\n";
+        f << "    " << JNum("runtime_safein_epsilon", runtime_safein_epsilon) << ",\n";
+        f << "    " << JNum("runtime_safeout_epsilon", runtime_safeout_epsilon) << ",\n";
         f << "    " << JBool("recall_available", metrics.recall_available) << ",\n";
         f << "    " << JInt("logical_dimension", index.logical_dim()) << ",\n";
         f << "    " << JInt("effective_dimension", index.effective_dim()) << ",\n";

@@ -23,5 +23,15 @@ enum class CoarseBuilder : uint8_t {
     FaissKMeans = 3,
 };
 
+enum class SafeInDkSpace : uint8_t {
+    ExactL2 = 0,
+    RabitqS2 = 1,
+};
+
+enum class SafeInDkSearchScope : uint8_t {
+    FullDatabase = 0,
+    NProbe = 1,
+};
+
 }  // namespace index
 }  // namespace vdb

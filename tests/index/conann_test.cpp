@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -136,6 +137,32 @@ TEST(ConANNTest, Classify_LargeEpsilon) {
     EXPECT_EQ(conann.Classify(201.1f), ResultClass::SafeOut);
 }
 
+TEST(ConANNTest, ClassifyAdaptive_UsesSafeInDkAndDynamicSafeOut) {
+    ConANN conann(/*epsilon=*/0.1f, /*legacy_d_k=*/1.0f,
+                  /*safein_d_k=*/1.3f, /*has_safein_d_k=*/true);
+
+    EXPECT_TRUE(std::isinf(std::numeric_limits<float>::infinity()));
+    EXPECT_EQ(conann.ClassifyAdaptive(/*approx_dist=*/1.15f,
+                                      /*margin=*/0.05f,
+                                      std::numeric_limits<float>::infinity()),
+              ResultClass::SafeIn);
+    EXPECT_EQ(conann.ClassifyAdaptive(/*approx_dist=*/1.15f,
+                                      /*margin=*/0.05f,
+                                      /*dynamic_d_k=*/1.0f),
+              ResultClass::SafeOut);
+}
+
+TEST(ConANNTest, SafeInFallback_UsesLegacyDkWhenExplicitValueMissing) {
+    ConANN conann(/*epsilon=*/0.1f, /*legacy_d_k=*/1.0f,
+                  /*safein_d_k=*/0.0f, /*has_safein_d_k=*/false);
+    EXPECT_FALSE(conann.has_safein_d_k());
+    EXPECT_FLOAT_EQ(conann.safein_d_k(), conann.legacy_d_k());
+    EXPECT_EQ(conann.ClassifyAdaptive(/*approx_dist=*/0.75f,
+                                      /*margin=*/0.1f,
+                                      std::numeric_limits<float>::infinity()),
+              ResultClass::SafeIn);
+}
+
 // ============================================================================
 // ConANN::CalibrateDistanceThreshold
 // ============================================================================
@@ -214,8 +241,9 @@ TEST(ConANNTest, CalibrateDistanceThreshold_HigherPercentileGivesLargerDk) {
     float d_k_99 = ConANN::CalibrateDistanceThreshold(
         vectors.data(), N, dim, 100, 10, 0.99f, 42);
 
-    // Higher percentile → more conservative → larger d_k
-    EXPECT_GE(d_k_99, d_k_50);
+    // ConANN percentile takes a lower sample quantile:
+    // larger percentile parameter => smaller calibrated d_k.
+    EXPECT_LE(d_k_99, d_k_50);
 }
 
 TEST(ConANNTest, CalibrateDistanceThreshold_EdgeCase_SmallN) {

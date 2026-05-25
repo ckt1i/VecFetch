@@ -9,6 +9,7 @@
 #include <numeric>
 #include <random>
 #include <sstream>
+#include <unordered_set>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -135,6 +136,42 @@ const char* ClusteringSourceName(ClusteringSource source) {
         default:
             return "auto";
     }
+}
+
+uint32_t ResolveSafeInCalibrationSamples(const IvfBuilderConfig& config) {
+    return config.safein_dk_calibration_samples > 0
+        ? config.safein_dk_calibration_samples
+        : config.calibration_samples;
+}
+
+float ResolveSafeInPercentile(const IvfBuilderConfig& config) {
+    return config.safein_dk_percentile >= 0.0f
+        ? config.safein_dk_percentile
+        : config.calibration_percentile;
+}
+
+uint32_t ResolveSafeInNProbe(const IvfBuilderConfig& config) {
+    return config.safein_dk_nprobe > 0 ? config.safein_dk_nprobe : config.nprobe;
+}
+
+std::vector<uint32_t> SampleCalibrationQueryIndices(
+    uint32_t total_queries, uint32_t num_samples, uint64_t seed) {
+    num_samples = std::min(num_samples, total_queries);
+    std::vector<uint32_t> indices(total_queries);
+    std::iota(indices.begin(), indices.end(), 0u);
+    std::mt19937_64 rng(seed == 0 ? std::random_device{}() : seed);
+    std::shuffle(indices.begin(), indices.end(), rng);
+    indices.resize(num_samples);
+    return indices;
+}
+
+uint32_t KthIndexForCalibration(uint32_t top_k,
+                                uint32_t candidate_count,
+                                bool self_sampling) {
+    uint32_t effective_topk = top_k + (self_sampling ? 1u : 0u);
+    if (effective_topk == 0) effective_topk = 1;
+    effective_topk = std::min(effective_topk, candidate_count);
+    return effective_topk - 1;
 }
 
 }  // namespace
@@ -572,6 +609,98 @@ void IvfBuilder::CalibrateDk(const float* vectors, uint32_t N, Dim dim) {
     }
 }
 
+void IvfBuilder::CalibrateSafeInDk(
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const float* vectors,
+    uint32_t N,
+    Dim dim,
+    const rabitq::RotationMatrix& rotation) {
+    calibrated_safein_dk_ = calibrated_dk_;
+    if (config_.safein_dk_space != SafeInDkSpace::RabitqS2) return;
+    if (config_.rabitq.bits <= 1) return;
+
+    const uint32_t total_queries =
+        (config_.calibration_queries != nullptr && config_.num_calibration_queries > 0)
+            ? config_.num_calibration_queries
+            : N;
+    const uint32_t sample_count = ResolveSafeInCalibrationSamples(config_);
+    if (total_queries == 0 || sample_count == 0 || config_.calibration_topk == 0) {
+        return;
+    }
+
+    const bool self_sampling =
+        (config_.calibration_queries == nullptr || config_.num_calibration_queries == 0);
+    const float* query_base = self_sampling ? vectors : config_.calibration_queries;
+    const auto query_indices =
+        SampleCalibrationQueryIndices(total_queries, sample_count, config_.seed);
+    std::vector<float> query_level_kths;
+    query_level_kths.reserve(query_indices.size());
+
+    rabitq::RaBitQEstimator estimator(dim, config_.rabitq.bits);
+    rabitq::PreparedQuery pq;
+    rabitq::ClusterPreparedScratch scratch;
+    std::vector<std::pair<float, uint32_t>> centroid_dists;
+    centroid_dists.reserve(cluster_members.size());
+
+    for (uint32_t sample_idx : query_indices) {
+        const float* query = query_base + static_cast<size_t>(sample_idx) * dim;
+        std::vector<float> candidate_dists;
+
+        if (config_.safein_dk_search_scope == SafeInDkSearchScope::FullDatabase) {
+            candidate_dists.reserve(N);
+            for (uint32_t cid = 0; cid < cluster_members.size(); ++cid) {
+                const float* centroid = centroids_.data() + static_cast<size_t>(cid) * dim;
+                estimator.PrepareQueryInto(query, centroid, rotation, &pq, &scratch);
+                const auto& codes = all_codes[cid];
+                for (const auto& code : codes) {
+                    candidate_dists.push_back(estimator.EstimateDistanceMultiBit(pq, code));
+                }
+            }
+        } else {
+            centroid_dists.clear();
+            for (uint32_t cid = 0; cid < cluster_members.size(); ++cid) {
+                const float* centroid = centroids_.data() + static_cast<size_t>(cid) * dim;
+                centroid_dists.push_back({simd::L2Sqr(query, centroid, dim), cid});
+            }
+            const uint32_t nprobe = std::min<uint32_t>(
+                ResolveSafeInNProbe(config_),
+                static_cast<uint32_t>(centroid_dists.size()));
+            if (nprobe == 0) continue;
+            std::partial_sort(centroid_dists.begin(), centroid_dists.begin() + nprobe,
+                              centroid_dists.end());
+            for (uint32_t i = 0; i < nprobe; ++i) {
+                const uint32_t cid = centroid_dists[i].second;
+                const float* centroid = centroids_.data() + static_cast<size_t>(cid) * dim;
+                estimator.PrepareQueryInto(query, centroid, rotation, &pq, &scratch);
+                const auto& codes = all_codes[cid];
+                for (const auto& code : codes) {
+                    candidate_dists.push_back(estimator.EstimateDistanceMultiBit(pq, code));
+                }
+            }
+        }
+
+        if (candidate_dists.size() < config_.calibration_topk) continue;
+        const uint32_t kth = KthIndexForCalibration(
+            config_.calibration_topk,
+            static_cast<uint32_t>(candidate_dists.size()),
+            self_sampling);
+        std::nth_element(candidate_dists.begin(),
+                         candidate_dists.begin() + kth,
+                         candidate_dists.end());
+        query_level_kths.push_back(candidate_dists[kth]);
+    }
+
+    if (query_level_kths.empty()) return;
+
+    std::sort(query_level_kths.begin(), query_level_kths.end());
+    const float percentile = ResolveSafeInPercentile(config_);
+    uint32_t k = static_cast<uint32_t>(std::floor(
+        (1.0f - percentile) * static_cast<float>(query_level_kths.size())));
+    k = std::min<uint32_t>(k, static_cast<uint32_t>(query_level_kths.size() - 1));
+    calibrated_safein_dk_ = query_level_kths[k];
+}
+
 // ============================================================================
 // CalibrateEpsilonIp — distance-error calibration for FastScan classification
 // ============================================================================
@@ -881,6 +1010,7 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
         rotation, dim, K,
         config_.epsilon_samples, config_.epsilon_percentile, config_.seed,
         calibrated_dk_, config_.rabitq.bits);
+    CalibrateSafeInDk(all_codes, cluster_members, encoded_vectors, N, dim, rotation);
 
     // --- Phase 2c: write unified cluster.clu ---
     storage::ClusterStoreWriter clu_writer;
@@ -962,7 +1092,14 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
         config_.calibration_topk,        // calibration_topk
         config_.calibration_percentile,  // calibration_percentile
         calibrated_eps_ip_,              // eps_ip_fs (same as epsilon; explicit FastScan label)
-        used_hadamard                    // has_rotated_centroids
+        used_hadamard,                   // has_rotated_centroids
+        calibrated_safein_dk_,
+        config_.safein_dk_space == SafeInDkSpace::RabitqS2 ? 1 : 0,
+        ResolveSafeInPercentile(config_),
+        ResolveSafeInCalibrationSamples(config_),
+        config_.safein_dk_search_scope == SafeInDkSearchScope::NProbe ? 1 : 0,
+        ResolveSafeInNProbe(config_),
+        config_.rabitq.bits
     );
 
     // ClusterMeta array — per-cluster info from the lookup table
@@ -1129,6 +1266,18 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
             << "  \"faiss_train_size\": " << std::min(config_.faiss_train_size, N) << ",\n"
             << "  \"faiss_niter\": " << ((config_.faiss_niter == 0) ? kDefaultFaissNiter : config_.faiss_niter) << ",\n"
             << "  \"faiss_nredo\": " << config_.faiss_nredo << ",\n"
+            << "  \"legacy_d_k\": " << calibrated_dk_ << ",\n"
+            << "  \"safein_d_k\": " << calibrated_safein_dk_ << ",\n"
+            << "  \"safein_dk_space\": \""
+            << (config_.safein_dk_space == SafeInDkSpace::RabitqS2 ? "rabitq_s2" : "exact_l2")
+            << "\",\n"
+            << "  \"safein_dk_percentile\": " << ResolveSafeInPercentile(config_) << ",\n"
+            << "  \"safein_dk_calibration_samples\": " << ResolveSafeInCalibrationSamples(config_) << ",\n"
+            << "  \"safein_dk_search_scope\": \""
+            << (config_.safein_dk_search_scope == SafeInDkSearchScope::NProbe ? "nprobe" : "full_database")
+            << "\",\n"
+            << "  \"safein_dk_nprobe\": " << ResolveSafeInNProbe(config_) << ",\n"
+            << "  \"safein_dk_bits\": " << static_cast<uint32_t>(config_.rabitq.bits) << ",\n"
             << "  \"faiss_backend\": \"cpu\"\n"
             << "}\n";
         const std::string payload = oss.str();

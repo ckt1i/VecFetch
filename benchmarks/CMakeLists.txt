@@ -11,7 +11,7 @@ target_link_libraries(bench_ivf_quality PRIVATE vdb_index)
 vdb_enable_target_avx512(bench_ivf_quality)
 
 # ----- E2E Benchmark -----
-add_executable(bench_e2e bench_e2e.cpp)
+add_executable(bench_e2e bench_e2e.cpp rabitq_bench_calibration.cpp)
 target_link_libraries(bench_e2e PRIVATE vdb_query vdb_io vdb_crc)
 vdb_enable_target_avx512(bench_e2e)
 
@@ -70,8 +70,26 @@ add_executable(bench_rabitq_diagnostic bench_rabitq_diagnostic.cpp)
 target_link_libraries(bench_rabitq_diagnostic PRIVATE vdb_index vdb_io)
 vdb_enable_target_avx512(bench_rabitq_diagnostic)
 
+# ----- SafeIn Replay Benchmark -----
+add_executable(bench_safein_replay bench_safein_replay.cpp)
+vdb_enable_target_avx512(bench_safein_replay)
+
+# ----- d_k Distance Distribution Analysis Benchmark -----
+add_executable(bench_dk_distance_analysis bench_dk_distance_analysis.cpp)
+vdb_enable_target_avx512(bench_dk_distance_analysis)
+
+# ----- d_k Calibration Space Compare Benchmark -----
+add_executable(bench_dk_space_compare bench_dk_space_compare.cpp)
+target_link_libraries(bench_dk_space_compare PRIVATE vdb_index vdb_io)
+vdb_enable_target_avx512(bench_dk_space_compare)
+
+# ----- Phase A Grid Replay Benchmark -----
+add_executable(bench_phase_a_grid bench_phase_a_grid.cpp)
+target_link_libraries(bench_phase_a_grid PRIVATE vdb_index vdb_io)
+vdb_enable_target_avx512(bench_phase_a_grid)
+
 # ----- Vector Search Benchmark -----
-add_executable(bench_vector_search bench_vector_search.cpp)
+add_executable(bench_vector_search bench_vector_search.cpp rabitq_bench_calibration.cpp)
 target_link_libraries(bench_vector_search PRIVATE vdb_query vdb_crc vdb_index vdb_io)
 vdb_enable_target_avx512(bench_vector_search)
 if(VDB_USE_MKL)

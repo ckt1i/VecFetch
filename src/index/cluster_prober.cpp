@@ -58,18 +58,34 @@ ClusterProber::ClusterProber(const ConANN& conann, Dim dim, uint8_t bits)
 ClusterProber::~ClusterProber() = default;
 
 void ClusterProber::Probe(const query::ParsedCluster& pc,
+                           uint32_t cluster_id,
                            const rabitq::PreparedClusterQueryView& view,
-                           float margin_factor,
                            float dynamic_d_k,
                            bool enable_address_decode_simd,
                            bool enable_fine_grained_timing,
+                           bool enable_stage1_safein,
                            bool enable_stage2_collect_block_first,
                            bool enable_stage2_scatter_batch_classify,
+                           const std::vector<std::vector<uint32_t>>* false_stats_cluster_members,
+                           const std::unordered_set<uint32_t>* false_stats_true_topk_rows,
                            ProbeResultSink& sink,
                            ProbeStats& stats) const {
     const rabitq::PreparedQuery& pq = *view.prepared;
     const uint32_t packed_sz = storage::FastScanPackedSize(dim_);
-    const float safein_threshold_base = conann_.d_k();
+    const float safein_threshold_base = conann_.safein_d_k();
+    const bool collect_false_stats =
+        false_stats_cluster_members != nullptr &&
+        false_stats_true_topk_rows != nullptr &&
+        cluster_id < false_stats_cluster_members->size();
+    const auto* cluster_members = collect_false_stats
+        ? &(*false_stats_cluster_members)[cluster_id]
+        : nullptr;
+    auto is_true_topk = [&](uint32_t local_idx) -> bool {
+        if (cluster_members == nullptr || local_idx >= cluster_members->size()) {
+            return false;
+        }
+        return false_stats_true_topk_rows->count((*cluster_members)[local_idx]) != 0;
+    };
 
     for (uint32_t b = 0; b < pc.num_fastscan_blocks; ++b) {
         ++stats.num_stage1_blocks;
@@ -100,20 +116,33 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
         if (enable_fine_grained_timing) {
             auto mask_start = std::chrono::steady_clock::now();
             so_mask = simd::FastScanSafeOutMask(
-                dists, block_norms, count, dynamic_d_k, margin_factor);
+                dists, block_norms, count, dynamic_d_k, view.safeout_margin_factor);
             stats.stage1_mask_ms += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - mask_start).count();
         } else {
             so_mask = simd::FastScanSafeOutMask(
-                dists, block_norms, count, dynamic_d_k, margin_factor);
+                dists, block_norms, count, dynamic_d_k, view.safeout_margin_factor);
         }
         stats.s1_safeout += static_cast<uint32_t>(__builtin_popcount(so_mask));
+        if (collect_false_stats && so_mask != 0) {
+            uint32_t m = so_mask;
+            while (m) {
+                const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(m));
+                if (is_true_topk(base_idx + lane)) {
+                    ++stats.s1_false_safeout;
+                }
+                m &= (m - 1u);
+            }
+        }
 
         // Stage 1c/1d: compact survivors and classify them in mask batches.
         const uint32_t lane_valid = LaneMaskForCount(count);
         const uint32_t maybe_in = (~so_mask) & lane_valid;
-        const uint32_t safein_mask = simd::FastScanSafeInMask(
-            dists, block_norms, count, safein_threshold_base, margin_factor) & maybe_in;
+        const uint32_t safein_mask = enable_stage1_safein
+            ? (simd::FastScanSafeInMask(
+                   dists, block_norms, count, safein_threshold_base,
+                   view.safein_margin_factor) & maybe_in)
+            : 0u;
         const uint32_t uncertain_mask = maybe_in & ~safein_mask;
 
         uint32_t survivor_lanes[32];
@@ -143,12 +172,23 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
             stats.s1_safein += safein_count;
             stats.s1_uncertain += uncertain_count;
         }
+        if (collect_false_stats && safein_mask != 0) {
+            uint32_t m = safein_mask;
+            while (m) {
+                const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(m));
+                if (!is_true_topk(base_idx + lane)) {
+                    ++stats.s1_false_safein;
+                }
+                m &= (m - 1u);
+            }
+        }
 
         struct Stage2LaneEntry {
             bool present = false;
             uint32_t global_idx = 0;
             float est_dist_s1 = 0.0f;
             float margin_s1 = 0.0f;
+            float safeout_margin_s1 = 0.0f;
             float norm_oc = 0.0f;
             const uint8_t* code_abs = nullptr;
             const uint8_t* sign = nullptr;
@@ -179,7 +219,8 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
             const uint32_t j = survivor_lanes[s];
             const uint32_t global_idx = base_idx + j;
             const float est_dist_s1 = dists[j];
-            const float margin_s1 = margin_factor * block_norms[j];
+            const float safein_margin_s1 = view.safein_margin_factor * block_norms[j];
+            const float safeout_margin_s1 = view.safeout_margin_factor * block_norms[j];
             ResultClass rc_final = ((safein_mask >> j) & 1u) != 0
                 ? ResultClass::SafeIn
                 : ResultClass::Uncertain;
@@ -225,7 +266,8 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                 entry.present = true;
                 entry.global_idx = global_idx;
                 entry.est_dist_s1 = est_dist_s1;
-                entry.margin_s1 = margin_s1;
+                entry.margin_s1 = safein_margin_s1;
+                entry.safeout_margin_s1 = safeout_margin_s1;
                 entry.norm_oc = block_norms[j];
                 if (pc.exrabitq_storage_version >= 11) {
                     entry.xipnorm = 0.0f;
@@ -384,6 +426,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                 alignas(32) float lane_xipnorm[kStage2BatchSize] = {};
                 alignas(32) float lane_norm_oc[kStage2BatchSize] = {};
                 alignas(32) float lane_margin_s1[kStage2BatchSize] = {};
+                alignas(32) float lane_safeout_margin_s1[kStage2BatchSize] = {};
                 uint32_t chunk_idx = 0;
                 for (uint32_t lane = 0; lane < kStage2BatchSize; ++lane) {
                     if ((block.lane_mask & (1u << lane)) == 0) continue;
@@ -396,9 +439,12 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         : ip_raw_batch[chunk_idx++];
                     lane_norm_oc[lane] = entry.norm_oc;
                     lane_margin_s1[lane] = entry.margin_s1;
+                    lane_safeout_margin_s1[lane] = entry.safeout_margin_s1;
                 }
 
-                if (enable_stage2_scatter_batch_classify) {
+                const bool split_stage2_margin =
+                    std::abs(view.safein_margin_factor - view.safeout_margin_factor) > 1e-12f;
+                if (enable_stage2_scatter_batch_classify && !split_stage2_margin) {
                     const simd::Stage2ClassifyMasks classify_masks = simd::Stage2ClassifyBatch(
                         lane_ip_raw,
                         lane_xipnorm,
@@ -408,12 +454,30 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         pq.norm_qc,
                         pq.norm_qc_sq,
                         1.0f / margin_s2_divisor_,
-                        conann_.d_k(),
+                        conann_.safein_d_k(),
                         dynamic_d_k);
 
                     stats.s2_safein += static_cast<uint32_t>(__builtin_popcount(classify_masks.safein));
                     stats.s2_safeout += static_cast<uint32_t>(__builtin_popcount(classify_masks.safeout));
                     stats.s2_uncertain += static_cast<uint32_t>(__builtin_popcount(classify_masks.uncertain));
+                    if (collect_false_stats) {
+                        uint32_t m = classify_masks.safein;
+                        while (m) {
+                            const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(m));
+                            if (!is_true_topk(block.lanes[lane].global_idx)) {
+                                ++stats.s2_false_safein;
+                            }
+                            m &= (m - 1u);
+                        }
+                        m = classify_masks.safeout;
+                        while (m) {
+                            const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(m));
+                            if (is_true_topk(block.lanes[lane].global_idx)) {
+                                ++stats.s2_false_safeout;
+                            }
+                            m &= (m - 1u);
+                        }
+                    }
 
                     const uint32_t keep_mask = classify_masks.safein | classify_masks.uncertain;
                     for (uint32_t lane = 0; lane < kStage2BatchSize; ++lane) {
@@ -438,14 +502,23 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                                           - 2.0f * entry.norm_oc * pq.norm_qc * ip_est;
                         est_dist_s2 = std::max(est_dist_s2, 0.0f);
 
-                        const float margin_s2 = entry.margin_s1 / margin_s2_divisor_;
+                        const float safein_margin_s2 = entry.margin_s1 / margin_s2_divisor_;
+                        const float safeout_margin_s2 =
+                            entry.safeout_margin_s1 / margin_s2_divisor_;
                         const ResultClass rc_s2 =
-                            conann_.ClassifyAdaptive(est_dist_s2, margin_s2, dynamic_d_k);
+                            conann_.ClassifyAdaptive(est_dist_s2, safein_margin_s2,
+                                                     safeout_margin_s2, dynamic_d_k);
 
                         if (rc_s2 == ResultClass::SafeIn) {
                             ++stats.s2_safein;
+                            if (collect_false_stats && !is_true_topk(entry.global_idx)) {
+                                ++stats.s2_false_safein;
+                            }
                         } else if (rc_s2 == ResultClass::SafeOut) {
                             ++stats.s2_safeout;
+                            if (collect_false_stats && is_true_topk(entry.global_idx)) {
+                                ++stats.s2_false_safeout;
+                            }
                             continue;
                         } else {
                             ++stats.s2_uncertain;

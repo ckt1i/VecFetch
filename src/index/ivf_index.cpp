@@ -28,6 +28,19 @@ namespace index {
 
 namespace {
 
+SafeInDkSpace ParseSafeInDkSpace(uint8_t value) {
+    return value == 1 ? SafeInDkSpace::RabitqS2 : SafeInDkSpace::ExactL2;
+}
+
+SafeInDkSearchScope ParseSafeInDkSearchScope(uint8_t value) {
+    return value == 1 ? SafeInDkSearchScope::NProbe
+                      : SafeInDkSearchScope::FullDatabase;
+}
+
+}  // namespace
+
+namespace {
+
 CoarseBuilder ParseCoarseBuilder(std::string_view value) {
     if (value == "superkmeans") {
         return CoarseBuilder::SuperKMeans;
@@ -332,8 +345,19 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
     const auto* conann_params = seg_meta->conann_params();
     if (conann_params) {
         float eps = conann_params->epsilon();
-        float dk = conann_params->d_k();
-        conann_ = ConANN(eps, dk);
+        float legacy_dk = conann_params->d_k();
+        float safein_dk = conann_params->safein_d_k();
+        safein_dk_space_ = ParseSafeInDkSpace(conann_params->safein_dk_space());
+        safein_dk_search_scope_ =
+            ParseSafeInDkSearchScope(conann_params->safein_dk_search_scope());
+        safein_dk_percentile_ = conann_params->safein_dk_percentile();
+        safein_dk_calibration_samples_ =
+            conann_params->safein_dk_calibration_samples();
+        safein_dk_nprobe_ = conann_params->safein_dk_nprobe();
+        safein_dk_bits_ = conann_params->safein_dk_bits();
+        const bool has_safein_dk =
+            (safein_dk_space_ == SafeInDkSpace::RabitqS2) && (safein_dk > 0.0f);
+        conann_ = ConANN(eps, legacy_dk, safein_dk, has_safein_dk);
     }
 
     // --- Phase 2: Load rotated_centroids.bin from disk ---

@@ -1,17 +1,12 @@
-/// bench_rabitq_diagnostic.cpp — Diagnostic benchmark for RaBitQ distance
-/// estimation and ConANN classification.
-///
-/// Phase 1: Compare RaBitQ estimated distances vs exact L2, track kth-distance
-///          convergence curves and top-K overlap as clusters are probed.
-/// Phase 2: Evaluate ConANN Classify/ClassifyAdaptive accuracy under RaBitQ
-///          estimates, including confusion matrices and false SafeOut rates.
-///
-/// Outputs CSV files for Python visualization.
+/// bench_rabitq_diagnostic.cpp — Offline diagnostic benchmark for RaBitQ S1/S2
+/// distance estimation and ConANN classification on real serving-style probe
+/// candidates.
 ///
 /// Usage:
-///   bench_rabitq_diagnostic [--dataset path] [--nlist 32] [--queries 100]
-///       [--topk 10] [--outdir ./diag_output] [--phase 0]
-///       [--scatter-queries 10]
+///   bench_rabitq_diagnostic --dataset <dir> --index-dir <dir>
+///       [--base path] [--query path] [--centroids path] [--assignments path]
+///       [--gt-file path] [--queries 200] [--topk 10] [--nprobe 64]
+///       [--bits 4] [--outdir ./diag_output]
 
 #include <algorithm>
 #include <chrono>
@@ -20,33 +15,90 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <memory>
 #include <numeric>
-#include <random>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-#include "superkmeans/superkmeans.h"
-
 #include "vdb/common/types.h"
-#include "vdb/index/conann.h"
+#include "vdb/index/ivf_index.h"
 #include "vdb/io/npy_reader.h"
 #include "vdb/io/vecs_reader.h"
 #include "vdb/rabitq/rabitq_encoder.h"
 #include "vdb/rabitq/rabitq_estimator.h"
-#include "vdb/rabitq/rabitq_rotation.h"
 #include "vdb/simd/distance_l2.h"
-#include "vdb/simd/popcount.h"
 
 using namespace vdb;
-using namespace vdb::rabitq;
 using namespace vdb::index;
+using namespace vdb::rabitq;
 
-// ============================================================================
-// Helpers
-// ============================================================================
+namespace fs = std::filesystem;
+
+namespace {
+
+struct QueryTruth {
+    std::unordered_set<uint32_t> row_ids;
+    std::unordered_set<int64_t> external_ids;
+};
+
+struct CandidateMetrics {
+    uint32_t query_id = 0;
+    uint32_t cluster_rank = 0;
+    uint32_t cluster_id = 0;
+    uint32_t vector_row = 0;
+    int64_t vector_external_id = -1;
+    bool is_true_topk = false;
+    float exact_dist = 0.0f;
+    float est_dist_s1 = 0.0f;
+    bool stage2_evaluated = false;
+    float est_dist_s2 = 0.0f;
+    float norm_qc = 0.0f;
+    float norm_oc = 0.0f;
+    float margin_s1 = 0.0f;
+    float margin_s2 = 0.0f;
+    float d_k_static = 0.0f;
+    float dynamic_d_k_before_cluster = 0.0f;
+    float abs_err_s1 = 0.0f;
+    float abs_err_s2 = 0.0f;
+    float normalized_err_s1 = 0.0f;
+    float normalized_err_s2 = 0.0f;
+    float safein_gap_s1 = 0.0f;
+    float safein_gap_s2 = 0.0f;
+    float safeout_gap_s1 = 0.0f;
+    float safeout_gap_s2 = 0.0f;
+    float safein_ratio_s1 = 0.0f;
+    float safein_ratio_s2 = 0.0f;
+    ResultClass s1_class = ResultClass::Uncertain;
+    ResultClass s2_class = ResultClass::Uncertain;
+    ResultClass final_class = ResultClass::Uncertain;
+};
+
+struct SummaryStats {
+    uint64_t candidates = 0;
+    uint64_t stage2_candidates = 0;
+    uint64_t true_topk_candidates = 0;
+    uint64_t final_false_safeout = 0;
+    uint64_t s1_safein = 0;
+    uint64_t s1_safeout = 0;
+    uint64_t s1_uncertain = 0;
+    uint64_t s2_safein = 0;
+    uint64_t s2_safeout = 0;
+    uint64_t s2_uncertain = 0;
+    uint64_t final_safein = 0;
+    uint64_t final_safeout = 0;
+    uint64_t final_uncertain = 0;
+    std::vector<float> abs_err_s1;
+    std::vector<float> abs_err_s2;
+    std::vector<float> normalized_err_s1;
+    std::vector<float> normalized_err_s2;
+};
 
 static std::string GetArg(int argc, char* argv[], const char* name,
                           const std::string& def) {
@@ -57,8 +109,15 @@ static std::string GetArg(int argc, char* argv[], const char* name,
 }
 
 static int GetIntArg(int argc, char* argv[], const char* name, int def) {
-    auto s = GetArg(argc, argv, name, "");
+    const auto s = GetArg(argc, argv, name, "");
     return s.empty() ? def : std::atoi(s.c_str());
+}
+
+static bool HasFlag(int argc, char* argv[], const char* name) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], name) == 0) return true;
+    }
+    return false;
 }
 
 static void Log(const char* fmt, ...) {
@@ -69,549 +128,615 @@ static void Log(const char* fmt, ...) {
     std::fflush(stdout);
 }
 
-static void RunSuperKMeans(const float* data, uint32_t N, Dim dim, uint32_t K,
-                           std::vector<float>& centroids,
-                           std::vector<uint32_t>& assignments) {
-    skmeans::SuperKMeansConfig cfg;
-    cfg.iters = 10;
-    cfg.seed = 42;
-    cfg.verbose = false;
-    auto skm = skmeans::SuperKMeans(K, dim, cfg);
-    auto c = skm.Train(data, N);
-    auto a = skm.Assign(data, c.data(), N, K);
-    centroids.assign(c.begin(), c.end());
-    assignments.assign(a.begin(), a.end());
-}
-
 static const char* ClassToStr(ResultClass rc) {
     switch (rc) {
-        case ResultClass::SafeIn:    return "SafeIn";
-        case ResultClass::SafeOut:   return "SafeOut";
+        case ResultClass::SafeIn: return "SafeIn";
+        case ResultClass::SafeOut: return "SafeOut";
         case ResultClass::Uncertain: return "Uncertain";
     }
-    return "?";
+    return "Unknown";
 }
 
-static int ClassToIdx(ResultClass rc) {
-    switch (rc) {
-        case ResultClass::SafeIn:    return 0;
-        case ResultClass::SafeOut:   return 1;
-        case ResultClass::Uncertain: return 2;
+static std::string JsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            default: out += c; break;
+        }
     }
-    return 2;
+    return out;
 }
 
-// ============================================================================
-// Main
-// ============================================================================
+static float Percentile(std::vector<float> values, float p) {
+    if (values.empty()) return 0.0f;
+    std::sort(values.begin(), values.end());
+    const float idx = p * static_cast<float>(values.size() - 1);
+    const size_t lo = static_cast<size_t>(std::floor(idx));
+    const size_t hi = static_cast<size_t>(std::ceil(idx));
+    if (lo == hi) return values[lo];
+    const float frac = idx - static_cast<float>(lo);
+    return values[lo] * (1.0f - frac) + values[hi] * frac;
+}
+
+static std::string DefaultBasePath(const std::string& dataset_dir) {
+    if (fs::exists(dataset_dir + "/image_embeddings.npy")) {
+        return dataset_dir + "/image_embeddings.npy";
+    }
+    return dataset_dir + "/image_embeddings.fvecs";
+}
+
+static std::string DefaultQueryPath(const std::string& dataset_dir) {
+    if (fs::exists(dataset_dir + "/query_embeddings.npy")) {
+        return dataset_dir + "/query_embeddings.npy";
+    }
+    return dataset_dir + "/query_embeddings.fvecs";
+}
+
+static StatusOr<std::vector<uint32_t>> LoadAssignments(const std::string& path,
+                                                       uint32_t expected_rows) {
+    auto a_or = io::LoadIvecs(path);
+    if (!a_or.ok()) return a_or.status();
+    const auto& a = a_or.value();
+    if (a.rows != expected_rows) {
+        return Status::InvalidArgument(
+            "Assignment rows mismatch: expected " + std::to_string(expected_rows) +
+            ", got " + std::to_string(a.rows));
+    }
+    std::vector<uint32_t> out(expected_rows);
+    for (uint32_t i = 0; i < expected_rows; ++i) {
+        out[i] = static_cast<uint32_t>(a.data[static_cast<size_t>(i) * a.cols]);
+    }
+    return out;
+}
+
+static StatusOr<std::vector<std::vector<int64_t>>> LoadExternalGroundTruth(
+    const std::string& gt_file, uint32_t q_count, uint32_t gt_k) {
+    std::vector<std::vector<int64_t>> gt_topk;
+    if (gt_file.size() >= 6 && gt_file.substr(gt_file.size() - 6) == ".ivecs") {
+        auto gt_or = io::LoadIvecs(gt_file);
+        if (!gt_or.ok()) return gt_or.status();
+        const auto& gt = gt_or.value();
+        if (gt.rows < q_count || gt.cols < gt_k) {
+            return Status::InvalidArgument("External GT shape is smaller than requested.");
+        }
+        gt_topk.resize(q_count);
+        for (uint32_t qi = 0; qi < q_count; ++qi) {
+            gt_topk[qi].resize(gt_k);
+            const int32_t* row = gt.data.data() + static_cast<size_t>(qi) * gt.cols;
+            for (uint32_t k = 0; k < gt_k; ++k) gt_topk[qi][k] = static_cast<int64_t>(row[k]);
+        }
+        return gt_topk;
+    }
+    auto gt_or = io::LoadNpyInt64Matrix(gt_file);
+    if (!gt_or.ok()) return gt_or.status();
+    const auto& gt = gt_or.value();
+    if (gt.rows < q_count || gt.cols < gt_k) {
+        return Status::InvalidArgument("External GT shape is smaller than requested.");
+    }
+    gt_topk.resize(q_count);
+    for (uint32_t qi = 0; qi < q_count; ++qi) {
+        gt_topk[qi].resize(gt_k);
+        const int64_t* row = gt.data.data() + static_cast<size_t>(qi) * gt.cols;
+        for (uint32_t k = 0; k < gt_k; ++k) gt_topk[qi][k] = row[k];
+    }
+    return gt_topk;
+}
+
+static bool InferClusteringPaths(const std::string& dataset_dir,
+                                 const std::string& index_dir,
+                                 uint32_t nlist,
+                                 std::string* centroids_path,
+                                 std::string* assignments_path) {
+    if (centroids_path == nullptr || assignments_path == nullptr) return false;
+    if (!centroids_path->empty() && !assignments_path->empty()) return true;
+
+    const std::vector<std::pair<std::string, std::string>> candidates = {
+        {dataset_dir + "/coco_centroid_" + std::to_string(nlist) + ".fvecs",
+         dataset_dir + "/coco_cluster_id_" + std::to_string(nlist) + ".ivecs"},
+        {"/home/zcq/VDB/data/formal_baselines/msmarco_passage/embeddings/msmarco_passage_centroid_" +
+             std::to_string(nlist) + ".fvecs",
+         "/home/zcq/VDB/data/formal_baselines/msmarco_passage/embeddings/msmarco_passage_cluster_id_" +
+             std::to_string(nlist) + ".ivecs"},
+        {"/home/zcq/VDB/data/formal_baselines/msmarco_passage/embeddings/msmarco_passage_centroid_" +
+             std::to_string(nlist) + "_pad1024.fvecs",
+         "/home/zcq/VDB/data/formal_baselines/msmarco_passage/embeddings/msmarco_passage_cluster_id_" +
+             std::to_string(nlist) + ".ivecs"},
+    };
+
+    for (const auto& [c_path, a_path] : candidates) {
+        if (fs::exists(c_path) && fs::exists(a_path)) {
+            if (centroids_path->empty()) *centroids_path = c_path;
+            if (assignments_path->empty()) *assignments_path = a_path;
+            return true;
+        }
+    }
+
+    if (!index_dir.empty()) {
+        const std::string exported_centroids = index_dir + "/centroids.fvecs";
+        const std::string exported_assignments = index_dir + "/assignments.ivecs";
+        if (fs::exists(exported_centroids) && fs::exists(exported_assignments)) {
+            if (centroids_path->empty()) *centroids_path = exported_centroids;
+            if (assignments_path->empty()) *assignments_path = exported_assignments;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static QueryTruth BuildTruthFromRows(const std::vector<uint32_t>& rows,
+                                     const std::vector<int64_t>* image_ids) {
+    QueryTruth truth;
+    truth.row_ids.insert(rows.begin(), rows.end());
+    if (image_ids != nullptr && !image_ids->empty()) {
+        for (uint32_t row : rows) {
+            if (row < image_ids->size()) truth.external_ids.insert((*image_ids)[row]);
+        }
+    }
+    return truth;
+}
+
+static QueryTruth BuildTruthFromExternal(const std::vector<int64_t>& external_ids,
+                                         const std::unordered_map<int64_t, uint32_t>* id_to_row) {
+    QueryTruth truth;
+    truth.external_ids.insert(external_ids.begin(), external_ids.end());
+    if (id_to_row != nullptr) {
+        for (int64_t id : external_ids) {
+            auto it = id_to_row->find(id);
+            if (it != id_to_row->end()) truth.row_ids.insert(it->second);
+        }
+    }
+    return truth;
+}
+
+static std::vector<uint32_t> ComputeExactTopKRows(const float* q_vec,
+                                                  const io::NpyArrayFloat& base,
+                                                  uint32_t top_k) {
+    const uint32_t N = base.rows;
+    const Dim dim = static_cast<Dim>(base.cols);
+    std::vector<std::pair<float, uint32_t>> dists(N);
+    for (uint32_t i = 0; i < N; ++i) {
+        dists[i] = {simd::L2Sqr(q_vec, base.data.data() + static_cast<size_t>(i) * dim, dim), i};
+    }
+    const uint32_t k = std::min(top_k, N);
+    std::partial_sort(dists.begin(), dists.begin() + k, dists.end());
+    std::vector<uint32_t> rows(k);
+    for (uint32_t i = 0; i < k; ++i) rows[i] = dists[i].second;
+    return rows;
+}
+
+static void WritePerCandidateRow(std::ofstream& csv, const CandidateMetrics& m) {
+    csv << m.query_id << ','
+        << m.cluster_rank << ','
+        << m.cluster_id << ','
+        << m.vector_row << ','
+        << m.vector_external_id << ','
+        << (m.is_true_topk ? 1 : 0) << ','
+        << m.exact_dist << ','
+        << m.est_dist_s1 << ',';
+    if (m.stage2_evaluated) {
+        csv << m.est_dist_s2;
+    }
+    csv << ','
+        << m.norm_qc << ','
+        << m.norm_oc << ','
+        << m.margin_s1 << ',';
+    if (m.stage2_evaluated) {
+        csv << m.margin_s2;
+    }
+    csv << ','
+        << m.d_k_static << ','
+        << m.dynamic_d_k_before_cluster << ','
+        << m.abs_err_s1 << ',';
+    if (m.stage2_evaluated) csv << m.abs_err_s2;
+    csv << ','
+        << m.normalized_err_s1 << ',';
+    if (m.stage2_evaluated) csv << m.normalized_err_s2;
+    csv << ','
+        << m.safein_gap_s1 << ',';
+    if (m.stage2_evaluated) csv << m.safein_gap_s2;
+    csv << ','
+        << m.safeout_gap_s1 << ',';
+    if (m.stage2_evaluated) csv << m.safeout_gap_s2;
+    csv << ','
+        << m.safein_ratio_s1 << ',';
+    if (m.stage2_evaluated) csv << m.safein_ratio_s2;
+    csv << ','
+        << ClassToStr(m.s1_class) << ','
+        << (m.stage2_evaluated ? ClassToStr(m.s2_class) : "") << ','
+        << ClassToStr(m.final_class) << '\n';
+}
+
+static void WriteSummaryJson(const std::string& path,
+                             const std::string& dataset_name,
+                             const std::string& index_dir,
+                             uint32_t queries,
+                             uint32_t top_k,
+                             uint32_t nprobe,
+                             uint8_t bits,
+                             float legacy_d_k,
+                             float safein_d_k,
+                             const std::string& safein_dk_space,
+                             const std::string& safeout_threshold_mode,
+                             const SummaryStats& stats) {
+    std::ofstream f(path);
+    f << "{\n";
+    f << "  \"dataset\": \"" << JsonEscape(dataset_name) << "\",\n";
+    f << "  \"index_dir\": \"" << JsonEscape(index_dir) << "\",\n";
+    f << "  \"queries\": " << queries << ",\n";
+    f << "  \"topk\": " << top_k << ",\n";
+    f << "  \"nprobe\": " << nprobe << ",\n";
+    f << "  \"bits\": " << static_cast<int>(bits) << ",\n";
+    f << "  \"legacy_d_k\": " << legacy_d_k << ",\n";
+    f << "  \"safein_d_k\": " << safein_d_k << ",\n";
+    f << "  \"safein_dk_space\": \"" << safein_dk_space << "\",\n";
+    f << "  \"safeout_threshold_mode\": \"" << safeout_threshold_mode << "\",\n";
+    f << "  \"candidates\": " << stats.candidates << ",\n";
+    f << "  \"stage2_candidates\": " << stats.stage2_candidates << ",\n";
+    f << "  \"true_topk_candidates\": " << stats.true_topk_candidates << ",\n";
+    f << "  \"final_false_safeout\": " << stats.final_false_safeout << ",\n";
+    const auto pct = [](uint64_t v, uint64_t denom) -> double {
+        return denom == 0 ? 0.0 : 100.0 * static_cast<double>(v) / static_cast<double>(denom);
+    };
+    f << std::fixed << std::setprecision(6);
+    f << "  \"ratios\": {\n";
+    f << "    \"stage2_candidate_pct\": " << pct(stats.stage2_candidates, stats.candidates) << ",\n";
+    f << "    \"s1_safein_pct\": " << pct(stats.s1_safein, stats.candidates) << ",\n";
+    f << "    \"s1_safeout_pct\": " << pct(stats.s1_safeout, stats.candidates) << ",\n";
+    f << "    \"s1_uncertain_pct\": " << pct(stats.s1_uncertain, stats.candidates) << ",\n";
+    f << "    \"s2_safein_from_uncertain_pct\": " << pct(stats.s2_safein, stats.stage2_candidates) << ",\n";
+    f << "    \"s2_safeout_from_uncertain_pct\": " << pct(stats.s2_safeout, stats.stage2_candidates) << ",\n";
+    f << "    \"s2_uncertain_from_uncertain_pct\": " << pct(stats.s2_uncertain, stats.stage2_candidates) << ",\n";
+    f << "    \"final_safein_pct\": " << pct(stats.final_safein, stats.candidates) << ",\n";
+    f << "    \"final_safeout_pct\": " << pct(stats.final_safeout, stats.candidates) << ",\n";
+    f << "    \"final_uncertain_pct\": " << pct(stats.final_uncertain, stats.candidates) << "\n";
+    f << "  },\n";
+    auto write_percentiles = [&](const char* key, const std::vector<float>& vals) {
+        f << "  \"" << key << "\": {\n";
+        f << "    \"p50\": " << Percentile(vals, 0.50f) << ",\n";
+        f << "    \"p90\": " << Percentile(vals, 0.90f) << ",\n";
+        f << "    \"p95\": " << Percentile(vals, 0.95f) << ",\n";
+        f << "    \"p99\": " << Percentile(vals, 0.99f) << ",\n";
+        f << "    \"p999\": " << Percentile(vals, 0.999f) << "\n";
+        f << "  }";
+    };
+    write_percentiles("abs_err_s1", stats.abs_err_s1);
+    f << ",\n";
+    write_percentiles("abs_err_s2", stats.abs_err_s2);
+    f << ",\n";
+    write_percentiles("normalized_err_s1", stats.normalized_err_s1);
+    f << ",\n";
+    write_percentiles("normalized_err_s2", stats.normalized_err_s2);
+    f << "\n}\n";
+}
+
+}  // namespace
 
 int main(int argc, char* argv[]) {
-    std::string data_dir = GetArg(argc, argv, "--dataset",
-                                  "/home/zcq/VDB/data/coco_1k");
+    const std::string dataset_dir = GetArg(argc, argv, "--dataset", "");
+    const std::string index_dir = GetArg(argc, argv, "--index-dir", "");
     std::string base_path = GetArg(argc, argv, "--base", "");
     std::string query_path = GetArg(argc, argv, "--query", "");
-    uint32_t nlist = static_cast<uint32_t>(GetIntArg(argc, argv, "--nlist", 32));
-    int q_limit = GetIntArg(argc, argv, "--queries", 100);
-    uint32_t top_k = static_cast<uint32_t>(GetIntArg(argc, argv, "--topk", 10));
-    int phase = GetIntArg(argc, argv, "--phase", 0);
-    std::string outdir = GetArg(argc, argv, "--outdir", "./diag_output");
-    uint32_t scatter_queries = static_cast<uint32_t>(
-        GetIntArg(argc, argv, "--scatter-queries", 10));
-    uint32_t p_for_dk = static_cast<uint32_t>(
-        GetIntArg(argc, argv, "--p-for-dk", 90));
-    uint32_t p_for_eps = static_cast<uint32_t>(
-        GetIntArg(argc, argv, "--p-for-eps", 95));
-    uint32_t samples_for_eps = static_cast<uint32_t>(
-        GetIntArg(argc, argv, "--samples-for-eps", 100));
+    std::string centroids_path = GetArg(argc, argv, "--centroids", "");
+    std::string assignments_path = GetArg(argc, argv, "--assignments", "");
+    const std::string gt_file = GetArg(argc, argv, "--gt-file", "");
+    const std::string outdir = GetArg(argc, argv, "--outdir", "./diag_output");
+    const uint32_t top_k = static_cast<uint32_t>(GetIntArg(argc, argv, "--topk", 10));
+    const uint32_t nprobe = static_cast<uint32_t>(GetIntArg(argc, argv, "--nprobe", 64));
+    const uint32_t q_limit = static_cast<uint32_t>(GetIntArg(argc, argv, "--queries", 200));
+    uint8_t bits = static_cast<uint8_t>(GetIntArg(argc, argv, "--bits", 0));
+    const bool use_bruteforce_gt = gt_file.empty() && !HasFlag(argc, argv, "--no-bruteforce-gt");
 
-    // Fallback: --base/--query not specified → derive from --dataset
-    if (base_path.empty())  base_path  = data_dir + "/image_embeddings.npy";
-    if (query_path.empty()) query_path = data_dir + "/query_embeddings.npy";
-
-    bool run_phase1 = (phase == 0 || phase == 1);
-    bool run_phase2 = (phase == 0 || phase == 2);
-
-    Log("=== RaBitQ Diagnostic Benchmark ===\n");
-    Log("Base:     %s\n", base_path.c_str());
-    Log("Query:    %s\n", query_path.c_str());
-    Log("Outdir:   %s\n", outdir.c_str());
-    Log("Phase:    %d (%s%s%s)\n", phase,
-        run_phase1 ? "dist" : "", (run_phase1 && run_phase2) ? "+" : "",
-        run_phase2 ? "classify" : "");
-
-    // Create output directory
-    std::string mkdir_cmd = "mkdir -p " + outdir;
-    int rc = std::system(mkdir_cmd.c_str());
-    if (rc != 0) {
-        std::fprintf(stderr, "Failed to create output directory: %s\n", outdir.c_str());
+    if (dataset_dir.empty() || index_dir.empty()) {
+        std::fprintf(stderr,
+                     "Usage: bench_rabitq_diagnostic --dataset <dir> --index-dir <dir> "
+                     "[--base path] [--query path] [--centroids path] [--assignments path] "
+                     "[--gt-file path] [--queries 200] [--topk 10] [--nprobe 64] [--bits 4] "
+                     "[--outdir ./diag_output]\n");
         return 1;
     }
 
-    // ================================================================
-    // Phase 0: Load data + KMeans + RaBitQ encode + calibrate
-    // ================================================================
-    Log("\n[Phase 0] Loading data...\n");
+    fs::create_directories(outdir);
+    if (base_path.empty()) base_path = DefaultBasePath(dataset_dir);
+    if (query_path.empty()) query_path = DefaultQueryPath(dataset_dir);
 
-    auto img_or = io::LoadVectors(base_path);
-    if (!img_or.ok()) {
-        std::fprintf(stderr, "Failed to load base: %s\n", img_or.status().ToString().c_str());
+    Log("=== RaBitQ Offline Diagnostic ===\n");
+    Log("Dataset:   %s\n", dataset_dir.c_str());
+    Log("Index:     %s\n", index_dir.c_str());
+    Log("Base:      %s\n", base_path.c_str());
+    Log("Query:     %s\n", query_path.c_str());
+    Log("Outdir:    %s\n", outdir.c_str());
+
+    IvfIndex index;
+    Status s = index.Open(index_dir, false);
+    if (!s.ok()) {
+        std::fprintf(stderr, "Failed to open index: %s\n", s.ToString().c_str());
         return 1;
     }
-    auto& img = img_or.value();
-    uint32_t N = img.rows;
-    Dim dim = static_cast<Dim>(img.cols);
-
-    auto qry_or = io::LoadVectors(query_path);
-    if (!qry_or.ok()) {
-        std::fprintf(stderr, "Failed to load query: %s\n", qry_or.status().ToString().c_str());
+    if (bits == 0) bits = index.segment().rabitq_config().bits;
+    if (!InferClusteringPaths(dataset_dir, index_dir, index.nlist(),
+                              &centroids_path, &assignments_path)) {
+        std::fprintf(stderr,
+                     "Failed to infer centroids/assignments. Provide --centroids and --assignments.\n");
         return 1;
     }
-    auto& qry = qry_or.value();
-    uint32_t Q = (q_limit > 0) ? std::min(static_cast<uint32_t>(q_limit), qry.rows)
-                                : qry.rows;
 
-    Log("  N=%u, Q=%u, dim=%u, nlist=%u, top_k=%u\n", N, Q, dim, nlist, top_k);
-
-    // KMeans
-    Log("[Phase 0] K-Means (K=%u) + RaBitQ encoding...\n", nlist);
-    std::vector<float> centroids;
-    std::vector<uint32_t> assignments;
-    RunSuperKMeans(img.data.data(), N, dim, nlist, centroids, assignments);
-
-    RotationMatrix rotation(dim);
-    rotation.GenerateRandom(42);
-    RaBitQEncoder encoder(dim, rotation);
-    RaBitQEstimator estimator(dim);
-
-    std::vector<RaBitQCode> codes(N);
-    for (uint32_t i = 0; i < N; ++i) {
-        uint32_t k = assignments[i];
-        const float* centroid = centroids.data() + static_cast<size_t>(k) * dim;
-        codes[i] = encoder.Encode(
-            img.data.data() + static_cast<size_t>(i) * dim, centroid);
+    auto base_or = io::LoadVectors(base_path);
+    if (!base_or.ok()) {
+        std::fprintf(stderr, "Failed to load base: %s\n",
+                     base_or.status().ToString().c_str());
+        return 1;
     }
-    Log("  Encoded %u vectors.\n", N);
-
-    // Cluster members
-    std::vector<std::vector<uint32_t>> cluster_members(nlist);
-    for (uint32_t i = 0; i < N; ++i) {
-        cluster_members[assignments[i]].push_back(i);
+    auto query_or = io::LoadVectors(query_path);
+    if (!query_or.ok()) {
+        std::fprintf(stderr, "Failed to load query: %s\n",
+                     query_or.status().ToString().c_str());
+        return 1;
+    }
+    auto centroids_or = io::LoadVectors(centroids_path);
+    if (!centroids_or.ok()) {
+        std::fprintf(stderr, "Failed to load centroids: %s\n",
+                     centroids_or.status().ToString().c_str());
+        return 1;
+    }
+    auto assignments_or = LoadAssignments(assignments_path, base_or.value().rows);
+    if (!assignments_or.ok()) {
+        std::fprintf(stderr, "Failed to load assignments: %s\n",
+                     assignments_or.status().ToString().c_str());
+        return 1;
     }
 
-    // Per-cluster r_max
-    std::vector<float> per_cluster_r_max(nlist, 0.0f);
-    for (uint32_t k = 0; k < nlist; ++k) {
-        for (uint32_t idx : cluster_members[k]) {
-            per_cluster_r_max[k] = std::max(per_cluster_r_max[k], codes[idx].norm);
+    const auto& base = base_or.value();
+    const auto& qry = query_or.value();
+    const auto& cents = centroids_or.value();
+    const auto& assignments = assignments_or.value();
+    const uint32_t Q = std::min(q_limit, qry.rows);
+    const uint32_t N = base.rows;
+    const Dim dim = static_cast<Dim>(base.cols);
+    if (qry.cols != base.cols || cents.cols != base.cols || cents.rows != index.nlist()) {
+        std::fprintf(stderr, "Dimension or centroid-count mismatch with index.\n");
+        return 1;
+    }
+
+    std::vector<int64_t> image_ids;
+    std::unordered_map<int64_t, uint32_t> image_id_to_row;
+    if (fs::exists(dataset_dir + "/image_ids.npy")) {
+        auto ids_or = io::LoadNpyInt64(dataset_dir + "/image_ids.npy");
+        if (!ids_or.ok()) {
+            std::fprintf(stderr, "Failed to load image_ids.npy: %s\n",
+                         ids_or.status().ToString().c_str());
+            return 1;
         }
+        image_ids = ids_or.value().data;
+        image_id_to_row.reserve(image_ids.size() * 2);
+        for (uint32_t i = 0; i < image_ids.size(); ++i) image_id_to_row[image_ids[i]] = i;
     }
 
-    // Global ε_ip calibration
-    const float inv_sqrt_dim = 1.0f / std::sqrt(static_cast<float>(dim));
-    const uint32_t num_words = (dim + 63) / 64;
-
-    std::vector<float> ip_errors;
-    for (uint32_t k = 0; k < nlist; ++k) {
-        const auto& members = cluster_members[k];
-        if (members.size() < 2) continue;
-        uint32_t n_queries = std::min(samples_for_eps,
-                                       static_cast<uint32_t>(members.size()));
-        const float* centroid = centroids.data() + static_cast<size_t>(k) * dim;
-        std::vector<uint32_t> indices(members.size());
-        std::iota(indices.begin(), indices.end(), 0u);
-        std::mt19937 rng(42 + k);
-        std::shuffle(indices.begin(), indices.end(), rng);
-
-        for (uint32_t q = 0; q < n_queries; ++q) {
-            uint32_t q_global = members[indices[q]];
-            const float* q_vec = img.data.data() +
-                static_cast<size_t>(q_global) * dim;
-            auto pq = estimator.PrepareQuery(q_vec, centroid, rotation);
-            for (uint32_t t = 0; t < static_cast<uint32_t>(members.size()); ++t) {
-                if (t == indices[q]) continue;
-                uint32_t t_global = members[t];
-                const auto& code = codes[t_global];
-                uint32_t hamming = simd::PopcountXor(
-                    pq.sign_code.data(), code.code.data(), num_words);
-                float ip_hat = 1.0f - 2.0f * static_cast<float>(hamming) /
-                                              static_cast<float>(dim);
-                float dot = 0.0f;
-                for (size_t d = 0; d < dim; ++d) {
-                    int bit = (code.code[d / 64] >> (d % 64)) & 1;
-                    dot += pq.rotated[d] * (2.0f * bit - 1.0f);
-                }
-                float ip_accurate = dot * inv_sqrt_dim;
-                ip_errors.push_back(std::abs(ip_hat - ip_accurate));
-            }
+    std::vector<QueryTruth> truth_sets(Q);
+    if (!gt_file.empty()) {
+        auto gt_or = LoadExternalGroundTruth(gt_file, Q, top_k);
+        if (!gt_or.ok()) {
+            std::fprintf(stderr, "Failed to load external GT: %s\n",
+                         gt_or.status().ToString().c_str());
+            return 1;
         }
+        for (uint32_t qi = 0; qi < Q; ++qi) {
+            truth_sets[qi] = BuildTruthFromExternal(gt_or.value()[qi], &image_id_to_row);
+        }
+        Log("GT mode: external (%s)\n", gt_file.c_str());
+    } else if (use_bruteforce_gt) {
+        Log("GT mode: brute-force exact top-%u over %u base vectors\n", top_k, N);
+        for (uint32_t qi = 0; qi < Q; ++qi) {
+            const float* q_vec = qry.data.data() + static_cast<size_t>(qi) * dim;
+            truth_sets[qi] = BuildTruthFromRows(ComputeExactTopKRows(q_vec, base, top_k), &image_ids);
+        }
+    } else {
+        std::fprintf(stderr, "No GT mode available.\n");
+        return 1;
     }
-    float eps_ip = 0.0f;
-    if (!ip_errors.empty()) {
-        std::sort(ip_errors.begin(), ip_errors.end());
-        float p = static_cast<float>(p_for_eps) / 100.0f;
-        auto idx = static_cast<size_t>(
-            p * static_cast<float>(ip_errors.size() - 1));
-        eps_ip = ip_errors[idx];
+
+    std::vector<std::vector<uint32_t>> cluster_members(index.nlist());
+    cluster_members.reserve(index.nlist());
+    for (uint32_t row = 0; row < assignments.size(); ++row) {
+        const uint32_t cid = assignments[row];
+        if (cid >= index.nlist()) {
+            std::fprintf(stderr, "Assignment cluster id out of range: %u\n", cid);
+            return 1;
+        }
+        cluster_members[cid].push_back(row);
     }
-    Log("  ε_ip = %.6f (P%u)\n", eps_ip, p_for_eps);
 
-    // d_k calibration
-    float p_dk_f = static_cast<float>(p_for_dk) / 100.0f;
-    float d_k = ConANN::CalibrateDistanceThreshold(
-        qry.data.data(), Q, img.data.data(), N,
-        dim, 100, top_k, p_dk_f, 42);
-    Log("  d_k = %.4f (P%u)\n", d_k, p_for_dk);
+    const auto& rotation = index.rotation();
+    RaBitQEncoder encoder(dim, rotation, bits);
+    RaBitQEstimator estimator(dim, bits);
+    std::vector<std::unique_ptr<std::vector<RaBitQCode>>> cluster_code_cache(index.nlist());
+    std::vector<float> per_cluster_r_max(index.nlist(), -1.0f);
+    auto ensure_cluster_codes = [&](uint32_t cid) -> const std::vector<RaBitQCode>& {
+        if (cluster_code_cache[cid]) return *cluster_code_cache[cid];
+        auto codes_ptr = std::make_unique<std::vector<RaBitQCode>>();
+        const auto& members = cluster_members[cid];
+        codes_ptr->reserve(members.size());
+        float r_max = 0.0f;
+        const float* centroid = cents.data.data() + static_cast<size_t>(cid) * dim;
+        for (uint32_t row : members) {
+            RaBitQCode code = encoder.Encode(
+                base.data.data() + static_cast<size_t>(row) * dim, centroid);
+            r_max = std::max(r_max, code.norm);
+            codes_ptr->push_back(std::move(code));
+        }
+        per_cluster_r_max[cid] = r_max;
+        cluster_code_cache[cid] = std::move(codes_ptr);
+        return *cluster_code_cache[cid];
+    };
 
-    // Brute-force exact GT
-    Log("[Phase 0] Computing exact ground truth...\n");
-    std::vector<std::unordered_set<uint32_t>> gt_sets(Q);
+    std::ofstream per_candidate(outdir + "/per_candidate.csv");
+    per_candidate
+        << "query_id,cluster_rank,cluster_id,vector_row,vector_external_id,is_true_topk,"
+        << "exact_dist,est_dist_s1,est_dist_s2,norm_qc,norm_oc,margin_s1,margin_s2_current,"
+        << "d_k_static,dynamic_d_k_before_cluster,abs_err_s1,abs_err_s2,normalized_err_s1,normalized_err_s2,"
+        << "safein_gap_s1,safein_gap_s2,safeout_gap_s1,safeout_gap_s2,safein_ratio_s1,safein_ratio_s2,"
+        << "s1_class,s2_class,final_class\n";
+
+    std::ofstream classification(outdir + "/classification.csv");
+    classification
+        << "query_id,vector_row,cluster_id,cluster_rank,exact_dist,est_dist_s1,est_dist_s2,"
+        << "margin_s1,margin_s2_current,dynamic_d_k_before_cluster,s1_class,s2_class,final_class,is_true_topk\n";
+
+    std::ofstream kth(outdir + "/kth_convergence.csv");
+    kth << "query_id,probed_clusters,est_kth\n";
+
+    SummaryStats stats;
+    stats.abs_err_s1.reserve(static_cast<size_t>(Q) * nprobe * 1024u);
+    stats.abs_err_s2.reserve(static_cast<size_t>(Q) * nprobe * 1024u / 4u);
+    stats.normalized_err_s1.reserve(static_cast<size_t>(Q) * nprobe * 1024u);
+    stats.normalized_err_s2.reserve(static_cast<size_t>(Q) * nprobe * 1024u / 4u);
+
+    const float d_k_static = index.conann().safein_d_k();
+    const float legacy_d_k = index.conann().legacy_d_k();
+    const float eps_ip = index.conann().epsilon();
+    const float margin_s2_divisor = static_cast<float>(1u << (bits - 1));
+
+    auto run_start = std::chrono::steady_clock::now();
     for (uint32_t qi = 0; qi < Q; ++qi) {
+        if (qi % 10 == 0) Log("query %u/%u\n", qi, Q);
         const float* q_vec = qry.data.data() + static_cast<size_t>(qi) * dim;
-        std::vector<std::pair<float, uint32_t>> dists(N);
-        for (uint32_t i = 0; i < N; ++i) {
-            dists[i] = {simd::L2Sqr(q_vec,
-                img.data.data() + static_cast<size_t>(i) * dim, dim), i};
-        }
-        std::partial_sort(dists.begin(), dists.begin() + top_k, dists.end());
-        for (uint32_t i = 0; i < top_k; ++i) {
-            gt_sets[qi].insert(dists[i].second);
-        }
-    }
-    Log("  GT computed for %u queries.\n\n", Q);
-
-    // ================================================================
-    // Phase 1 + 2: Fused probing loop
-    // ================================================================
-    // We fuse Phase 1 and Phase 2 into one loop since both need the same
-    // per-query per-cluster per-vector distances.
-
-    Log("[Phase 1+2] Running diagnostic probing (%u queries × %u clusters)...\n",
-        Q, nlist);
-
-    auto t0 = std::chrono::steady_clock::now();
-
-    // CSV file handles
-    std::ofstream csv_kth, csv_scatter, csv_classify;
-
-    if (run_phase1) {
-        csv_kth.open(outdir + "/kth_convergence.csv");
-        csv_kth << "query_id,probed_count,exact_kth,est_kth,topk_overlap\n";
-
-        csv_scatter.open(outdir + "/vector_distances.csv");
-        csv_scatter << "query_id,vector_id,cluster_id,exact_dist,est_dist,is_true_topk\n";
-    }
-    if (run_phase2) {
-        csv_classify.open(outdir + "/classification.csv");
-        csv_classify << "query_id,vector_id,cluster_id,probe_step,"
-                     << "exact_dist,est_dist,margin,"
-                     << "class_exact,class_est,class_est_adaptive,is_true_topk\n";
-    }
-
-    // Phase 1 accumulators
-    float exact_d_min = std::numeric_limits<float>::infinity();
-    float exact_d_max = -std::numeric_limits<float>::infinity();
-    float est_d_min = std::numeric_limits<float>::infinity();
-    float est_d_max = -std::numeric_limits<float>::infinity();
-    std::vector<double> sum_overlap_per_step(nlist, 0.0);
-
-    // Phase 2 accumulators: confusion[row=exact_class][col=est_class]
-    uint64_t confusion_est[3][3] = {};       // exact vs Classify(est)
-    uint64_t confusion_adaptive[3][3] = {};  // exact vs ClassifyAdaptive(est)
-    uint64_t total_true_nn = 0;
-    uint64_t false_safeout_est = 0;       // true NN classified SafeOut by est
-    uint64_t false_safeout_adaptive = 0;  // true NN classified SafeOut by adaptive
-    uint64_t total_flips_est = 0;
-    uint64_t total_flips_adaptive = 0;
-    uint64_t total_vectors_classified = 0;
-    // Collect all margins for quartile boundaries
-    std::vector<float> all_margins;
-    if (run_phase2) {
-        // Pre-estimate total vectors for reserve
-        all_margins.reserve(static_cast<size_t>(Q) * N / 4);  // rough estimate
-    }
-
-    ConANN conann(eps_ip, d_k);
-
-    for (uint32_t qi = 0; qi < Q; ++qi) {
-        if (qi % 20 == 0) {
-            Log("  query %u/%u\n", qi, Q);
-        }
-
-        const float* q_vec = qry.data.data() + static_cast<size_t>(qi) * dim;
-
-        // Sort clusters by centroid distance
-        std::vector<std::pair<float, uint32_t>> centroid_dists(nlist);
-        for (uint32_t c = 0; c < nlist; ++c) {
-            centroid_dists[c] = {
-                simd::L2Sqr(q_vec,
-                    centroids.data() + static_cast<size_t>(c) * dim, dim),
-                c};
-        }
-        std::sort(centroid_dists.begin(), centroid_dists.end());
-
-        // Dual heaps: max-heap (largest at front)
-        std::vector<std::pair<float, uint32_t>> exact_heap;
+        const std::vector<ClusterID> probed = index.FindNearestClusters(q_vec, nprobe);
         std::vector<std::pair<float, uint32_t>> est_heap;
+        est_heap.reserve(top_k + 1);
 
-        // Probe clusters in order
-        for (uint32_t p = 0; p < nlist; ++p) {
-            uint32_t cid = centroid_dists[p].second;
-            const float* centroid = centroids.data() +
-                static_cast<size_t>(cid) * dim;
-            auto pq = estimator.PrepareQuery(q_vec, centroid, rotation);
-            float margin = 2.0f * per_cluster_r_max[cid] * pq.norm_qc * eps_ip;
+        for (uint32_t rank = 0; rank < probed.size(); ++rank) {
+            const uint32_t cid = probed[rank];
+            const float* centroid = cents.data.data() + static_cast<size_t>(cid) * dim;
+            PreparedQuery pq = estimator.PrepareQuery(q_vec, centroid, rotation);
+            const auto& cluster_codes = ensure_cluster_codes(cid);
+            const auto& members = cluster_members[cid];
+            const float margin_factor = 2.0f * pq.norm_qc * eps_ip;
+            const float dynamic_d_k_before_cluster =
+                (est_heap.size() >= top_k) ? est_heap.front().first
+                                           : std::numeric_limits<float>::infinity();
 
-            // est_kth at the start of this cluster (for ClassifyAdaptive)
-            float est_kth_before = (est_heap.size() >= top_k)
+            for (size_t local_idx = 0; local_idx < members.size(); ++local_idx) {
+                const uint32_t row = members[local_idx];
+                const RaBitQCode& code = cluster_codes[local_idx];
+                CandidateMetrics m;
+                m.query_id = qi;
+                m.cluster_rank = rank + 1;
+                m.cluster_id = cid;
+                m.vector_row = row;
+                m.vector_external_id =
+                    (row < image_ids.size()) ? image_ids[row] : static_cast<int64_t>(row);
+                m.is_true_topk = !truth_sets[qi].row_ids.empty()
+                    ? (truth_sets[qi].row_ids.count(row) > 0)
+                    : (truth_sets[qi].external_ids.count(m.vector_external_id) > 0);
+                m.norm_qc = pq.norm_qc;
+                m.norm_oc = code.norm;
+                m.d_k_static = d_k_static;
+                m.dynamic_d_k_before_cluster = dynamic_d_k_before_cluster;
+                m.exact_dist = simd::L2Sqr(q_vec,
+                    base.data.data() + static_cast<size_t>(row) * dim, dim);
+                m.est_dist_s1 = estimator.EstimateDistance(pq, code);
+                m.margin_s1 = margin_factor * code.norm;
+                m.abs_err_s1 = std::abs(m.est_dist_s1 - m.exact_dist);
+                const float denom_s1 = 2.0f * std::max(1e-12f, pq.norm_qc * code.norm);
+                m.normalized_err_s1 = m.abs_err_s1 / denom_s1;
+                m.safein_gap_s1 = d_k_static - m.est_dist_s1;
+                m.safeout_gap_s1 = m.est_dist_s1 - dynamic_d_k_before_cluster;
+                m.safein_ratio_s1 = m.safein_gap_s1 / std::max(1e-12f, 2.0f * m.margin_s1);
+                m.s1_class = index.conann().ClassifyAdaptive(
+                    m.est_dist_s1, m.margin_s1, dynamic_d_k_before_cluster);
+                m.final_class = m.s1_class;
+
+                ++stats.candidates;
+                if (m.is_true_topk) ++stats.true_topk_candidates;
+                stats.abs_err_s1.push_back(m.abs_err_s1);
+                stats.normalized_err_s1.push_back(m.normalized_err_s1);
+                if (m.s1_class == ResultClass::SafeIn) ++stats.s1_safein;
+                else if (m.s1_class == ResultClass::SafeOut) ++stats.s1_safeout;
+                else ++stats.s1_uncertain;
+
+                if (m.s1_class == ResultClass::Uncertain && bits > 1) {
+                    m.stage2_evaluated = true;
+                    m.est_dist_s2 = estimator.EstimateDistanceMultiBit(pq, code);
+                    m.margin_s2 = m.margin_s1 / margin_s2_divisor;
+                    m.abs_err_s2 = std::abs(m.est_dist_s2 - m.exact_dist);
+                    m.normalized_err_s2 = m.abs_err_s2 / denom_s1;
+                    m.safein_gap_s2 = d_k_static - m.est_dist_s2;
+                    m.safeout_gap_s2 = m.est_dist_s2 - dynamic_d_k_before_cluster;
+                    m.safein_ratio_s2 = m.safein_gap_s2 / std::max(1e-12f, 2.0f * m.margin_s2);
+                    m.s2_class = index.conann().ClassifyAdaptive(
+                        m.est_dist_s2, m.margin_s2, dynamic_d_k_before_cluster);
+                    m.final_class = m.s2_class;
+
+                    ++stats.stage2_candidates;
+                    stats.abs_err_s2.push_back(m.abs_err_s2);
+                    stats.normalized_err_s2.push_back(m.normalized_err_s2);
+                    if (m.s2_class == ResultClass::SafeIn) ++stats.s2_safein;
+                    else if (m.s2_class == ResultClass::SafeOut) ++stats.s2_safeout;
+                    else ++stats.s2_uncertain;
+                }
+
+                if (m.final_class == ResultClass::SafeIn) ++stats.final_safein;
+                else if (m.final_class == ResultClass::SafeOut) {
+                    ++stats.final_safeout;
+                    if (m.is_true_topk) ++stats.final_false_safeout;
+                } else {
+                    ++stats.final_uncertain;
+                }
+
+                WritePerCandidateRow(per_candidate, m);
+                classification
+                    << m.query_id << ',' << m.vector_row << ',' << m.cluster_id << ','
+                    << m.cluster_rank << ',' << m.exact_dist << ',' << m.est_dist_s1 << ',';
+                if (m.stage2_evaluated) classification << m.est_dist_s2;
+                classification << ',' << m.margin_s1 << ',';
+                if (m.stage2_evaluated) classification << m.margin_s2;
+                classification << ',' << m.dynamic_d_k_before_cluster << ','
+                               << ClassToStr(m.s1_class) << ','
+                               << (m.stage2_evaluated ? ClassToStr(m.s2_class) : "") << ','
+                               << ClassToStr(m.final_class) << ','
+                               << (m.is_true_topk ? 1 : 0) << '\n';
+
+                if (m.final_class != ResultClass::SafeOut) {
+                    if (est_heap.size() < top_k) {
+                        est_heap.push_back({m.est_dist_s1, row});
+                        std::push_heap(est_heap.begin(), est_heap.end());
+                    } else if (m.est_dist_s1 < est_heap.front().first) {
+                        std::pop_heap(est_heap.begin(), est_heap.end());
+                        est_heap.back() = {m.est_dist_s1, row};
+                        std::push_heap(est_heap.begin(), est_heap.end());
+                    }
+                }
+            }
+
+            const float est_kth = est_heap.size() >= top_k
                 ? est_heap.front().first
                 : std::numeric_limits<float>::infinity();
-
-            for (uint32_t vi = 0; vi < cluster_members[cid].size(); ++vi) {
-                uint32_t vid = cluster_members[cid][vi];
-                const float* vec = img.data.data() +
-                    static_cast<size_t>(vid) * dim;
-
-                float exact_dist = simd::L2Sqr(q_vec, vec, dim);
-                float est_dist = estimator.EstimateDistance(pq, codes[vid]);
-                bool is_nn = gt_sets[qi].count(vid) > 0;
-
-                // Update exact heap
-                if (exact_heap.size() < top_k) {
-                    exact_heap.push_back({exact_dist, vid});
-                    std::push_heap(exact_heap.begin(), exact_heap.end());
-                } else if (exact_dist < exact_heap.front().first) {
-                    std::pop_heap(exact_heap.begin(), exact_heap.end());
-                    exact_heap.back() = {exact_dist, vid};
-                    std::push_heap(exact_heap.begin(), exact_heap.end());
-                }
-
-                // Update est heap
-                if (est_heap.size() < top_k) {
-                    est_heap.push_back({est_dist, vid});
-                    std::push_heap(est_heap.begin(), est_heap.end());
-                } else if (est_dist < est_heap.front().first) {
-                    std::pop_heap(est_heap.begin(), est_heap.end());
-                    est_heap.back() = {est_dist, vid};
-                    std::push_heap(est_heap.begin(), est_heap.end());
-                }
-
-                // Phase 1: scatter CSV (sampled queries)
-                if (run_phase1 && qi < scatter_queries) {
-                    csv_scatter << qi << "," << vid << "," << cid << ","
-                                << exact_dist << "," << est_dist << ","
-                                << (is_nn ? 1 : 0) << "\n";
-                }
-
-                // Phase 2: classification
-                if (run_phase2) {
-                    ResultClass class_exact = conann.Classify(exact_dist, margin);
-                    ResultClass class_est = conann.Classify(est_dist, margin);
-                    ResultClass class_adaptive = conann.ClassifyAdaptive(
-                        est_dist, margin, est_kth_before);
-
-                    csv_classify << qi << "," << vid << "," << cid << ","
-                                 << (p + 1) << ","
-                                 << exact_dist << "," << est_dist << ","
-                                 << margin << ","
-                                 << ClassToStr(class_exact) << ","
-                                 << ClassToStr(class_est) << ","
-                                 << ClassToStr(class_adaptive) << ","
-                                 << (is_nn ? 1 : 0) << "\n";
-
-                    int ei = ClassToIdx(class_exact);
-                    int si = ClassToIdx(class_est);
-                    int ai = ClassToIdx(class_adaptive);
-                    confusion_est[ei][si]++;
-                    confusion_adaptive[ei][ai]++;
-                    total_vectors_classified++;
-
-                    if (ei != si) total_flips_est++;
-                    if (ei != ai) total_flips_adaptive++;
-
-                    if (is_nn) {
-                        total_true_nn++;
-                        if (class_est == ResultClass::SafeOut) false_safeout_est++;
-                        if (class_adaptive == ResultClass::SafeOut) false_safeout_adaptive++;
-                    }
-
-                    all_margins.push_back(margin);
-                }
-            }
-
-            // Phase 1: record kth convergence after this cluster
-            if (run_phase1) {
-                float exact_kth = (exact_heap.size() >= top_k)
-                    ? exact_heap.front().first
-                    : std::numeric_limits<float>::infinity();
-                float est_kth = (est_heap.size() >= top_k)
-                    ? est_heap.front().first
-                    : std::numeric_limits<float>::infinity();
-
-                // Top-K overlap
-                std::unordered_set<uint32_t> exact_ids, est_ids;
-                for (auto& [d, id] : exact_heap) exact_ids.insert(id);
-                for (auto& [d, id] : est_heap) est_ids.insert(id);
-                uint32_t overlap = 0;
-                for (uint32_t id : exact_ids) {
-                    if (est_ids.count(id)) overlap++;
-                }
-
-                csv_kth << qi << "," << (p + 1) << ","
-                        << exact_kth << "," << est_kth << ","
-                        << overlap << "\n";
-
-                // Accumulate d_min/d_max
-                if (std::isfinite(exact_kth)) {
-                    exact_d_min = std::min(exact_d_min, exact_kth);
-                    exact_d_max = std::max(exact_d_max, exact_kth);
-                }
-                if (std::isfinite(est_kth)) {
-                    est_d_min = std::min(est_d_min, est_kth);
-                    est_d_max = std::max(est_d_max, est_kth);
-                }
-                sum_overlap_per_step[p] += overlap;
-            }
+            kth << qi << ',' << (rank + 1) << ',' << est_kth << '\n';
         }
     }
 
-    auto t1 = std::chrono::steady_clock::now();
-    double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    Log("\n  Probing complete (%.1f ms).\n\n", elapsed_ms);
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - run_start).count();
+    Log("Finished in %.2f ms\n", elapsed_ms);
 
-    // Close CSV files
-    if (csv_kth.is_open()) csv_kth.close();
-    if (csv_scatter.is_open()) csv_scatter.close();
-    if (csv_classify.is_open()) csv_classify.close();
+    WriteSummaryJson(outdir + "/summary.json",
+                     fs::path(dataset_dir).filename().string(),
+                     index_dir,
+                     Q,
+                     top_k,
+                     nprobe,
+                     bits,
+                     legacy_d_k,
+                     d_k_static,
+                     index.conann().has_safein_d_k() ? "rabitq_s2_or_explicit" : "legacy_exact_l2",
+                     "query_time_estimated_kth_plus_margin",
+                     stats);
 
-    // ================================================================
-    // Phase 1 summary
-    // ================================================================
-    if (run_phase1) {
-        Log("=== Phase 1: Distance Distribution Summary ===\n\n");
-        Log("  d_min/d_max comparison:\n");
-        Log("  %-14s %-14s %-14s %-14s\n", "", "d_min", "d_max", "range");
-        Log("  %-14s %-14s %-14s %-14s\n", "------", "------", "------", "------");
-        Log("  %-14s %-14.4f %-14.4f %-14.4f\n", "Exact L2",
-            exact_d_min, exact_d_max, exact_d_max - exact_d_min);
-        Log("  %-14s %-14.4f %-14.4f %-14.4f\n", "RaBitQ Est",
-            est_d_min, est_d_max, est_d_max - est_d_min);
-        Log("  %-14s %-14.2fx\n", "Range ratio",
-            (exact_d_max - exact_d_min) > 0
-                ? (est_d_max - est_d_min) / (exact_d_max - exact_d_min)
-                : 0.0f);
-        Log("\n");
-
-        Log("  Mean top-K overlap per step (last 5):\n");
-        for (uint32_t p = (nlist > 5 ? nlist - 5 : 0); p < nlist; ++p) {
-            Log("    step %2u: %.2f / %u\n", p + 1,
-                sum_overlap_per_step[p] / Q, top_k);
-        }
-        Log("\n  CSV files written:\n");
-        Log("    %s/kth_convergence.csv\n", outdir.c_str());
-        Log("    %s/vector_distances.csv\n", outdir.c_str());
-        Log("\n");
-    }
-
-    // ================================================================
-    // Phase 2 summary
-    // ================================================================
-    if (run_phase2) {
-        Log("=== Phase 2: ConANN Classification Summary ===\n\n");
-
-        const char* class_names[3] = {"SafeIn", "SafeOut", "Uncertain"};
-
-        // Confusion matrix: exact vs Classify(est)
-        Log("  Confusion: Exact class (rows) vs Classify(est_dist) (cols)\n");
-        Log("  %-12s %-12s %-12s %-12s\n", "", "est_SI", "est_SO", "est_Unc");
-        for (int r = 0; r < 3; ++r) {
-            Log("  %-12s %-12lu %-12lu %-12lu\n", class_names[r],
-                confusion_est[r][0], confusion_est[r][1], confusion_est[r][2]);
-        }
-        Log("\n");
-
-        // Confusion matrix: exact vs ClassifyAdaptive(est)
-        Log("  Confusion: Exact class (rows) vs ClassifyAdaptive(est_dist) (cols)\n");
-        Log("  %-12s %-12s %-12s %-12s\n", "", "adp_SI", "adp_SO", "adp_Unc");
-        for (int r = 0; r < 3; ++r) {
-            Log("  %-12s %-12lu %-12lu %-12lu\n", class_names[r],
-                confusion_adaptive[r][0], confusion_adaptive[r][1],
-                confusion_adaptive[r][2]);
-        }
-        Log("\n");
-
-        // False SafeOut rates
-        Log("  False SafeOut (true NN misclassified as SafeOut):\n");
-        Log("    Classify(est):         %lu / %lu (%.4f%%)\n",
-            false_safeout_est, total_true_nn,
-            total_true_nn > 0 ? 100.0 * static_cast<double>(false_safeout_est) /
-                                    static_cast<double>(total_true_nn) : 0.0);
-        Log("    ClassifyAdaptive(est): %lu / %lu (%.4f%%)\n",
-            false_safeout_adaptive, total_true_nn,
-            total_true_nn > 0 ? 100.0 * static_cast<double>(false_safeout_adaptive) /
-                                    static_cast<double>(total_true_nn) : 0.0);
-        Log("\n");
-
-        // Classification flip rates
-        Log("  Classification flip rate (exact_class != est_class):\n");
-        Log("    Classify:              %lu / %lu (%.2f%%)\n",
-            total_flips_est, total_vectors_classified,
-            total_vectors_classified > 0
-                ? 100.0 * static_cast<double>(total_flips_est) /
-                      static_cast<double>(total_vectors_classified)
-                : 0.0);
-        Log("    ClassifyAdaptive:      %lu / %lu (%.2f%%)\n",
-            total_flips_adaptive, total_vectors_classified,
-            total_vectors_classified > 0
-                ? 100.0 * static_cast<double>(total_flips_adaptive) /
-                      static_cast<double>(total_vectors_classified)
-                : 0.0);
-        Log("\n");
-
-        // SafeOut % comparison
-        uint64_t est_so_total = confusion_est[0][1] + confusion_est[1][1] + confusion_est[2][1];
-        uint64_t adp_so_total = confusion_adaptive[0][1] + confusion_adaptive[1][1] + confusion_adaptive[2][1];
-        // exact SafeOut total is the row sum
-        uint64_t exact_so_total = confusion_est[1][0] + confusion_est[1][1] + confusion_est[1][2];
-
-        Log("  SafeOut %% comparison:\n");
-        Log("    Classify(exact):       %.2f%%\n",
-            total_vectors_classified > 0
-                ? 100.0 * static_cast<double>(exact_so_total) /
-                      static_cast<double>(total_vectors_classified)
-                : 0.0);
-        Log("    Classify(est):         %.2f%%\n",
-            total_vectors_classified > 0
-                ? 100.0 * static_cast<double>(est_so_total) /
-                      static_cast<double>(total_vectors_classified)
-                : 0.0);
-        Log("    ClassifyAdaptive(est): %.2f%%\n",
-            total_vectors_classified > 0
-                ? 100.0 * static_cast<double>(adp_so_total) /
-                      static_cast<double>(total_vectors_classified)
-                : 0.0);
-        Log("\n");
-
-        // Margin quartile flip analysis
-        if (!all_margins.empty()) {
-            std::vector<float> sorted_margins = all_margins;
-            std::sort(sorted_margins.begin(), sorted_margins.end());
-            float q1 = sorted_margins[sorted_margins.size() / 4];
-            float q2 = sorted_margins[sorted_margins.size() / 2];
-            float q3 = sorted_margins[sorted_margins.size() * 3 / 4];
-
-            // Re-read classification CSV to compute per-quartile stats
-            // Instead, we note that we'd need to re-scan. For simplicity,
-            // we output the quartile boundaries and let Python do the analysis.
-            Log("  Margin quartile boundaries: Q1=%.4f Q2=%.4f Q3=%.4f\n",
-                q1, q2, q3);
-            Log("  (Detailed per-quartile flip analysis in Python plots)\n");
-        }
-
-        Log("\n  CSV files written:\n");
-        Log("    %s/classification.csv\n", outdir.c_str());
-        Log("\n");
-    }
-
-    Log("Done.\n");
+    Log("Wrote %s\n", (outdir + "/per_candidate.csv").c_str());
+    Log("Wrote %s\n", (outdir + "/summary.json").c_str());
     return 0;
 }

@@ -86,6 +86,10 @@ class IvfIndex {
     /// Get the ConANN classifier.
     const ConANN& conann() const { return conann_; }
     void OverrideConANN(float epsilon, float d_k) { conann_ = ConANN(epsilon, d_k); }
+    void OverrideConANN(float epsilon, float legacy_d_k, float safein_d_k,
+                        bool has_safein_d_k) {
+        conann_ = ConANN(epsilon, legacy_d_k, safein_d_k, has_safein_d_k);
+    }
 
     /// Get the underlying Segment (mutable for lazy-opening readers).
     storage::Segment& segment() { return segment_; }
@@ -107,6 +111,8 @@ class IvfIndex {
     }
 
     /// Get centroid for a specific cluster (row-major offset into centroids_).
+    const std::vector<float>& centroids() const { return centroids_; }
+
     const float* centroid(uint32_t cluster_idx) const {
         return centroids_.data() + static_cast<size_t>(cluster_idx) * dim_;
     }
@@ -138,6 +144,12 @@ class IvfIndex {
     CoarseBuilder coarse_builder() const { return coarse_builder_; }
     const std::string& requested_metric() const { return requested_metric_; }
     const std::string& effective_metric() const { return effective_metric_; }
+    SafeInDkSpace safein_dk_space() const { return safein_dk_space_; }
+    SafeInDkSearchScope safein_dk_search_scope() const { return safein_dk_search_scope_; }
+    float safein_dk_percentile() const { return safein_dk_percentile_; }
+    uint32_t safein_dk_calibration_samples() const { return safein_dk_calibration_samples_; }
+    uint32_t safein_dk_nprobe() const { return safein_dk_nprobe_; }
+    uint8_t safein_dk_bits() const { return safein_dk_bits_; }
 
  private:
     std::string dir_;
@@ -162,6 +174,12 @@ class IvfIndex {
     CoarseBuilder coarse_builder_ = CoarseBuilder::Auto;
     std::string requested_metric_ = "l2";
     std::string effective_metric_ = "l2";
+    SafeInDkSpace safein_dk_space_ = SafeInDkSpace::ExactL2;
+    SafeInDkSearchScope safein_dk_search_scope_ = SafeInDkSearchScope::FullDatabase;
+    float safein_dk_percentile_ = 0.0f;
+    uint32_t safein_dk_calibration_samples_ = 0;
+    uint32_t safein_dk_nprobe_ = 0;
+    uint8_t safein_dk_bits_ = 0;
     Dim logical_dim_ = 0;
     std::string padding_mode_ = "none";
     std::string rotation_mode_ = "random_matrix";

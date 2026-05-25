@@ -29,6 +29,13 @@ struct NpyArrayInt64Matrix {
     uint32_t cols;
 };
 
+/// Row-major int32 matrix loaded from .npy.
+struct NpyArrayInt32Matrix {
+    std::vector<int32_t> data;
+    uint32_t rows;
+    uint32_t cols;
+};
+
 /// Load a float32 .npy file. Returns error if dtype != <f4.
 StatusOr<NpyArrayFloat> LoadNpyFloat32(const std::string& path);
 
@@ -37,6 +44,9 @@ StatusOr<NpyArrayInt64> LoadNpyInt64(const std::string& path);
 
 /// Load a row-major int64 matrix from .npy. Returns error if dtype != <i8.
 StatusOr<NpyArrayInt64Matrix> LoadNpyInt64Matrix(const std::string& path);
+
+/// Load a row-major int32 matrix from .npy. Returns error if dtype != <i4.
+StatusOr<NpyArrayInt32Matrix> LoadNpyInt32Matrix(const std::string& path);
 
 }  // namespace io
 }  // namespace vdb

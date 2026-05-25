@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_set>
+#include <vector>
 
 #include "vdb/common/macros.h"
 #include "vdb/common/types.h"
@@ -54,6 +56,10 @@ struct ProbeStats {
     uint32_t s2_safein = 0;
     uint32_t s2_safeout = 0;
     uint32_t s2_uncertain = 0;
+    uint32_t s1_false_safein = 0;
+    uint32_t s1_false_safeout = 0;
+    uint32_t s2_false_safein = 0;
+    uint32_t s2_false_safeout = 0;
     uint32_t num_stage1_blocks = 0;
     uint32_t num_stage2_candidates = 0;
     uint32_t num_stage2_block_lookups = 0;
@@ -100,20 +106,22 @@ class ClusterProber {
     ///
     /// @param pc             Parsed cluster (Region 1 + Region 2)
     /// @param view           Lightweight prepared query view for this cluster
-    /// @param margin_factor  2 * pq.norm_qc * conann.epsilon()
     /// @param dynamic_d_k    Current k-th estimate distance:
     ///                         (est_heap.size() >= top_k) ? est_heap.front()
     ///                                                     : +infinity
     /// @param sink           Receives non-SafeOut candidates
     /// @param stats          Accumulated classification statistics
     void Probe(const query::ParsedCluster& pc,
+               uint32_t cluster_id,
                const rabitq::PreparedClusterQueryView& view,
-               float margin_factor,
                float dynamic_d_k,
                bool enable_address_decode_simd,
                bool enable_fine_grained_timing,
+               bool enable_stage1_safein,
                bool enable_stage2_collect_block_first,
                bool enable_stage2_scatter_batch_classify,
+               const std::vector<std::vector<uint32_t>>* false_stats_cluster_members,
+               const std::unordered_set<uint32_t>* false_stats_true_topk_rows,
                ProbeResultSink& sink,
                ProbeStats& stats) const;
 

@@ -9,7 +9,8 @@
 /// Usage:
 ///   bench_vector_search --base /path/to/base.fvecs --query /path/to/query.fvecs
 ///       [--gt /path/to/gt.ivecs] [--nlist 256] [--nprobe 32] [--topk 10]
-///       [--bits 4] [--crc 1] [--early-stop 1] [--outdir ./results]
+///       [--bits 4] [--metric l2|cosine|ip] [--crc 1] [--early-stop 1]
+///       [--outdir ./results]
 ///       [--centroids /path/to/centroids.fvecs] [--assignments /path/to/assign.ivecs]
 ///       [--pad-to-pow2 1] [--index-dir /path/to/existing/index]
 ///       [--tmp-dir /tmp/bench_vs] [--keep-index]
@@ -25,6 +26,8 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <random>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -32,14 +35,20 @@
 #include "vdb/index/crc_calibrator.h"
 #include "vdb/index/ivf_builder.h"
 #include "vdb/index/ivf_index.h"
+#include "vdb/io/npy_reader.h"
 #include "vdb/io/vecs_reader.h"
 #include "vdb/query/async_reader.h"
 #include "vdb/query/overlap_scheduler.h"
 #include "vdb/query/search_context.h"
 #include "vdb/query/search_results.h"
+#include "vdb/rabitq/rabitq_encoder.h"
+#include "vdb/rabitq/rabitq_estimator.h"
+#include "vdb/rabitq/rabitq_rotation.h"
 #include "vdb/simd/distance_l2.h"
+#include "rabitq_bench_calibration.h"
 
 using namespace vdb;
+using namespace vdb::bench;
 using namespace vdb::index;
 using namespace vdb::query;
 
@@ -86,6 +95,10 @@ static float GetFloatArg(int argc, char* argv[], const char* name, float def) {
     auto s = GetArg(argc, argv, name, "");
     return s.empty() ? def : std::strtof(s.c_str(), nullptr);
 }
+static bool EndsWith(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
 static bool HasFlag(int argc, char* argv[], const char* name) {
     for (int i = 1; i < argc; ++i)
         if (std::strcmp(argv[i], name) == 0) return true;
@@ -118,10 +131,20 @@ int main(int argc, char* argv[]) {
     std::string outdir = GetArg(argc, argv, "--outdir", "");
     int q_limit      = GetIntArg(argc, argv, "--queries", 0);
     uint8_t bits     = static_cast<uint8_t>(GetIntArg(argc, argv, "--bits", 1));
+    std::string metric = GetArg(argc, argv, "--metric", "l2");
+    std::string coarse_builder = GetArg(argc, argv, "--coarse-builder", "auto");
     uint32_t epsilon_samples = static_cast<uint32_t>(GetIntArg(argc, argv, "--epsilon-samples", 100));
     float epsilon_percentile = GetFloatArg(argc, argv, "--epsilon-percentile", 0.99f);
+    float safein_dk_percentile = GetFloatArg(argc, argv, "--safein-dk-percentile", -1.0f);
+    float safein_epsilon_percentile = GetFloatArg(argc, argv, "--safein-epsilon-percentile", -1.0f);
+    float safeout_epsilon_percentile = GetFloatArg(argc, argv, "--safeout-epsilon-percentile", -1.0f);
+    uint32_t safein_dk_samples =
+        static_cast<uint32_t>(GetIntArg(argc, argv, "--safein-dk-samples", 0));
+    bool enable_stage1_safein =
+        GetIntArg(argc, argv, "--enable-stage1-safein", 1) != 0;
     std::string centroids_path   = GetArg(argc, argv, "--centroids", "");
     std::string assignments_path = GetArg(argc, argv, "--assignments", "");
+    std::string image_ids_path   = GetArg(argc, argv, "--image-ids", "");
     bool pad_to_pow2 = GetIntArg(argc, argv, "--pad-to-pow2", 0) != 0;
     std::string arg_index_dir = GetArg(argc, argv, "--index-dir", "");
     std::string arg_tmp_dir   = GetArg(argc, argv, "--tmp-dir", "");
@@ -131,8 +154,12 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
             "Usage: bench_vector_search --base <path> --query <path> "
             "[--gt <path>] [--nlist N] [--nprobe N] [--topk K] "
-            "[--crc 0|1] [--early-stop 0|1] [--bits N] [--outdir dir] "
-            "[--centroids <path>] [--assignments <path>] [--pad-to-pow2 1] "
+            "[--crc 0|1] [--early-stop 0|1] [--bits N] [--metric l2|cosine|ip] "
+            "[--coarse-builder auto|superkmeans|hierarchical_superkmeans|faiss_kmeans] "
+            "[--outdir dir] "
+            "[--centroids <path>] [--assignments <path>] [--image-ids <path>] "
+            "[--pad-to-pow2 1] "
+            "[--enable-stage1-safein 0|1] "
             "[--index-dir <path>] [--tmp-dir <path>] [--keep-index]\n");
         return 1;
     }
@@ -141,8 +168,10 @@ int main(int argc, char* argv[]) {
     Log("Base:   %s\n", base_path.c_str());
     Log("Query:  %s\n", query_path.c_str());
     Log("GT:     %s\n", gt_path.empty() ? "(brute-force)" : gt_path.c_str());
-    Log("nlist=%u  nprobe=%u  top_k=%u  bits=%u  crc=%d  early_stop=%d\n",
-        nlist, nprobe, top_k, bits, use_crc, early_stop);
+    Log("nlist=%u  nprobe=%u  top_k=%u  bits=%u  metric=%s  coarse_builder=%s  crc=%d  early_stop=%d\n",
+        nlist, nprobe, top_k, bits, metric.c_str(), coarse_builder.c_str(), use_crc, early_stop);
+    const bool split_safein_safeout_eps =
+        safein_epsilon_percentile >= 0.0f || safeout_epsilon_percentile >= 0.0f;
 
     // ================================================================
     // Phase A: Load data
@@ -174,6 +203,29 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     Log("  N=%u, Q=%u, dim=%u\n", N, Q, dim);
+
+    std::vector<int64_t> image_ids;
+    std::unordered_map<int64_t, uint32_t> image_id_to_row;
+    if (!image_ids_path.empty()) {
+        auto ids_or = io::LoadNpyInt64(image_ids_path);
+        if (!ids_or.ok()) {
+            std::fprintf(stderr, "Failed to load image ids: %s\n",
+                         ids_or.status().ToString().c_str());
+            return 1;
+        }
+        const auto& ids = ids_or.value();
+        if (ids.count != N) {
+            std::fprintf(stderr, "image_ids count mismatch: expected %u, got %u\n",
+                         N, ids.count);
+            return 1;
+        }
+        image_ids = ids.data;
+        image_id_to_row.reserve(image_ids.size() * 2);
+        for (uint32_t row = 0; row < image_ids.size(); ++row) {
+            image_id_to_row[image_ids[row]] = row;
+        }
+        Log("  Loaded image ids: %zu\n", image_ids.size());
+    }
 
     // Pad to next power of 2 if requested (e.g. Deep1M dim=96→128)
     uint32_t orig_dim = dim;
@@ -214,31 +266,113 @@ int main(int argc, char* argv[]) {
     }
 
     // GT loading
-    std::vector<std::vector<uint32_t>> gt_ids;
+    std::vector<std::vector<int64_t>> gt_ids;
+    std::vector<std::vector<uint32_t>> gt_row_ids;
     uint32_t gt_k = 0;
 
     if (!gt_path.empty() && fs::exists(gt_path)) {
         Log("  Loading GT from %s...\n", gt_path.c_str());
-        auto gt_or = io::LoadIvecs(gt_path);
-        if (!gt_or.ok()) {
-            std::fprintf(stderr, "Failed to load GT: %s\n",
-                         gt_or.status().ToString().c_str());
-            return 1;
+        if (EndsWith(gt_path, ".npy")) {
+            auto gt_or = io::LoadNpyInt64Matrix(gt_path);
+            if (gt_or.ok()) {
+                auto& gt = gt_or.value();
+            gt_k = gt.cols;
+            uint32_t gt_rows = std::min(gt.rows, Q);
+            gt_ids.resize(gt_rows);
+            for (uint32_t qi = 0; qi < gt_rows; ++qi) {
+                gt_ids[qi].resize(gt.cols);
+                for (uint32_t j = 0; j < gt.cols; ++j) {
+                    const int64_t id = gt.data[static_cast<size_t>(qi) * gt.cols + j];
+                    gt_ids[qi][j] = id;
+                }
+            }
+            Log("  GT: %u queries, k=%u\n", gt_rows, gt_k);
+            } else {
+                auto gt32_or = io::LoadNpyInt32Matrix(gt_path);
+                if (!gt32_or.ok()) {
+                    std::fprintf(stderr, "Failed to load GT as int64 or int32: %s / %s\n",
+                                 gt_or.status().ToString().c_str(),
+                                 gt32_or.status().ToString().c_str());
+                    return 1;
+                }
+                auto& gt = gt32_or.value();
+                gt_k = gt.cols;
+                uint32_t gt_rows = std::min(gt.rows, Q);
+                gt_ids.resize(gt_rows);
+                for (uint32_t qi = 0; qi < gt_rows; ++qi) {
+                    gt_ids[qi].resize(gt.cols);
+                    for (uint32_t j = 0; j < gt.cols; ++j) {
+                        const int32_t id = gt.data[static_cast<size_t>(qi) * gt.cols + j];
+                        gt_ids[qi][j] = static_cast<int64_t>(id);
+                    }
+                }
+                Log("  GT: %u queries, k=%u\n", gt_rows, gt_k);
+            }
+        } else {
+            auto gt_or = io::LoadIvecs(gt_path);
+            if (!gt_or.ok()) {
+                std::fprintf(stderr, "Failed to load GT: %s\n",
+                             gt_or.status().ToString().c_str());
+                return 1;
+            }
+            auto& gt = gt_or.value();
+            gt_k = gt.cols;
+            uint32_t gt_rows = std::min(gt.rows, Q);
+            gt_ids.resize(gt_rows);
+            for (uint32_t qi = 0; qi < gt_rows; ++qi) {
+                gt_ids[qi].resize(gt.cols);
+                for (uint32_t j = 0; j < gt.cols; ++j) {
+                    gt_ids[qi][j] =
+                        static_cast<int64_t>(gt.data[static_cast<size_t>(qi) * gt.cols + j]);
+                }
+            }
+            Log("  GT: %u queries, k=%u\n", gt_rows, gt_k);
         }
-        auto& gt = gt_or.value();
-        gt_k = gt.cols;
-        uint32_t gt_rows = std::min(gt.rows, Q);
-        gt_ids.resize(gt_rows);
-        for (uint32_t qi = 0; qi < gt_rows; ++qi) {
-            gt_ids[qi].assign(
-                gt.data.data() + static_cast<size_t>(qi) * gt.cols,
-                gt.data.data() + static_cast<size_t>(qi) * gt.cols + gt.cols);
+        if (!image_ids.empty()) {
+            uint64_t row_range_count = 0;
+            uint64_t image_id_hit_count = 0;
+            uint64_t total_gt_ids = 0;
+            for (const auto& per_query : gt_ids) {
+                for (int64_t id : per_query) {
+                    ++total_gt_ids;
+                    if (id >= 0 && static_cast<uint64_t>(id) < N) {
+                        ++row_range_count;
+                    }
+                    if (image_id_to_row.find(id) != image_id_to_row.end()) {
+                        ++image_id_hit_count;
+                    }
+                }
+            }
+            const bool gt_looks_like_rows =
+                total_gt_ids > 0 &&
+                row_range_count == total_gt_ids &&
+                image_id_hit_count * 2 < total_gt_ids;
+            if (gt_looks_like_rows) {
+                for (auto& per_query : gt_ids) {
+                    for (int64_t& id : per_query) {
+                        id = image_ids[static_cast<uint32_t>(id)];
+                    }
+                }
+                Log("  GT row ids converted to image ids for recall.\n");
+            }
         }
-        Log("  GT: %u queries, k=%u\n", gt_rows, gt_k);
+        gt_row_ids.resize(gt_ids.size());
+        for (uint32_t qi = 0; qi < gt_ids.size(); ++qi) {
+            gt_row_ids[qi].reserve(gt_ids[qi].size());
+            for (int64_t id : gt_ids[qi]) {
+                auto it = image_id_to_row.find(id);
+                if (it != image_id_to_row.end()) {
+                    gt_row_ids[qi].push_back(it->second);
+                } else if (id >= 0 && static_cast<uint64_t>(id) < N) {
+                    gt_row_ids[qi].push_back(static_cast<uint32_t>(id));
+                }
+            }
+        }
     } else {
         Log("  No GT file — computing brute-force L2...\n");
         gt_k = std::max(top_k, 100u);
         gt_ids.resize(Q);
+        gt_row_ids.resize(Q);
         for (uint32_t qi = 0; qi < Q; ++qi) {
             const float* q_vec = qry.data.data() + static_cast<size_t>(qi) * dim;
             std::vector<std::pair<float, uint32_t>> dists(N);
@@ -249,8 +383,13 @@ int main(int argc, char* argv[]) {
             std::partial_sort(dists.begin(),
                               dists.begin() + std::min(gt_k, N), dists.end());
             gt_ids[qi].resize(std::min(gt_k, N));
+            gt_row_ids[qi].resize(std::min(gt_k, N));
             for (uint32_t i = 0; i < std::min(gt_k, N); ++i)
-                gt_ids[qi][i] = dists[i].second;
+                gt_ids[qi][i] = image_ids.empty()
+                    ? static_cast<int64_t>(dists[i].second)
+                    : image_ids[dists[i].second];
+            for (uint32_t i = 0; i < std::min(gt_k, N); ++i)
+                gt_row_ids[qi][i] = dists[i].second;
         }
         Log("  Brute-force GT computed (k=%u).\n", gt_k);
     }
@@ -261,6 +400,7 @@ int main(int argc, char* argv[]) {
     std::string index_dir;
     bool tmp_index = false;  // whether we created a temp index to clean up
     double build_time_ms = 0.0;
+    std::vector<uint32_t> built_assignments;
 
     if (!arg_index_dir.empty()) {
         index_dir = arg_index_dir;
@@ -284,22 +424,47 @@ int main(int argc, char* argv[]) {
         IvfBuilderConfig cfg;
         cfg.nlist = nlist;
         cfg.seed = seed;
+        cfg.metric = metric;
+        if (coarse_builder == "superkmeans") {
+            cfg.coarse_builder = index::CoarseBuilder::SuperKMeans;
+        } else if (coarse_builder == "hierarchical_superkmeans") {
+            cfg.coarse_builder = index::CoarseBuilder::HierarchicalSuperKMeans;
+        } else if (coarse_builder == "faiss_kmeans") {
+            cfg.coarse_builder = index::CoarseBuilder::FaissKMeans;
+        } else {
+            cfg.coarse_builder = index::CoarseBuilder::Auto;
+        }
         cfg.rabitq = {bits, 64, 5.75f};
         cfg.calibration_samples = std::min(100u, N);
         cfg.epsilon_samples = epsilon_samples;
         cfg.epsilon_percentile = epsilon_percentile;
         cfg.calibration_topk = top_k;
         cfg.calibration_percentile = 0.99f;
+        if (safein_dk_percentile >= 0.0f) {
+            cfg.safein_dk_space = SafeInDkSpace::RabitqS2;
+            cfg.safein_dk_percentile = safein_dk_percentile;
+            cfg.safein_dk_calibration_samples =
+                (safein_dk_samples > 0) ? safein_dk_samples : Q;
+            cfg.safein_dk_search_scope = SafeInDkSearchScope::FullDatabase;
+        }
         cfg.centroids_path = centroids_path;
         cfg.assignments_path = assignments_path;
+        if (assignments_path.empty()) {
+            cfg.save_assignments_path = index_dir + "/assignments.ivecs";
+        }
         cfg.crc_top_k = top_k;
         cfg.calibration_queries = qry.data.data();
         cfg.num_calibration_queries = Q;
         // Store vector index as INT64 payload for recall computation
         cfg.payload_schemas = {{0, "idx", DType::INT64, false}};
 
-        PayloadFn payload_fn = [](uint32_t idx) -> std::vector<Datum> {
-            return {Datum::Int64(static_cast<int64_t>(idx))};
+        const std::vector<int64_t>* payload_image_ids =
+            image_ids.empty() ? nullptr : &image_ids;
+        PayloadFn payload_fn = [payload_image_ids](uint32_t idx) -> std::vector<Datum> {
+            const int64_t payload_id = (payload_image_ids == nullptr)
+                ? static_cast<int64_t>(idx)
+                : (*payload_image_ids)[idx];
+            return {Datum::Int64(payload_id)};
         };
 
         IvfBuilder builder(cfg);
@@ -319,6 +484,7 @@ int main(int argc, char* argv[]) {
             std::fprintf(stderr, "Build failed: %s\n", s.ToString().c_str());
             return 1;
         }
+        built_assignments = builder.assignments();
         Log("  Build time: %.1f ms\n", build_time_ms);
     }
 
@@ -337,6 +503,72 @@ int main(int argc, char* argv[]) {
     Log("  eps_ip=%.6f  d_k=%.6f  nlist=%u  used_hadamard=%d\n",
         index.conann().epsilon(), index.conann().d_k(),
         index.nlist(), index.used_hadamard());
+
+    float runtime_safein_dk = index.conann().safein_d_k();
+    float runtime_safein_eps = index.conann().epsilon();
+    float runtime_safeout_eps = index.conann().epsilon();
+    std::vector<std::vector<uint32_t>> cluster_members_for_stats;
+    bool have_cluster_members_for_stats = false;
+    if (!arg_index_dir.empty() && !image_ids.empty()) {
+        auto recover_status = RecoverClusterMembersFromIndex(
+            index, image_id_to_row, &cluster_members_for_stats);
+        if (!recover_status.ok()) {
+            std::fprintf(stderr,
+                         "Failed to recover cluster members from index payload: %s\n",
+                         recover_status.ToString().c_str());
+            return 1;
+        }
+        have_cluster_members_for_stats = true;
+    } else if (!built_assignments.empty()) {
+        BuildClusterMembers(built_assignments, index.nlist(), &cluster_members_for_stats);
+        have_cluster_members_for_stats = true;
+    } else if (!assignments_path.empty()) {
+        auto assignments_or = LoadAssignments(assignments_path, N);
+        if (!assignments_or.ok()) {
+            std::fprintf(stderr, "Failed to load assignments: %s\n",
+                         assignments_or.status().ToString().c_str());
+            return 1;
+        }
+        BuildClusterMembers(assignments_or.value(), index.nlist(), &cluster_members_for_stats);
+        have_cluster_members_for_stats = true;
+    }
+
+    if (safein_dk_percentile >= 0.0f ||
+        safein_epsilon_percentile >= 0.0f ||
+        safeout_epsilon_percentile >= 0.0f) {
+        if (!have_cluster_members_for_stats) {
+            std::fprintf(stderr,
+                "Experimental safein/safeout sweep requires --assignments or a freshly built index.\n");
+            return 1;
+        }
+        std::vector<std::vector<rabitq::RaBitQCode>> all_codes;
+        EncodeAllCodes(base.data, N, dim, cluster_members_for_stats, index.centroids(),
+                       index.rotation(), bits, nullptr, &all_codes);
+
+        if (safein_dk_percentile >= 0.0f) {
+            const uint32_t dk_queries = (safein_dk_samples > 0) ? safein_dk_samples : Q;
+            runtime_safein_dk = CalibrateRabitqSafeInDk(
+                qry.data.data(), Q, dim, top_k, dk_queries,
+                safein_dk_percentile, cluster_members_for_stats, all_codes,
+                index.centroids(), index.rotation(), bits, seed);
+        }
+        if (safein_epsilon_percentile >= 0.0f) {
+            runtime_safein_eps = CalibrateSplitEpsilon(
+                all_codes, cluster_members_for_stats, base.data.data(), index.centroids(),
+                index.rotation(), dim, epsilon_samples, safein_epsilon_percentile,
+                seed, runtime_safein_dk, bits, nullptr);
+        }
+        if (safeout_epsilon_percentile >= 0.0f) {
+            runtime_safeout_eps = CalibrateSplitEpsilon(
+                all_codes, cluster_members_for_stats, base.data.data(), index.centroids(),
+                index.rotation(), dim, epsilon_samples, safeout_epsilon_percentile,
+                seed, runtime_safein_dk, bits, nullptr);
+        }
+        index.OverrideConANN(runtime_safeout_eps, index.conann().legacy_d_k(),
+                             runtime_safein_dk, true);
+        Log("  override safein_d_k=%.6f safein_eps=%.6f safeout_eps=%.6f\n",
+            runtime_safein_dk, runtime_safein_eps, runtime_safeout_eps);
+    }
 
     CalibrationResults calib_results;
     if (use_crc) {
@@ -383,6 +615,19 @@ int main(int argc, char* argv[]) {
     search_cfg.initial_prefetch = 16;
     search_cfg.refill_threshold = 4;
     search_cfg.refill_count = 8;
+    search_cfg.enable_stage1_safein = enable_stage1_safein;
+    if (safein_epsilon_percentile >= 0.0f) {
+        search_cfg.safein_epsilon_override = runtime_safein_eps;
+    }
+    if (safeout_epsilon_percentile >= 0.0f) {
+        search_cfg.safeout_epsilon_override = runtime_safeout_eps;
+    }
+    if (split_safein_safeout_eps) {
+        search_cfg.enable_stage2_scatter_batch_classify = false;
+    }
+    if (have_cluster_members_for_stats) {
+        search_cfg.false_stats_cluster_members = &cluster_members_for_stats;
+    }
 
     IoUringReader reader;
     {
@@ -401,19 +646,34 @@ int main(int argc, char* argv[]) {
                 s.ToString().c_str());
         }
     }
-    OverlapScheduler scheduler(index, reader, search_cfg);
-
-    std::vector<std::vector<uint32_t>> results(Q);
+    std::vector<std::vector<int64_t>> results(Q);
     std::vector<double> latencies(Q);
+    std::vector<std::unordered_set<uint32_t>> truth_sets(Q);
+    if (!gt_ids.empty()) {
+        for (uint32_t qi = 0; qi < Q && qi < gt_row_ids.size(); ++qi) {
+            const uint32_t gt_limit =
+                std::min(top_k, static_cast<uint32_t>(gt_row_ids[qi].size()));
+            for (uint32_t i = 0; i < gt_limit; ++i) {
+                truth_sets[qi].insert(gt_row_ids[qi][i]);
+            }
+        }
+    }
 
     // Aggregate stats
     uint64_t s1_safein = 0, s1_safeout = 0, s1_uncertain = 0;
     uint64_t s2_safein = 0, s2_safeout = 0, s2_uncertain = 0;
+    uint64_t s1_false_safein = 0, s1_false_safeout = 0;
+    uint64_t s2_false_safein = 0, s2_false_safeout = 0;
     uint64_t final_uncertain = 0;
     uint64_t total_probed_clusters = 0;
     uint32_t early_stop_count = 0;
 
     for (uint32_t qi = 0; qi < Q; ++qi) {
+        SearchConfig query_cfg = search_cfg;
+        if (query_cfg.false_stats_cluster_members != nullptr && qi < truth_sets.size()) {
+            query_cfg.false_stats_true_topk_rows = &truth_sets[qi];
+        }
+        OverlapScheduler scheduler(index, reader, query_cfg);
         auto t0 = std::chrono::steady_clock::now();
         auto sr = scheduler.Search(qry.data.data() + static_cast<size_t>(qi) * dim);
         latencies[qi] = std::chrono::duration<double, std::milli>(
@@ -424,7 +684,7 @@ int main(int argc, char* argv[]) {
         for (const auto& res : sr.results()) {
             if (!res.payload.empty()) {
                 results[qi].push_back(
-                    static_cast<uint32_t>(res.payload[0].fixed.i64));
+                    static_cast<int64_t>(res.payload[0].fixed.i64));
             }
         }
 
@@ -436,6 +696,10 @@ int main(int argc, char* argv[]) {
         s2_safein       += st.s2_safe_in;
         s2_safeout      += st.s2_safe_out;
         s2_uncertain    += st.s2_uncertain;
+        s1_false_safein += st.s1_false_safe_in;
+        s1_false_safeout += st.s1_false_safe_out;
+        s2_false_safein += st.s2_false_safe_in;
+        s2_false_safeout += st.s2_false_safe_out;
         final_uncertain += st.total_uncertain;
         total_probed_clusters += st.crc_clusters_probed > 0
             ? st.crc_clusters_probed
@@ -461,10 +725,10 @@ int main(int argc, char* argv[]) {
         uint32_t valid = 0;
         double sum = 0.0;
         for (uint32_t qi = 0; qi < Q && qi < gt_ids.size(); ++qi) {
-            std::unordered_set<uint32_t> gt_set;
+            std::unordered_set<int64_t> gt_set;
             uint32_t gt_limit = std::min(at_k, static_cast<uint32_t>(gt_ids[qi].size()));
             for (uint32_t i = 0; i < gt_limit; ++i)
-                gt_set.insert(static_cast<uint32_t>(gt_ids[qi][i]));
+                gt_set.insert(gt_ids[qi][i]);
             if (gt_set.empty()) continue;
             uint32_t hits = 0;
             uint32_t check_limit = std::min(at_k, static_cast<uint32_t>(results[qi].size()));
@@ -524,6 +788,10 @@ int main(int argc, char* argv[]) {
     Log("    SafeIn    = %lu (%.2f%%)\n", s1_safein, pct(s1_safein, s1_total));
     Log("    SafeOut   = %lu (%.2f%%)\n", s1_safeout, pct(s1_safeout, s1_total));
     Log("    Uncertain = %lu (%.2f%%)\n", s1_uncertain, pct(s1_uncertain, s1_total));
+    Log("    False SafeIn  = %lu (%.4f%% of S1 SafeIn)\n",
+        s1_false_safein, pct(s1_false_safein, s1_safein));
+    Log("    False SafeOut = %lu (%.4f%% of S1 SafeOut)\n",
+        s1_false_safeout, pct(s1_false_safeout, s1_safeout));
 
     if (bits > 1) {
         uint64_t s2_total = s2_safein + s2_safeout + s2_uncertain;
@@ -531,6 +799,10 @@ int main(int argc, char* argv[]) {
         Log("    SafeIn    = %lu (%.2f%%)\n", s2_safein, pct(s2_safein, s2_total));
         Log("    SafeOut   = %lu (%.2f%%)\n", s2_safeout, pct(s2_safeout, s2_total));
         Log("    Uncertain = %lu (%.2f%%)\n", s2_uncertain, pct(s2_uncertain, s2_total));
+        Log("    False SafeIn  = %lu (%.4f%% of S2 SafeIn)\n",
+            s2_false_safein, pct(s2_false_safein, s2_safein));
+        Log("    False SafeOut = %lu (%.4f%% of S2 SafeOut)\n",
+            s2_false_safeout, pct(s2_false_safeout, s2_safeout));
         Log("    Final Uncertain = %lu\n", final_uncertain);
     }
 
@@ -555,7 +827,15 @@ int main(int argc, char* argv[]) {
         jf << "  \"nprobe\": " << nprobe << ",\n";
         jf << "  \"top_k\": " << top_k << ",\n";
         jf << "  \"bits\": " << static_cast<int>(bits) << ",\n";
+        jf << "  \"metric\": \"" << metric << "\",\n";
         jf << "  \"crc\": " << (use_crc ? "true" : "false") << ",\n";
+        jf << "  \"safein_dk_percentile\": " << safein_dk_percentile << ",\n";
+        jf << "  \"safein_d_k\": " << runtime_safein_dk << ",\n";
+        jf << "  \"safein_epsilon_percentile\": " << safein_epsilon_percentile << ",\n";
+        jf << "  \"safein_epsilon\": " << runtime_safein_eps << ",\n";
+        jf << "  \"safeout_epsilon_percentile\": " << safeout_epsilon_percentile << ",\n";
+        jf << "  \"safeout_epsilon\": " << runtime_safeout_eps << ",\n";
+        jf << "  \"enable_stage1_safein\": " << (enable_stage1_safein ? "true" : "false") << ",\n";
         jf << "  \"recall_at_1\": " << recall_1 << ",\n";
         jf << "  \"recall_at_5\": " << recall_5 << ",\n";
         jf << "  \"recall_at_10\": " << recall_10 << ",\n";
@@ -566,7 +846,17 @@ int main(int argc, char* argv[]) {
         jf << "  \"latency_p99_ms\": " << p99 << ",\n";
         jf << "  \"build_time_ms\": " << build_time_ms << ",\n";
         jf << "  \"avg_probed\": " << avg_probed << ",\n";
-        jf << "  \"early_stop_rate\": " << early_stop_rate << "\n";
+        jf << "  \"early_stop_rate\": " << early_stop_rate << ",\n";
+        jf << "  \"s1_safein\": " << s1_safein << ",\n";
+        jf << "  \"s1_safeout\": " << s1_safeout << ",\n";
+        jf << "  \"s1_uncertain\": " << s1_uncertain << ",\n";
+        jf << "  \"s1_false_safein\": " << s1_false_safein << ",\n";
+        jf << "  \"s1_false_safeout\": " << s1_false_safeout << ",\n";
+        jf << "  \"s2_safein\": " << s2_safein << ",\n";
+        jf << "  \"s2_safeout\": " << s2_safeout << ",\n";
+        jf << "  \"s2_uncertain\": " << s2_uncertain << ",\n";
+        jf << "  \"s2_false_safein\": " << s2_false_safein << ",\n";
+        jf << "  \"s2_false_safeout\": " << s2_false_safeout << "\n";
         jf << "}\n";
         jf.close();
         Log("\nJSON results written to: %s\n", json_path.c_str());

@@ -259,5 +259,43 @@ StatusOr<NpyArrayInt64Matrix> LoadNpyInt64Matrix(const std::string& path) {
     return arr;
 }
 
+// =============================================================================
+// LoadNpyInt32Matrix
+// =============================================================================
+
+StatusOr<NpyArrayInt32Matrix> LoadNpyInt32Matrix(const std::string& path) {
+    auto hdr_result = ParseNpyHeader(path);
+    if (!hdr_result.ok()) return hdr_result.status();
+
+    const auto& hdr = hdr_result.value();
+
+    if (hdr.descr != "<i4" && hdr.descr != "=i4") {
+        return Status::InvalidArgument(
+            "Expected int32 (<i4) dtype, got: " + hdr.descr);
+    }
+    if (hdr.fortran_order) {
+        return Status::InvalidArgument("Fortran order not supported");
+    }
+    if (hdr.shape.size() != 2) {
+        return Status::InvalidArgument(
+            "Expected 2-D int32 matrix in npy file: " + path);
+    }
+
+    NpyArrayInt32Matrix arr;
+    arr.rows = hdr.shape[0];
+    arr.cols = hdr.shape[1];
+    arr.data.resize(static_cast<size_t>(arr.rows) * arr.cols);
+
+    std::ifstream f(path, std::ios::binary);
+    f.seekg(hdr.data_offset);
+    f.read(reinterpret_cast<char*>(arr.data.data()),
+           static_cast<std::streamsize>(arr.data.size() * sizeof(int32_t)));
+    if (!f.good()) {
+        return Status::IOError("Failed to read npy data from: " + path);
+    }
+
+    return arr;
+}
+
 }  // namespace io
 }  // namespace vdb

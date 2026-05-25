@@ -101,6 +101,46 @@ TEST_F(IvfBuilderTest, Build_Basic) {
     EXPECT_GT(builder.calibrated_dk(), 0.0f);
 }
 
+TEST_F(IvfBuilderTest, Build_RabitqSafeInDkCalibration_FullAndNProbe) {
+    constexpr uint32_t N = 96;
+    constexpr Dim dim = 64;
+    constexpr uint32_t nlist = 4;
+
+    auto vecs = GenerateVectors(N, dim, 7);
+
+    for (SafeInDkSearchScope scope : {SafeInDkSearchScope::FullDatabase,
+                                      SafeInDkSearchScope::NProbe}) {
+        const std::string out_dir = test_dir_ + (
+            scope == SafeInDkSearchScope::FullDatabase ? "/full" : "/nprobe");
+        fs::create_directories(out_dir);
+
+        IvfBuilderConfig cfg;
+        cfg.nlist = nlist;
+        cfg.max_iterations = 8;
+        cfg.seed = 7;
+        cfg.rabitq = {4, 64, 5.75f};
+        cfg.calibration_samples = 12;
+        cfg.calibration_topk = 5;
+        cfg.calibration_percentile = 0.95f;
+        cfg.safein_dk_space = SafeInDkSpace::RabitqS2;
+        cfg.safein_dk_search_scope = scope;
+        cfg.safein_dk_nprobe = 2;
+        cfg.page_size = 1;
+
+        IvfBuilder builder(cfg);
+        auto s = builder.Build(vecs.data(), N, dim, out_dir);
+        ASSERT_TRUE(s.ok()) << s.message();
+        EXPECT_GT(builder.calibrated_safein_dk(), 0.0f);
+
+        IvfIndex idx;
+        ASSERT_TRUE(idx.Open(out_dir).ok());
+        EXPECT_TRUE(idx.conann().has_safein_d_k());
+        EXPECT_GT(idx.conann().safein_d_k(), 0.0f);
+        EXPECT_EQ(idx.safein_dk_space(), SafeInDkSpace::RabitqS2);
+        EXPECT_EQ(idx.safein_dk_search_scope(), scope);
+    }
+}
+
 // ============================================================================
 // Assignment completeness: every vector is assigned to exactly one cluster
 // ============================================================================

@@ -9,6 +9,8 @@
 #include "vdb/common/status.h"
 #include "vdb/common/types.h"
 #include "vdb/index/ivf_metadata.h"
+#include "vdb/rabitq/rabitq_encoder.h"
+#include "vdb/rabitq/rabitq_rotation.h"
 
 namespace vdb {
 namespace index {
@@ -63,6 +65,24 @@ struct IvfBuilderConfig {
 
     /// Percentile for d_k calibration (0–1, e.g. 0.99).
     float calibration_percentile = 0.99f;
+
+    /// SafeIn d_k calibration space. Legacy exact-L2 remains available for
+    /// compatibility; RabitQ S2 aligns the threshold with serving classification.
+    SafeInDkSpace safein_dk_space = SafeInDkSpace::ExactL2;
+
+    /// Candidate domain used for SafeIn d_k calibration in RabitQ space.
+    SafeInDkSearchScope safein_dk_search_scope = SafeInDkSearchScope::FullDatabase;
+
+    /// Number of pseudo-query samples for SafeIn d_k calibration.
+    /// Zero reuses calibration_samples.
+    uint32_t safein_dk_calibration_samples = 0;
+
+    /// Percentile for SafeIn d_k calibration. Negative values reuse
+    /// calibration_percentile.
+    float safein_dk_percentile = -1.0f;
+
+    /// nprobe used when safein_dk_search_scope == NProbe. Zero reuses config nprobe.
+    uint32_t safein_dk_nprobe = 0;
 
     /// Page size for DataFile alignment (bytes). 1 = no padding.
     uint32_t page_size = 1;
@@ -226,6 +246,9 @@ class IvfBuilder {
     /// Get the calibrated d_k from the last Build() call.
     float calibrated_dk() const { return calibrated_dk_; }
 
+    /// Get the calibrated SafeIn d_k from the last Build() call.
+    float calibrated_safein_dk() const { return calibrated_safein_dk_; }
+
  private:
     // ----- Internal helpers -----
 
@@ -234,6 +257,15 @@ class IvfBuilder {
 
     /// Phase B: calibrate ConANN d_k by sampling.
     void CalibrateDk(const float* vectors, uint32_t N, Dim dim);
+
+    /// Phase C: calibrate SafeIn d_k in RabitQ Stage2 space once codes and
+    /// rotation are available.
+    void CalibrateSafeInDk(const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+                           const std::vector<std::vector<uint32_t>>& cluster_members,
+                           const float* vectors,
+                           uint32_t N,
+                           Dim dim,
+                           const rabitq::RotationMatrix& rotation);
 
     /// Derive secondary assignments from final centroids for top-2
     /// redundant-assignment mode.
@@ -252,6 +284,7 @@ class IvfBuilder {
     std::vector<uint32_t> secondary_assignments_;
     std::vector<float> centroids_;       // nlist × dim row-major
     float calibrated_dk_ = 0.0f;
+    float calibrated_safein_dk_ = 0.0f;
     float calibrated_eps_ip_ = 0.0f;
     AssignmentMode assignment_mode_ = AssignmentMode::Single;
     float rair_lambda_ = 0.75f;

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_set>
+#include <vector>
 
 #include "vdb/common/types.h"
 #include "vdb/index/crc_stopper.h"
@@ -62,8 +64,17 @@ struct SearchConfig {
     bool enable_rerank_batched_distance_simd = true;
     bool enable_coarse_select_simd = true;
     bool enable_coarse_select_phase2 = false;
+    bool enable_stage1_safein = true;
     bool enable_stage2_collect_block_first = true;
     bool enable_stage2_scatter_batch_classify = true;
+    float safein_epsilon_override = -1.0f;
+    float safeout_epsilon_override = -1.0f;
+
+    // Optional benchmark-only truth metadata for per-stage false classification
+    // counters. cluster_members maps cluster-local vector offsets to original
+    // database row ids; true_topk_rows is the current query's GT top-k set.
+    const std::vector<std::vector<uint32_t>>* false_stats_cluster_members = nullptr;
+    const std::unordered_set<uint32_t>* false_stats_true_topk_rows = nullptr;
 };
 
 struct SearchStats {
@@ -141,6 +152,10 @@ struct SearchStats {
     uint32_t s2_safe_in = 0;
     uint32_t s2_safe_out = 0;
     uint32_t s2_uncertain = 0;
+    uint32_t s1_false_safe_in = 0;
+    uint32_t s1_false_safe_out = 0;
+    uint32_t s2_false_safe_in = 0;
+    uint32_t s2_false_safe_out = 0;
     // Fine-grained timing breakdown (ms)
     double uring_prep_ms = 0;    // io_uring PrepRead() calls in AsyncIOSink batch submit path
     double uring_submit_ms = 0;  // reader_.Submit() calls in pipeline

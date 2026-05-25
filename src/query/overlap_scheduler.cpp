@@ -1049,7 +1049,14 @@ OverlapScheduler::PrepareClusterQueryView(const SearchContext& ctx,
     }
     view.prepared = pq;
     view.scratch = &query_wrapper_.scratch;
-    view.margin_factor = 2.0f * pq->norm_qc * index_.conann().epsilon();
+    const float safein_eps = (config_.safein_epsilon_override >= 0.0f)
+        ? config_.safein_epsilon_override
+        : index_.conann().epsilon();
+    const float safeout_eps = (config_.safeout_epsilon_override >= 0.0f)
+        ? config_.safeout_epsilon_override
+        : index_.conann().epsilon();
+    view.safein_margin_factor = 2.0f * pq->norm_qc * safein_eps;
+    view.safeout_margin_factor = 2.0f * pq->norm_qc * safeout_eps;
     return view;
 }
 
@@ -1082,22 +1089,24 @@ void OverlapScheduler::ProbeCluster(
 
     // dynamic_d_k:
     // - When CRC is disabled, keep +inf to avoid any estimate-driven SafeOut.
-    // - When CRC is enabled, use a conservative floor at the static ConANN d_k.
-    //   This prevents under-estimated est_heap thresholds from over-pruning
-    //   Stage1/Stage2 candidates before rerank has stabilized the frontier.
+    // - When CRC is enabled and the estimate heap is full, use the current
+    //   query-time estimated kth distance directly.
     float dynamic_d_k = std::numeric_limits<float>::infinity();
     if (use_crc_ && est_heap_.size() >= est_top_k_) {
-        dynamic_d_k = std::max(est_heap_.front().first, index_.conann().d_k());
+        dynamic_d_k = est_heap_.front().first;
     }
 
     AsyncIOSink sink(*this, ctx, dat_fd);
     index::ProbeStats local_stats;
     auto classify_start = std::chrono::steady_clock::now();
-    prober_.Probe(pc, prepared, prepared.margin_factor, dynamic_d_k,
+    prober_.Probe(pc, cluster_id, prepared, dynamic_d_k,
                   config_.enable_address_decode_simd,
                   config_.enable_fine_grained_timing,
+                  config_.enable_stage1_safein,
                   config_.enable_stage2_collect_block_first,
                   config_.enable_stage2_scatter_batch_classify,
+                  config_.false_stats_cluster_members,
+                  config_.false_stats_true_topk_rows,
                   sink, local_stats);
     const double classify_wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - classify_start).count();
@@ -1149,6 +1158,10 @@ void OverlapScheduler::ProbeCluster(
     ctx.stats().s2_safe_in      += local_stats.s2_safein;
     ctx.stats().s2_safe_out     += local_stats.s2_safeout;
     ctx.stats().s2_uncertain    += local_stats.s2_uncertain;
+    ctx.stats().s1_false_safe_in += local_stats.s1_false_safein;
+    ctx.stats().s1_false_safe_out += local_stats.s1_false_safeout;
+    ctx.stats().s2_false_safe_in += local_stats.s2_false_safein;
+    ctx.stats().s2_false_safe_out += local_stats.s2_false_safeout;
     ctx.stats().total_uncertain +=
         local_stats.s1_uncertain - local_stats.s2_safein - local_stats.s2_safeout;
 }

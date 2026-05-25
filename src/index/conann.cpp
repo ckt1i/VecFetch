@@ -22,8 +22,19 @@ namespace index {
 ConANN::ConANN(float epsilon, float d_k)
     : epsilon_(epsilon),
       d_k_(d_k),
-      tau_in_(d_k - 2.0f * epsilon),
+      safein_d_k_(d_k),
+      has_safein_d_k_(false),
+      tau_in_(safein_d_k_ - 2.0f * epsilon),
       tau_out_(d_k + 2.0f * epsilon) {}
+
+ConANN::ConANN(float epsilon, float legacy_d_k, float safein_d_k,
+               bool has_safein_d_k)
+    : epsilon_(epsilon),
+      d_k_(legacy_d_k),
+      safein_d_k_(has_safein_d_k ? safein_d_k : legacy_d_k),
+      has_safein_d_k_(has_safein_d_k),
+      tau_in_(safein_d_k_ - 2.0f * epsilon),
+      tau_out_(legacy_d_k + 2.0f * epsilon) {}
 
 ConANN ConANN::FromConfig(const RaBitQConfig& cfg, Dim dim, float d_k) {
     // epsilon = c_factor * 2^(-bits/2) / sqrt(dim)
@@ -51,7 +62,7 @@ ResultClass ConANN::Classify(float approx_dist, float margin) const {
     if (approx_dist > d_k_ + 2 * margin) {
         return ResultClass::SafeOut;
     }
-    if (approx_dist < d_k_ - 2 * margin) {
+    if (approx_dist < safein_d_k_ - 2 * margin) {
         return ResultClass::SafeIn;
     }
     return ResultClass::Uncertain;
