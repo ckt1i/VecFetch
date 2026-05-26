@@ -13,6 +13,11 @@
 namespace vdb {
 namespace bench {
 
+enum class SafeInDkSamplingMode {
+    Unique,
+    WithReplacement,
+};
+
 StatusOr<std::vector<uint32_t>> LoadAssignments(const std::string& path,
                                                 uint32_t expected_rows);
 
@@ -36,6 +41,27 @@ void EncodeAllCodes(const std::vector<float>& base_data,
                     uint8_t bits,
                     const std::vector<uint32_t>* cluster_subset,
                     std::vector<std::vector<rabitq::RaBitQCode>>* all_codes);
+
+std::vector<float> GenerateRabitqSafeInDkSamples(
+    const float* queries,
+    uint32_t q,
+    Dim dim,
+    uint32_t top_k,
+    uint32_t sample_queries,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<float>& centroids,
+    const rabitq::RotationMatrix& rotation,
+    uint8_t bits,
+    uint64_t seed,
+    SafeInDkSamplingMode sampling_mode,
+    const index::IvfIndex* index = nullptr,
+    index::SafeInDkSearchScope search_scope =
+        index::SafeInDkSearchScope::FullDatabase,
+    uint32_t nprobe = 0);
+
+float SelectSafeInDkFromSamples(const std::vector<float>& samples,
+                                float percentile);
 
 float CalibrateRabitqSafeInDk(
     const float* queries,
@@ -70,6 +96,9 @@ float CalibrateSplitEpsilon(
     const std::vector<uint32_t>* cluster_subset);
 
 StatusOr<index::SafeInDkSearchScope> ParseSafeInDkSearchScopeArg(
+    const std::string& value);
+
+StatusOr<SafeInDkSamplingMode> ParseSafeInDkSamplingModeArg(
     const std::string& value);
 
 }  // namespace bench

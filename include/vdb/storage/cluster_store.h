@@ -174,6 +174,7 @@ class ClusterStoreReader {
     uint64_t total_records() const;
 
     Status EnsureClusterLoaded(uint32_t cluster_id);
+    Status UnloadCluster(uint32_t cluster_id);
     AddressEntry GetAddress(uint32_t cluster_id, uint32_t record_idx) const;
     std::vector<AddressEntry> GetAddresses(
         uint32_t cluster_id,

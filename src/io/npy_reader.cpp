@@ -1,7 +1,9 @@
 #include "vdb/io/npy_reader.h"
 
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 
 namespace vdb {
@@ -181,6 +183,55 @@ StatusOr<NpyArrayFloat> LoadNpyFloat32(const std::string& path) {
     }
 
     return arr;
+}
+
+Status SaveNpyFloat32Vector(const std::string& path,
+                            const std::vector<float>& values) {
+    const auto parent = std::filesystem::path(path).parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            return Status::IOError(
+                "Failed to create parent directory for npy file: " + path);
+        }
+    }
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        return Status::IOError("Failed to open npy file for write: " + path);
+    }
+
+    f.write(reinterpret_cast<const char*>(kNpyMagic), sizeof(kNpyMagic));
+    const uint8_t version[2] = {1, 0};
+    f.write(reinterpret_cast<const char*>(version), sizeof(version));
+
+    std::ostringstream header_ss;
+    header_ss << "{'descr': '<f4', 'fortran_order': False, 'shape': ("
+              << values.size() << ",), }";
+    std::string header = header_ss.str();
+    const size_t prefix_bytes = sizeof(kNpyMagic) + sizeof(version) + sizeof(uint16_t);
+    size_t header_len = header.size() + 1;  // newline
+    const size_t total_mod = (prefix_bytes + header_len) % 16;
+    if (total_mod != 0) {
+        header.append(16 - total_mod, ' ');
+    }
+    header.push_back('\n');
+
+    if (header.size() > 65535) {
+        return Status::InvalidArgument("NPY header too large for v1.0: " + path);
+    }
+    const uint16_t header_size = static_cast<uint16_t>(header.size());
+    f.write(reinterpret_cast<const char*>(&header_size), sizeof(header_size));
+    f.write(header.data(), static_cast<std::streamsize>(header.size()));
+
+    if (!values.empty()) {
+        f.write(reinterpret_cast<const char*>(values.data()),
+                static_cast<std::streamsize>(values.size() * sizeof(float)));
+    }
+    if (!f.good()) {
+        return Status::IOError("Failed to write npy data to: " + path);
+    }
+    return Status::OK();
 }
 
 // =============================================================================

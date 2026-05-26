@@ -1013,6 +1013,14 @@ Status ClusterStoreReader::EnsureClusterLoaded(uint32_t cluster_id) {
     return Status::OK();
 }
 
+Status ClusterStoreReader::UnloadCluster(uint32_t cluster_id) {
+    if (resident_preload_ready_) {
+        return Status::OK();
+    }
+    loaded_clusters_.erase(cluster_id);
+    return Status::OK();
+}
+
 std::optional<query::ClusterBlockLocation>
 ClusterStoreReader::GetBlockLocation(uint32_t cluster_id) const {
     auto it = cluster_index_.find(cluster_id);

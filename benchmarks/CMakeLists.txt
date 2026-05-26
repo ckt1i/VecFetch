@@ -15,6 +15,11 @@ add_executable(bench_e2e bench_e2e.cpp rabitq_bench_calibration.cpp)
 target_link_libraries(bench_e2e PRIVATE vdb_query vdb_io vdb_crc)
 vdb_enable_target_avx512(bench_e2e)
 
+# ----- Offline SafeIn d_k samples generator -----
+add_executable(bench_safein_dk_samples bench_safein_dk_samples.cpp rabitq_bench_calibration.cpp)
+target_link_libraries(bench_safein_dk_samples PRIVATE vdb_index vdb_io)
+vdb_enable_target_avx512(bench_safein_dk_samples)
+
 # ----- ExRaBitQ Payload Compare Utility -----
 add_executable(bench_compare_exrabitq_payloads bench_compare_exrabitq_payloads.cpp)
 target_link_libraries(bench_compare_exrabitq_payloads PRIVATE vdb_storage)

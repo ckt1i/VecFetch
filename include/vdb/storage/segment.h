@@ -85,6 +85,11 @@ class Segment {
         return clu_reader_.EnsureClusterLoaded(cluster_id);
     }
 
+    /// Release a lazily loaded cluster from the reader cache.
+    Status UnloadCluster(uint32_t cluster_id) {
+        return clu_reader_.UnloadCluster(cluster_id);
+    }
+
     /// Get a decoded address entry.
     AddressEntry GetAddress(uint32_t cluster_id, uint32_t record_idx) const {
         return clu_reader_.GetAddress(cluster_id, record_idx);

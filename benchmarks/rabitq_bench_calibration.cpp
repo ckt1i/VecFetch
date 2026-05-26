@@ -44,6 +44,20 @@ std::vector<uint32_t> SampleIndices(uint32_t total, uint32_t num_samples,
     return ids;
 }
 
+std::vector<uint32_t> SampleIndicesWithReplacement(uint32_t total,
+                                                   uint32_t num_samples,
+                                                   uint64_t seed) {
+    std::vector<uint32_t> ids;
+    if (total == 0 || num_samples == 0) return ids;
+    ids.reserve(num_samples);
+    std::mt19937_64 rng(seed == 0 ? std::random_device{}() : seed);
+    std::uniform_int_distribution<uint32_t> dist(0, total - 1);
+    for (uint32_t i = 0; i < num_samples; ++i) {
+        ids.push_back(dist(rng));
+    }
+    return ids;
+}
+
 }  // namespace
 
 StatusOr<std::vector<uint32_t>> LoadAssignments(const std::string& path,
@@ -169,26 +183,28 @@ void EncodeAllCodes(const std::vector<float>& base_data,
     }
 }
 
-float CalibrateRabitqSafeInDk(
+std::vector<float> GenerateRabitqSafeInDkSamples(
     const float* queries,
     uint32_t q,
     Dim dim,
     uint32_t top_k,
     uint32_t sample_queries,
-    float percentile,
     const std::vector<std::vector<uint32_t>>& cluster_members,
     const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
     const std::vector<float>& centroids,
     const rabitq::RotationMatrix& rotation,
     uint8_t bits,
     uint64_t seed,
+    SafeInDkSamplingMode sampling_mode,
     const index::IvfIndex* index,
     index::SafeInDkSearchScope search_scope,
     uint32_t nprobe) {
     rabitq::RaBitQEstimator estimator(dim, bits);
     rabitq::PreparedQuery pq;
     rabitq::ClusterPreparedScratch scratch;
-    const auto sampled = SampleIndices(q, sample_queries, seed);
+    const auto sampled = (sampling_mode == SafeInDkSamplingMode::WithReplacement)
+        ? SampleIndicesWithReplacement(q, sample_queries, seed)
+        : SampleIndices(q, sample_queries, seed);
     std::vector<float> query_kths;
     query_kths.reserve(sampled.size());
 
@@ -229,7 +245,35 @@ float CalibrateRabitqSafeInDk(
         std::nth_element(dists.begin(), dists.begin() + kth, dists.end());
         query_kths.push_back(dists[kth]);
     }
-    return ConannPercentile(std::move(query_kths), percentile);
+    return query_kths;
+}
+
+float SelectSafeInDkFromSamples(const std::vector<float>& samples,
+                                float percentile) {
+    return ConannPercentile(samples, percentile);
+}
+
+float CalibrateRabitqSafeInDk(
+    const float* queries,
+    uint32_t q,
+    Dim dim,
+    uint32_t top_k,
+    uint32_t sample_queries,
+    float percentile,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<float>& centroids,
+    const rabitq::RotationMatrix& rotation,
+    uint8_t bits,
+    uint64_t seed,
+    const index::IvfIndex* index,
+    index::SafeInDkSearchScope search_scope,
+    uint32_t nprobe) {
+    auto samples = GenerateRabitqSafeInDkSamples(
+        queries, q, dim, top_k, sample_queries, cluster_members, all_codes,
+        centroids, rotation, bits, seed, SafeInDkSamplingMode::Unique, index,
+        search_scope, nprobe);
+    return SelectSafeInDkFromSamples(samples, percentile);
 }
 
 float CalibrateSplitEpsilon(
@@ -310,6 +354,17 @@ StatusOr<index::SafeInDkSearchScope> ParseSafeInDkSearchScopeArg(
     return Status::InvalidArgument(
         "Invalid safein_dk_search_scope: " + value +
         " (expected full or nprobe)");
+}
+
+StatusOr<SafeInDkSamplingMode> ParseSafeInDkSamplingModeArg(
+    const std::string& value) {
+    if (value == "unique") return SafeInDkSamplingMode::Unique;
+    if (value == "with_replacement") {
+        return SafeInDkSamplingMode::WithReplacement;
+    }
+    return Status::InvalidArgument(
+        "Invalid safein_dk_sampling_mode: " + value +
+        " (expected unique or with_replacement)");
 }
 
 }  // namespace bench

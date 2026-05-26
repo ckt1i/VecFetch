@@ -39,6 +39,10 @@ struct NpyArrayInt32Matrix {
 /// Load a float32 .npy file. Returns error if dtype != <f4.
 StatusOr<NpyArrayFloat> LoadNpyFloat32(const std::string& path);
 
+/// Save a 1-D float32 vector to a .npy file as C-order <f4 array.
+Status SaveNpyFloat32Vector(const std::string& path,
+                            const std::vector<float>& values);
+
 /// Load an int64 .npy file. Returns error if dtype != <i8.
 StatusOr<NpyArrayInt64> LoadNpyInt64(const std::string& path);
 

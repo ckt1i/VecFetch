@@ -372,6 +372,15 @@ static std::string JBool(const std::string& k, bool v) {
     return "\"" + k + "\": " + (v ? "true" : "false");
 }
 
+static float SelectPercentileForLog(std::vector<float> values, float percentile) {
+    if (values.empty()) return 0.0f;
+    std::sort(values.begin(), values.end());
+    const float index = percentile * static_cast<float>(values.size() - 1);
+    const size_t k = static_cast<size_t>(
+        std::min(index, static_cast<float>(values.size() - 1)));
+    return values[k];
+}
+
 static std::string JArr64(const std::string& k, const std::vector<int64_t>& v) {
     std::string s = "\"" + k + "\": [";
     for (size_t i = 0; i < v.size(); ++i) {
@@ -1464,8 +1473,16 @@ int main(int argc, char* argv[]) {
         GetFloatArg(argc, argv, "--safein-dk-percentile", -1.0f);
     int arg_safein_dk_samples =
         GetIntArg(argc, argv, "--safein-dk-samples", 0);
+    std::string arg_safein_dk_samples_output =
+        GetStringArg(argc, argv, "--safein-dk-samples-output", "");
+    std::string arg_safein_dk_samples_input =
+        GetStringArg(argc, argv, "--safein-dk-samples-input", "");
+    int arg_safein_dk_samples_only =
+        GetIntArg(argc, argv, "--safein-dk-samples-only", 0);
     float arg_safein_epsilon_percentile =
         GetFloatArg(argc, argv, "--safein-epsilon-percentile", -1.0f);
+    float arg_safein_epsilon_override =
+        GetFloatArg(argc, argv, "--safein-epsilon-override", -1.0f);
     float arg_safeout_epsilon_percentile =
         GetFloatArg(argc, argv, "--safeout-epsilon-percentile", -1.0f);
     int arg_enable_stage1_safein =
@@ -1479,10 +1496,39 @@ int main(int argc, char* argv[]) {
     SafeInDkSearchScope arg_safein_dk_search_scope = safein_dk_scope_or.value();
     int arg_safein_dk_nprobe =
         GetIntArg(argc, argv, "--safein-dk-nprobe", arg_nprobe);
+    auto safein_dk_sampling_mode_or = ParseSafeInDkSamplingModeArg(
+        GetStringArg(argc, argv, "--safein-dk-sampling-mode", "unique"));
+    if (!safein_dk_sampling_mode_or.ok()) {
+        std::fprintf(stderr, "%s\n",
+                     safein_dk_sampling_mode_or.status().ToString().c_str());
+        return 1;
+    }
+    SafeInDkSamplingMode arg_safein_dk_sampling_mode =
+        safein_dk_sampling_mode_or.value();
     if (arg_enable_stage1_safein != 0 && arg_enable_stage1_safein != 1) {
         std::fprintf(stderr,
                      "Invalid --enable-stage1-safein: %d (expected 0 or 1)\n",
                      arg_enable_stage1_safein);
+        return 1;
+    }
+    if (arg_safein_dk_samples_only != 0 && arg_safein_dk_samples_only != 1) {
+        std::fprintf(stderr,
+                     "Invalid --safein-dk-samples-only: %d (expected 0 or 1)\n",
+                     arg_safein_dk_samples_only);
+        return 1;
+    }
+    if (!arg_safein_dk_samples_input.empty() &&
+        !arg_safein_dk_samples_output.empty()) {
+        std::fprintf(stderr,
+                     "Cannot use --safein-dk-samples-input and "
+                     "--safein-dk-samples-output together\n");
+        return 1;
+    }
+    if (arg_safein_dk_samples_only != 0 &&
+        arg_safein_dk_samples_output.empty()) {
+        std::fprintf(stderr,
+                     "--safein-dk-samples-only requires "
+                     "--safein-dk-samples-output\n");
         return 1;
     }
 
@@ -1560,6 +1606,20 @@ int main(int argc, char* argv[]) {
     int q_limit = GetIntArg(argc, argv, "--queries", 0);
     uint32_t Q = (q_limit > 0 && static_cast<uint32_t>(q_limit) < Q_total)
                      ? static_cast<uint32_t>(q_limit) : Q_total;
+    uint32_t safein_dk_available_queries = Q;
+    uint32_t safein_dk_requested_samples =
+        (arg_safein_dk_samples > 0) ? static_cast<uint32_t>(arg_safein_dk_samples) : Q;
+    uint32_t safein_dk_samples_count = 0;
+    std::string effective_safein_dk_sampling_mode =
+        (arg_safein_dk_sampling_mode == SafeInDkSamplingMode::WithReplacement)
+            ? "with_replacement"
+            : "unique";
+    if (safein_dk_requested_samples > safein_dk_available_queries &&
+        arg_safein_dk_sampling_mode == SafeInDkSamplingMode::Unique) {
+        effective_safein_dk_sampling_mode = "with_replacement";
+        Log("  SafeIn d_k sampling auto-switch: requested_samples=%u available_queries=%u -> with_replacement\n",
+            safein_dk_requested_samples, safein_dk_available_queries);
+    }
 
     Log("  Images: %u, Queries: %u/%u, Dim: %u\n", N, Q, Q_total, dim);
 
@@ -1790,8 +1850,12 @@ int main(int argc, char* argv[]) {
     }
     float runtime_safein_epsilon = index.conann().epsilon();
     float runtime_safeout_epsilon = index.conann().epsilon();
+    std::vector<float> safein_dk_sample_values;
+    const bool has_safein_epsilon_override =
+        arg_safein_epsilon_percentile >= 0.0f ||
+        arg_safein_epsilon_override >= 0.0f;
     const bool split_safein_safeout_eps =
-        arg_safein_epsilon_percentile >= 0.0f &&
+        has_safein_epsilon_override ||
         arg_safeout_epsilon_percentile >= 0.0f;
 
     std::unordered_map<int64_t, uint32_t> image_id_to_row;
@@ -1829,9 +1893,17 @@ int main(int argc, char* argv[]) {
     }
 
     if (arg_safein_dk_percentile >= 0.0f ||
-        arg_safein_epsilon_percentile >= 0.0f ||
+        !arg_safein_dk_samples_input.empty() ||
+        !arg_safein_dk_samples_output.empty() ||
+        has_safein_epsilon_override ||
         arg_safeout_epsilon_percentile >= 0.0f) {
-        if (!have_cluster_members_for_stats) {
+        const bool need_calibration_codes =
+            !arg_safein_dk_samples_output.empty() ||
+            (arg_safein_dk_samples_input.empty() &&
+             arg_safein_dk_percentile >= 0.0f) ||
+            arg_safein_epsilon_percentile >= 0.0f ||
+            arg_safeout_epsilon_percentile >= 0.0f;
+        if (need_calibration_codes && !have_cluster_members_for_stats) {
             std::fprintf(stderr,
                          "SafeIn/SafeOut runtime calibration requires payload ids, "
                          "fresh assignments, or --assignments.\n");
@@ -1840,10 +1912,10 @@ int main(int argc, char* argv[]) {
         std::vector<std::vector<rabitq::RaBitQCode>> all_codes;
         std::vector<uint32_t> calibration_cluster_subset;
         const std::vector<uint32_t>* calibration_cluster_subset_ptr = nullptr;
-        if (arg_safein_dk_search_scope == SafeInDkSearchScope::NProbe) {
-            const uint32_t dk_queries = (arg_safein_dk_samples > 0)
-                ? std::min<uint32_t>(static_cast<uint32_t>(arg_safein_dk_samples), Q)
-                : Q;
+        if (need_calibration_codes &&
+            arg_safein_dk_search_scope == SafeInDkSearchScope::NProbe) {
+            const uint32_t dk_queries = std::min<uint32_t>(
+                std::max<uint32_t>(safein_dk_requested_samples, 1u), Q);
             std::vector<uint32_t> sample_qids(dk_queries);
             std::iota(sample_qids.begin(), sample_qids.end(), 0u);
             std::unordered_set<uint32_t> cluster_set;
@@ -1862,22 +1934,86 @@ int main(int argc, char* argv[]) {
             Log("  SafeIn calibration cluster subset: %zu clusters (scope=nprobe, nprobe=%d)\n",
                 calibration_cluster_subset.size(), arg_safein_dk_nprobe);
         }
-        EncodeAllCodes(img_emb.data, N, dim, cluster_members_for_stats,
-                       index.centroids(), index.rotation(),
-                       static_cast<uint8_t>(arg_bits),
-                       calibration_cluster_subset_ptr, &all_codes);
+        if (need_calibration_codes) {
+            EncodeAllCodes(img_emb.data, N, dim, cluster_members_for_stats,
+                           index.centroids(), index.rotation(),
+                           static_cast<uint8_t>(arg_bits),
+                           calibration_cluster_subset_ptr, &all_codes);
+        }
 
-        if (arg_safein_dk_percentile >= 0.0f) {
-            const uint32_t dk_queries = (arg_safein_dk_samples > 0)
-                ? static_cast<uint32_t>(arg_safein_dk_samples)
-                : Q;
-            runtime_safein_d_k = CalibrateRabitqSafeInDk(
-                qry_emb.data.data(), Q, dim, GT_K, dk_queries,
-                arg_safein_dk_percentile, cluster_members_for_stats, all_codes,
-                index.centroids(), index.rotation(), static_cast<uint8_t>(arg_bits),
-                static_cast<uint64_t>(arg_seed), &index,
+        if (!arg_safein_dk_samples_input.empty()) {
+            auto dk_or = io::LoadNpyFloat32(arg_safein_dk_samples_input);
+            if (!dk_or.ok()) {
+                std::fprintf(stderr, "Failed to load safein d_k samples from %s: %s\n",
+                             arg_safein_dk_samples_input.c_str(),
+                             dk_or.status().ToString().c_str());
+                return 1;
+            }
+            safein_dk_sample_values = std::move(dk_or.value().data);
+            safein_dk_samples_count =
+                static_cast<uint32_t>(safein_dk_sample_values.size());
+            if (safein_dk_samples_count == 0) {
+                std::fprintf(stderr, "safein d_k samples input is empty: %s\n",
+                             arg_safein_dk_samples_input.c_str());
+                return 1;
+            }
+        } else if (!arg_safein_dk_samples_output.empty() ||
+                   arg_safein_dk_percentile >= 0.0f) {
+            const SafeInDkSamplingMode effective_mode =
+                (effective_safein_dk_sampling_mode == "with_replacement")
+                    ? SafeInDkSamplingMode::WithReplacement
+                    : SafeInDkSamplingMode::Unique;
+            safein_dk_sample_values = GenerateRabitqSafeInDkSamples(
+                qry_emb.data.data(), Q, dim, GT_K, safein_dk_requested_samples,
+                cluster_members_for_stats, all_codes, index.centroids(),
+                index.rotation(), static_cast<uint8_t>(arg_bits),
+                static_cast<uint64_t>(arg_seed), effective_mode, &index,
                 arg_safein_dk_search_scope,
                 static_cast<uint32_t>(std::max(1, arg_safein_dk_nprobe)));
+            safein_dk_samples_count =
+                static_cast<uint32_t>(safein_dk_sample_values.size());
+            if (safein_dk_samples_count == 0) {
+                std::fprintf(stderr,
+                             "SafeIn d_k sample generation produced no valid samples\n");
+                return 1;
+            }
+            if (!arg_safein_dk_samples_output.empty()) {
+                s = io::SaveNpyFloat32Vector(arg_safein_dk_samples_output,
+                                             safein_dk_sample_values);
+                if (!s.ok()) {
+                    std::fprintf(stderr,
+                                 "Failed to write safein d_k samples to %s: %s\n",
+                                 arg_safein_dk_samples_output.c_str(),
+                                 s.ToString().c_str());
+                    return 1;
+                }
+                Log("  SafeIn d_k samples written: %s\n",
+                    arg_safein_dk_samples_output.c_str());
+            }
+        }
+        if (!safein_dk_sample_values.empty()) {
+            const auto& samples = safein_dk_sample_values;
+            safein_dk_samples_count = static_cast<uint32_t>(samples.size());
+            Log("  SafeIn d_k samples: count=%u min=%.6f p50=%.6f p90=%.6f p95=%.6f p97=%.6f p98=%.6f p99=%.6f max=%.6f\n",
+                safein_dk_samples_count,
+                *std::min_element(samples.begin(), samples.end()),
+                SelectPercentileForLog(samples, 0.50f),
+                SelectPercentileForLog(samples, 0.90f),
+                SelectPercentileForLog(samples, 0.95f),
+                SelectPercentileForLog(samples, 0.97f),
+                SelectPercentileForLog(samples, 0.98f),
+                SelectPercentileForLog(samples, 0.99f),
+                *std::max_element(samples.begin(), samples.end()));
+        }
+        if (arg_safein_dk_percentile >= 0.0f && !safein_dk_sample_values.empty()) {
+            runtime_safein_d_k = SelectSafeInDkFromSamples(
+                safein_dk_sample_values, arg_safein_dk_percentile);
+            Log("  SafeIn d_k selected: percentile=%.4f value=%.6f\n",
+                arg_safein_dk_percentile, runtime_safein_d_k);
+        }
+        if (arg_safein_dk_samples_only != 0) {
+            Log("  SafeIn d_k samples-only mode complete. Exiting before query path.\n");
+            return 0;
         }
         if (arg_safein_epsilon_percentile >= 0.0f) {
             runtime_safein_epsilon = CalibrateSplitEpsilon(
@@ -1887,6 +2023,8 @@ int main(int argc, char* argv[]) {
                 arg_safein_epsilon_percentile, static_cast<uint64_t>(arg_seed),
                 runtime_safein_d_k, static_cast<uint8_t>(arg_bits),
                 calibration_cluster_subset_ptr);
+        } else if (arg_safein_epsilon_override >= 0.0f) {
+            runtime_safein_epsilon = arg_safein_epsilon_override;
         }
         if (arg_safeout_epsilon_percentile >= 0.0f) {
             runtime_safeout_epsilon = CalibrateSplitEpsilon(
@@ -2187,7 +2325,7 @@ int main(int argc, char* argv[]) {
     search_cfg.enable_stage1_safein = (arg_enable_stage1_safein != 0);
     search_cfg.enable_stage2_collect_block_first = (arg_stage2_block_first != 0);
     search_cfg.enable_stage2_scatter_batch_classify = (arg_stage2_batch_classify != 0);
-    if (arg_safein_epsilon_percentile >= 0.0f) {
+    if (has_safein_epsilon_override) {
         search_cfg.safein_epsilon_override = runtime_safein_epsilon;
     }
     if (arg_safeout_epsilon_percentile >= 0.0f) {
@@ -2575,12 +2713,19 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("runtime_safeout_epsilon", runtime_safeout_epsilon) << ",\n";
         f << "    " << JNum("safein_dk_percentile", arg_safein_dk_percentile) << ",\n";
         f << "    " << JInt("safein_dk_samples", arg_safein_dk_samples) << ",\n";
+        f << "    " << JStr("safein_dk_samples_input", arg_safein_dk_samples_input) << ",\n";
+        f << "    " << JStr("safein_dk_samples_output", arg_safein_dk_samples_output) << ",\n";
+        f << "    " << JInt("safein_dk_samples_count", safein_dk_samples_count) << ",\n";
+        f << "    " << JStr("safein_dk_sampling_mode", effective_safein_dk_sampling_mode) << ",\n";
+        f << "    " << JInt("safein_dk_available_queries", safein_dk_available_queries) << ",\n";
+        f << "    " << JInt("safein_dk_requested_samples", safein_dk_requested_samples) << ",\n";
         f << "    " << JStr("safein_dk_search_scope",
                              arg_safein_dk_search_scope == SafeInDkSearchScope::NProbe
                                  ? "nprobe"
                                  : "full") << ",\n";
         f << "    " << JInt("safein_dk_nprobe", arg_safein_dk_nprobe) << ",\n";
         f << "    " << JNum("safein_epsilon_percentile", arg_safein_epsilon_percentile) << ",\n";
+        f << "    " << JNum("safein_epsilon_override_arg", arg_safein_epsilon_override) << ",\n";
         f << "    " << JNum("safeout_epsilon_percentile", arg_safeout_epsilon_percentile) << ",\n";
         f << "    " << JStr("assignment_mode", AssignmentModeName(index.assignment_mode())) << ",\n";
         f << "    " << JStr("coarse_builder", CoarseBuilderName(index.coarse_builder())) << ",\n";
@@ -2618,6 +2763,21 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("runtime_safein_d_k", runtime_safein_d_k) << ",\n";
         f << "    " << JNum("runtime_safein_epsilon", runtime_safein_epsilon) << ",\n";
         f << "    " << JNum("runtime_safeout_epsilon", runtime_safeout_epsilon) << ",\n";
+        f << "    " << JNum("safein_dk_percentile", arg_safein_dk_percentile) << ",\n";
+        f << "    " << JInt("safein_dk_samples", arg_safein_dk_samples) << ",\n";
+        f << "    " << JStr("safein_dk_samples_input", arg_safein_dk_samples_input) << ",\n";
+        f << "    " << JStr("safein_dk_samples_output", arg_safein_dk_samples_output) << ",\n";
+        f << "    " << JInt("safein_dk_samples_count", safein_dk_samples_count) << ",\n";
+        f << "    " << JStr("safein_dk_sampling_mode", effective_safein_dk_sampling_mode) << ",\n";
+        f << "    " << JInt("safein_dk_available_queries", safein_dk_available_queries) << ",\n";
+        f << "    " << JInt("safein_dk_requested_samples", safein_dk_requested_samples) << ",\n";
+        f << "    " << JStr("safein_dk_search_scope",
+                            arg_safein_dk_search_scope == SafeInDkSearchScope::NProbe
+                                ? "nprobe"
+                                : "full") << ",\n";
+        f << "    " << JInt("safein_dk_nprobe", arg_safein_dk_nprobe) << ",\n";
+        f << "    " << JNum("safein_epsilon_percentile", arg_safein_epsilon_percentile) << ",\n";
+        f << "    " << JNum("safein_epsilon_override_arg", arg_safein_epsilon_override) << ",\n";
         f << "    " << JBool("recall_available", metrics.recall_available) << ",\n";
         f << "    " << JInt("logical_dimension", index.logical_dim()) << ",\n";
         f << "    " << JInt("effective_dimension", index.effective_dim()) << ",\n";
