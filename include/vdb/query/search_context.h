@@ -64,6 +64,12 @@ struct SearchConfig {
     bool enable_rerank_batched_distance_simd = true;
     bool enable_coarse_select_simd = true;
     bool enable_coarse_select_phase2 = false;
+    bool enable_two_level_coarse_routing = false;
+    uint32_t two_level_coarse_threshold = 4096;
+    uint32_t two_level_coarse_super_count = 0;
+    uint32_t two_level_coarse_super_factor = 0;
+    uint32_t two_level_coarse_budget_factor = 8;
+    bool enable_two_level_coarse_exact_overlap = false;
     bool enable_stage1_safein = true;
     bool enable_stage2_collect_block_first = true;
     bool enable_stage2_scatter_batch_classify = true;
@@ -115,6 +121,14 @@ struct SearchStats {
     double coarse_select_ms = 0;
     double coarse_score_ms = 0;
     double coarse_topn_ms = 0;
+    uint32_t coarse_routing_mode = 0;  // 0=exact, 1=two_level
+    uint32_t coarse_super_count = 0;
+    uint32_t coarse_super_probes = 0;
+    uint32_t coarse_child_candidates_scored = 0;
+    uint32_t coarse_candidate_budget = 0;
+    uint32_t coarse_exact_fallback = 0;
+    uint32_t coarse_exact_overlap = 0;
+    double coarse_hierarchy_build_ms = 0;
     double probe_time_ms = 0;
     double probe_prepare_ms = 0;
     double probe_prepare_rotation_ms = 0;

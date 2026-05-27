@@ -182,6 +182,12 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
 
     index_.SetUseCoarseSelectSimd(config_.enable_coarse_select_simd);
     index_.SetUseCoarseSelectPhase2(config_.enable_coarse_select_phase2);
+    index_.SetTwoLevelCoarseRouting(config_.enable_two_level_coarse_routing,
+                                    config_.two_level_coarse_threshold,
+                                    config_.two_level_coarse_super_count,
+                                    config_.two_level_coarse_super_factor,
+                                    config_.two_level_coarse_budget_factor,
+                                    config_.enable_two_level_coarse_exact_overlap);
     SearchContext ctx(effective_query_vec, config_);
     // Phase 1.3: precompute P^T × query once when Hadamard rotation is used
     if (index_.used_hadamard()) {
@@ -198,6 +204,16 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
         ctx.query_vec(), config_.nprobe);
     ctx.stats().coarse_score_ms = index_.last_coarse_score_ms();
     ctx.stats().coarse_topn_ms = index_.last_coarse_topn_ms();
+    ctx.stats().coarse_routing_mode = index_.last_coarse_routing_mode();
+    ctx.stats().coarse_super_count = index_.last_coarse_super_count();
+    ctx.stats().coarse_super_probes = index_.last_coarse_super_probes();
+    ctx.stats().coarse_child_candidates_scored =
+        index_.last_coarse_child_candidates_scored();
+    ctx.stats().coarse_candidate_budget = index_.last_coarse_candidate_budget();
+    ctx.stats().coarse_exact_fallback = index_.last_coarse_exact_fallback();
+    ctx.stats().coarse_exact_overlap = index_.last_coarse_exact_overlap();
+    ctx.stats().coarse_hierarchy_build_ms =
+        index_.last_coarse_hierarchy_build_ms();
     ctx.stats().coarse_select_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - coarse_start).count();
 

@@ -518,6 +518,16 @@ if(VDB_BUILD_TESTS)
     target_link_libraries(test_crc_calibrator PRIVATE vdb_crc GTest::gtest GTest::gtest_main)
     add_test(NAME test_crc_calibrator COMMAND test_crc_calibrator)
 
+    add_executable(test_rabitq_bench_calibration
+        tests/benchmarks/rabitq_bench_calibration_test.cpp
+        benchmarks/rabitq_bench_calibration.cpp)
+    target_include_directories(test_rabitq_bench_calibration PRIVATE
+        ${CMAKE_SOURCE_DIR}/benchmarks)
+    target_link_libraries(test_rabitq_bench_calibration PRIVATE
+        vdb_index vdb_io GTest::gtest GTest::gtest_main)
+    vdb_enable_target_avx512(test_rabitq_bench_calibration)
+    add_test(NAME test_rabitq_bench_calibration COMMAND test_rabitq_bench_calibration)
+
     add_executable(test_ivf_index tests/index/ivf_index_test.cpp)
     target_link_libraries(test_ivf_index PRIVATE vdb_index GTest::gtest GTest::gtest_main)
     add_test(NAME test_ivf_index COMMAND test_ivf_index)

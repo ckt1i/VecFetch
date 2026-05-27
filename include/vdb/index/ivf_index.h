@@ -51,6 +51,11 @@ class IvfIndex {
         bool empty() const { return data.empty(); }
     };
 
+    struct CoarseTopKEntry {
+        float score = 0.0f;
+        uint32_t child = 0;
+    };
+
     IvfIndex();
     ~IvfIndex();
 
@@ -82,6 +87,30 @@ class IvfIndex {
     void SetUseCoarseSelectSimd(bool enabled) { use_coarse_select_simd_ = enabled; }
     bool use_coarse_select_phase2() const { return use_coarse_select_phase2_; }
     void SetUseCoarseSelectPhase2(bool enabled) { use_coarse_select_phase2_ = enabled; }
+    void SetTwoLevelCoarseRouting(bool enabled,
+                                  uint32_t threshold,
+                                  uint32_t super_count,
+                                  uint32_t super_factor,
+                                  uint32_t budget_factor,
+                                  bool exact_overlap = false);
+    bool PrepareTwoLevelCoarseRouting(uint32_t nprobe) const;
+    uint32_t last_coarse_routing_mode() const { return last_coarse_routing_mode_; }
+    uint32_t last_coarse_super_count() const { return last_coarse_super_count_; }
+    uint32_t last_coarse_super_probes() const { return last_coarse_super_probes_; }
+    uint32_t last_coarse_child_candidates_scored() const {
+        return last_coarse_child_candidates_scored_;
+    }
+    uint32_t last_coarse_candidate_budget() const { return last_coarse_candidate_budget_; }
+    uint32_t last_coarse_exact_fallback() const { return last_coarse_exact_fallback_; }
+    uint32_t last_coarse_exact_overlap() const { return last_coarse_exact_overlap_; }
+    double last_coarse_hierarchy_build_ms() const { return last_coarse_hierarchy_build_ms_; }
+    static uint32_t DefaultTwoLevelSuperCount(uint32_t nlist,
+                                              uint32_t override_count = 0,
+                                              uint32_t nprobe = 0,
+                                              uint32_t factor = 0);
+    static uint32_t DefaultTwoLevelCandidateBudget(uint32_t nlist,
+                                                   uint32_t nprobe,
+                                                   uint32_t budget_factor = 8);
 
     /// Get the ConANN classifier.
     const ConANN& conann() const { return conann_; }
@@ -187,16 +216,62 @@ class IvfIndex {
     CoarsePackedLayout packed_centroids_;
     CoarsePackedLayout packed_normalized_centroids_;
 
+    struct HierarchicalCoarseIndex {
+        std::vector<float> super_centroids;
+        std::vector<float> normalized_super_centroids;
+        std::vector<uint32_t> child_offsets;
+        std::vector<uint32_t> child_centroid_ids;
+        CoarsePackedLayout packed_super_centroids;
+        CoarsePackedLayout packed_normalized_super_centroids;
+        std::vector<CoarsePackedLayout> packed_child_centroids_by_super;
+        std::vector<CoarsePackedLayout> packed_normalized_child_centroids_by_super;
+        uint32_t n_super = 0;
+        uint32_t nlist = 0;
+        Dim dim = 0;
+        bool ready = false;
+    };
+
     struct CoarseScratch {
         std::vector<float> scores;
         std::vector<uint32_t> order;
         std::vector<float> query_buffer;
+        std::vector<float> super_scores;
+        std::vector<uint32_t> super_order;
+        std::vector<uint32_t> child_candidates;
+        std::vector<float> child_scores;
+        std::vector<uint32_t> child_order;
+        std::vector<uint8_t> child_seen;
+        std::vector<uint32_t> exact_order_for_overlap;
+        std::vector<CoarseTopKEntry> child_topk;
     };
     mutable std::unique_ptr<CoarseScratch> coarse_scratch_;
     mutable double last_coarse_score_ms_ = 0;
     mutable double last_coarse_topn_ms_ = 0;
     mutable bool use_coarse_select_simd_ = true;
     mutable bool use_coarse_select_phase2_ = false;
+    mutable bool use_two_level_coarse_routing_ = false;
+    mutable uint32_t two_level_coarse_threshold_ = 4096;
+    mutable uint32_t two_level_coarse_super_count_ = 0;
+    mutable uint32_t two_level_coarse_super_factor_ = 0;
+    mutable uint32_t two_level_coarse_budget_factor_ = 8;
+    mutable bool two_level_coarse_exact_overlap_ = false;
+    mutable HierarchicalCoarseIndex coarse_hierarchy_;
+    mutable double last_coarse_hierarchy_build_ms_ = 0;
+    mutable uint32_t last_coarse_routing_mode_ = 0;
+    mutable uint32_t last_coarse_super_count_ = 0;
+    mutable uint32_t last_coarse_super_probes_ = 0;
+    mutable uint32_t last_coarse_child_candidates_scored_ = 0;
+    mutable uint32_t last_coarse_candidate_budget_ = 0;
+    mutable uint32_t last_coarse_exact_fallback_ = 0;
+    mutable uint32_t last_coarse_exact_overlap_ = 0;
+
+    uint32_t ResolveTwoLevelSuperCount(uint32_t nprobe) const;
+    uint32_t ResolveTwoLevelCandidateBudget(uint32_t nprobe) const;
+    bool EnsureCoarseHierarchy(uint32_t nprobe) const;
+    std::vector<ClusterID> FindNearestClustersExact(const float* query,
+                                                    uint32_t nprobe) const;
+    std::vector<ClusterID> FindNearestClustersTwoLevel(const float* query,
+                                                       uint32_t nprobe) const;
 
 #ifdef VDB_USE_MKL
     // Precomputed ||c||² for each centroid (MKL-accelerated distance)

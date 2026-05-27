@@ -15,6 +15,11 @@ namespace bench {
 
 namespace {
 
+struct RowLocation {
+    uint32_t cluster_id = 0;
+    uint32_t local_idx = 0;
+};
+
 float ConannPercentile(std::vector<float> values, float percentile) {
     if (values.empty()) return 0.0f;
     std::sort(values.begin(), values.end());
@@ -288,13 +293,100 @@ float CalibrateSplitEpsilon(
     uint64_t seed,
     float d_k,
     uint8_t bits,
-    const std::vector<uint32_t>* cluster_subset) {
+    const std::vector<uint32_t>* cluster_subset,
+    EpsilonSamplingMode sampling_mode,
+    EpsilonCalibrationStats* stats) {
     const float lo = 0.1f * d_k;
     const float hi = 10.0f * d_k;
     std::vector<float> errors;
     rabitq::RaBitQEstimator estimator(dim, bits);
     std::vector<uint32_t> sample_ids;
     const bool use_subset = cluster_subset != nullptr && !cluster_subset->empty();
+    if (stats != nullptr) {
+        *stats = EpsilonCalibrationStats{};
+        stats->sampling_mode = sampling_mode;
+        stats->requested_samples = max_samples_per_cluster;
+    }
+    auto record_error = [&](const rabitq::PreparedQuery& pq,
+                            const rabitq::RaBitQCode& code,
+                            const float* query,
+                            const float* target) -> bool {
+        const float true_dist = simd::L2Sqr(query, target, dim);
+        if (true_dist < lo || true_dist > hi) return false;
+        const float est_dist = (bits > 1)
+            ? estimator.EstimateDistanceMultiBit(pq, code)
+            : estimator.EstimateDistanceAccurate(pq, code);
+        const float denom = 2.0f * code.norm * pq.norm_qc;
+        if (denom <= 0.0f) return false;
+        errors.push_back(std::abs(est_dist - true_dist) / denom);
+        return true;
+    };
+    if (sampling_mode == EpsilonSamplingMode::GlobalPair) {
+        std::vector<RowLocation> rows;
+        rows.reserve(cluster_members.size());
+        auto add_cluster_rows = [&](uint32_t cid) {
+            if (cid >= cluster_members.size() || cid >= all_codes.size()) return;
+            const auto& members = cluster_members[cid];
+            if (members.size() < 2) return;
+            for (uint32_t local_idx = 0;
+                 local_idx < static_cast<uint32_t>(members.size());
+                 ++local_idx) {
+                rows.push_back(RowLocation{cid, local_idx});
+            }
+        };
+        if (use_subset) {
+            for (uint32_t cid : *cluster_subset) add_cluster_rows(cid);
+        } else {
+            for (uint32_t cid = 0; cid < cluster_members.size(); ++cid) {
+                add_cluster_rows(cid);
+            }
+        }
+        if (rows.empty() || max_samples_per_cluster == 0) {
+            if (stats != nullptr) {
+                stats->valid_error_count = 0;
+                stats->attempted_pairs = 0;
+            }
+            return 0.0f;
+        }
+        errors.reserve(max_samples_per_cluster);
+        std::mt19937_64 rng(seed == 0 ? std::random_device{}() : seed);
+        std::uniform_int_distribution<size_t> row_dist(0, rows.size() - 1);
+        const uint32_t max_attempts =
+            std::max<uint32_t>(max_samples_per_cluster + 1024u,
+                               max_samples_per_cluster * 20u);
+        uint32_t attempts = 0;
+        rabitq::PreparedQuery pq;
+        rabitq::ClusterPreparedScratch scratch;
+        while (errors.size() < max_samples_per_cluster &&
+               attempts < max_attempts) {
+            ++attempts;
+            const RowLocation loc = rows[row_dist(rng)];
+            const auto& members = cluster_members[loc.cluster_id];
+            const auto& codes = all_codes[loc.cluster_id];
+            if (members.size() < 2 || loc.local_idx >= members.size() ||
+                loc.local_idx >= codes.size()) {
+                continue;
+            }
+            std::uniform_int_distribution<uint32_t> target_dist(
+                0, static_cast<uint32_t>(members.size() - 2));
+            uint32_t target_local = target_dist(rng);
+            if (target_local >= loc.local_idx) ++target_local;
+            if (target_local >= codes.size()) continue;
+            const float* centroid =
+                centroids.data() + static_cast<size_t>(loc.cluster_id) * dim;
+            const float* query =
+                vectors + static_cast<size_t>(members[loc.local_idx]) * dim;
+            const float* target =
+                vectors + static_cast<size_t>(members[target_local]) * dim;
+            estimator.PrepareQueryInto(query, centroid, rotation, &pq, &scratch);
+            record_error(pq, codes[target_local], query, target);
+        }
+        if (stats != nullptr) {
+            stats->valid_error_count = static_cast<uint32_t>(errors.size());
+            stats->attempted_pairs = attempts;
+        }
+        return UpperPercentile(std::move(errors), percentile);
+    }
     const auto run_cluster = [&](uint32_t cid) {
         const auto& members = cluster_members[cid];
         const auto& codes = all_codes[cid];
@@ -318,15 +410,8 @@ float CalibrateSplitEpsilon(
             estimator.PrepareQueryInto(query, centroid, rotation, &pq, &scratch);
             for (uint32_t j = 0; j < n_members; ++j) {
                 if (j == local_q) continue;
-                const float true_dist = simd::L2Sqr(
-                    query, vectors + static_cast<size_t>(members[j]) * dim, dim);
-                if (true_dist < lo || true_dist > hi) continue;
-                const float est_dist = (bits > 1)
-                    ? estimator.EstimateDistanceMultiBit(pq, codes[j])
-                    : estimator.EstimateDistanceAccurate(pq, codes[j]);
-                const float denom = 2.0f * codes[j].norm * pq.norm_qc;
-                if (denom <= 0.0f) continue;
-                errors.push_back(std::abs(est_dist - true_dist) / denom);
+                record_error(pq, codes[j], query,
+                             vectors + static_cast<size_t>(members[j]) * dim);
             }
         }
     };
@@ -340,7 +425,34 @@ float CalibrateSplitEpsilon(
             run_cluster(cid);
         }
     }
+    if (stats != nullptr) {
+        stats->valid_error_count = static_cast<uint32_t>(errors.size());
+        stats->attempted_pairs = static_cast<uint32_t>(errors.size());
+    }
     return UpperPercentile(std::move(errors), percentile);
+}
+
+const char* EpsilonSamplingModeName(EpsilonSamplingMode mode) {
+    switch (mode) {
+        case EpsilonSamplingMode::LegacyPerCluster:
+            return "legacy_per_cluster";
+        case EpsilonSamplingMode::GlobalPair:
+            return "global_pair";
+    }
+    return "legacy_per_cluster";
+}
+
+StatusOr<EpsilonSamplingMode> ParseEpsilonSamplingModeArg(
+    const std::string& value) {
+    if (value == "legacy_per_cluster") {
+        return EpsilonSamplingMode::LegacyPerCluster;
+    }
+    if (value == "global_pair") {
+        return EpsilonSamplingMode::GlobalPair;
+    }
+    return Status::InvalidArgument(
+        "Invalid epsilon_sampling_mode: " + value +
+        " (expected legacy_per_cluster or global_pair)");
 }
 
 StatusOr<index::SafeInDkSearchScope> ParseSafeInDkSearchScopeArg(

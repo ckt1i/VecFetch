@@ -6,11 +6,13 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <limits>
 #include <optional>
-#include <numeric>
 #include <string_view>
 
+#include "superkmeans/superkmeans.h"
 #include "vdb/common/aligned_alloc.h"
 #include "vdb/simd/coarse_ip_score.h"
 #include "vdb/simd/coarse_select.h"
@@ -170,6 +172,22 @@ void BuildCoarsePackedLayout(const std::vector<float>& src,
     }
 }
 
+void BuildCoarsePackedLayoutFromChildIds(const std::vector<float>& src,
+                                         const std::vector<uint32_t>& child_ids,
+                                         uint32_t begin,
+                                         uint32_t count,
+                                         Dim dim,
+                                         IvfIndex::CoarsePackedLayout* layout) {
+    std::vector<float> ordered(static_cast<size_t>(count) * dim);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t child = child_ids[static_cast<size_t>(begin) + i];
+        std::memcpy(ordered.data() + static_cast<size_t>(i) * dim,
+                    src.data() + static_cast<size_t>(child) * dim,
+                    static_cast<size_t>(dim) * sizeof(float));
+    }
+    BuildCoarsePackedLayout(ordered, count, dim, layout);
+}
+
 void ComputeCoarseIPScoresDispatch(const float* query,
                                    const IvfIndex::CoarsePackedLayout& layout,
                                    uint32_t nlist,
@@ -184,6 +202,37 @@ void ComputeCoarseIPScoresDispatch(const float* query,
 #endif
 }
 
+bool TopKScoreLess(const IvfIndex::CoarseTopKEntry& lhs,
+                   const IvfIndex::CoarseTopKEntry& rhs) {
+    if (lhs.score == rhs.score) {
+        return lhs.child < rhs.child;
+    }
+    return lhs.score < rhs.score;
+}
+
+void PushChildTopK(std::vector<IvfIndex::CoarseTopKEntry>* heap,
+                   uint32_t capacity,
+                   float score,
+                   uint32_t child) {
+    if (capacity == 0 || heap == nullptr) return;
+    IvfIndex::CoarseTopKEntry entry{score, child};
+    auto better = [](const IvfIndex::CoarseTopKEntry& lhs,
+                     const IvfIndex::CoarseTopKEntry& rhs) {
+        return TopKScoreLess(lhs, rhs);
+    };
+    if (heap->size() < capacity) {
+        heap->push_back(entry);
+        std::push_heap(heap->begin(), heap->end(), better);
+        return;
+    }
+    if (!TopKScoreLess(entry, heap->front())) {
+        return;
+    }
+    std::pop_heap(heap->begin(), heap->end(), better);
+    heap->back() = entry;
+    std::push_heap(heap->begin(), heap->end(), better);
+}
+
 }  // namespace
 
 // ============================================================================
@@ -192,6 +241,218 @@ void ComputeCoarseIPScoresDispatch(const float* query,
 
 IvfIndex::IvfIndex() = default;
 IvfIndex::~IvfIndex() = default;
+
+uint32_t IvfIndex::DefaultTwoLevelSuperCount(uint32_t nlist,
+                                             uint32_t override_count,
+                                             uint32_t nprobe,
+                                             uint32_t factor) {
+    if (nlist == 0) return 0;
+    uint32_t requested = 0;
+    if (override_count > 0) {
+        requested = override_count;
+    } else if (factor > 0 && nprobe > 0) {
+        const uint64_t scaled =
+            static_cast<uint64_t>(factor) * static_cast<uint64_t>(nprobe);
+        requested = static_cast<uint32_t>(
+            std::min<uint64_t>(scaled, std::numeric_limits<uint32_t>::max()));
+    } else {
+        requested = (nlist + 127u) / 128u;
+    }
+    return std::min<uint32_t>(std::max<uint32_t>(1, requested), nlist);
+}
+
+uint32_t IvfIndex::DefaultTwoLevelCandidateBudget(uint32_t nlist,
+                                                  uint32_t nprobe,
+                                                  uint32_t budget_factor) {
+    if (nlist == 0 || nprobe == 0) return 0;
+    const uint64_t budget =
+        static_cast<uint64_t>(std::max<uint32_t>(1, budget_factor)) *
+        static_cast<uint64_t>(nprobe);
+    return std::min<uint32_t>(
+        nlist, static_cast<uint32_t>(std::min<uint64_t>(budget, nlist)));
+}
+
+void IvfIndex::SetTwoLevelCoarseRouting(bool enabled,
+                                        uint32_t threshold,
+                                        uint32_t super_count,
+                                        uint32_t super_factor,
+                                        uint32_t budget_factor,
+                                        bool exact_overlap) {
+    const uint32_t sanitized_threshold = std::max<uint32_t>(1, threshold);
+    const uint32_t sanitized_super_factor = super_factor;
+    const uint32_t sanitized_budget = std::max<uint32_t>(1, budget_factor);
+    if (use_two_level_coarse_routing_ != enabled ||
+        two_level_coarse_threshold_ != sanitized_threshold ||
+        two_level_coarse_super_count_ != super_count ||
+        two_level_coarse_super_factor_ != sanitized_super_factor ||
+        two_level_coarse_budget_factor_ != sanitized_budget) {
+        coarse_hierarchy_ = HierarchicalCoarseIndex{};
+    }
+    use_two_level_coarse_routing_ = enabled;
+    two_level_coarse_threshold_ = sanitized_threshold;
+    two_level_coarse_super_count_ = super_count;
+    two_level_coarse_super_factor_ = sanitized_super_factor;
+    two_level_coarse_budget_factor_ = sanitized_budget;
+    two_level_coarse_exact_overlap_ = exact_overlap;
+}
+
+uint32_t IvfIndex::ResolveTwoLevelSuperCount(uint32_t nprobe) const {
+    return DefaultTwoLevelSuperCount(nlist_,
+                                     two_level_coarse_super_count_,
+                                     nprobe,
+                                     two_level_coarse_super_factor_);
+}
+
+uint32_t IvfIndex::ResolveTwoLevelCandidateBudget(uint32_t nprobe) const {
+    return DefaultTwoLevelCandidateBudget(
+        nlist_, nprobe, two_level_coarse_budget_factor_);
+}
+
+bool IvfIndex::PrepareTwoLevelCoarseRouting(uint32_t nprobe) const {
+    if (!use_two_level_coarse_routing_ ||
+        nlist_ <= two_level_coarse_threshold_ ||
+        effective_metric_ != "ip") {
+        return false;
+    }
+    return EnsureCoarseHierarchy(nprobe);
+}
+
+bool IvfIndex::EnsureCoarseHierarchy(uint32_t nprobe) const {
+    const uint32_t n_super = ResolveTwoLevelSuperCount(nprobe);
+    if (coarse_hierarchy_.ready &&
+        coarse_hierarchy_.n_super == n_super &&
+        coarse_hierarchy_.nlist == nlist_ &&
+        coarse_hierarchy_.dim == dim_) {
+        last_coarse_hierarchy_build_ms_ = 0.0;
+        return true;
+    }
+    if (n_super == 0 || nlist_ == 0 || centroids_.empty()) {
+        coarse_hierarchy_ = HierarchicalCoarseIndex{};
+        last_coarse_hierarchy_build_ms_ = 0.0;
+        return false;
+    }
+
+    const auto build_start = std::chrono::steady_clock::now();
+    HierarchicalCoarseIndex hierarchy;
+    hierarchy.n_super = n_super;
+    hierarchy.nlist = nlist_;
+    hierarchy.dim = dim_;
+
+    const bool cosine_path = (effective_metric_ == "ip" && requested_metric_ == "cosine");
+    const std::vector<float>* clustering_centroids =
+        (cosine_path && !normalized_centroids_.empty()) ? &normalized_centroids_ : &centroids_;
+    if (clustering_centroids->size() != static_cast<size_t>(nlist_) * dim_) {
+        coarse_hierarchy_ = HierarchicalCoarseIndex{};
+        last_coarse_hierarchy_build_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - build_start).count();
+        return false;
+    }
+
+    skmeans::SuperKMeansConfig skm_cfg;
+    skm_cfg.iters = 10;
+    skm_cfg.seed = 42;
+    skm_cfg.sampling_fraction = 1.0f;
+    skm_cfg.max_points_per_cluster = 256;
+    skm_cfg.n_threads = 0;
+    skm_cfg.early_termination = true;
+    skm_cfg.tol = 1e-4f;
+    skm_cfg.verbose = false;
+    skm_cfg.angular = cosine_path;
+
+    std::vector<float> trained_super_centroids;
+    std::vector<uint32_t> assignments;
+    try {
+        skmeans::SuperKMeans skm(n_super, dim_, skm_cfg);
+        trained_super_centroids =
+            skm.Train(clustering_centroids->data(), static_cast<size_t>(nlist_));
+        if (trained_super_centroids.size() != static_cast<size_t>(n_super) * dim_) {
+            coarse_hierarchy_ = HierarchicalCoarseIndex{};
+            last_coarse_hierarchy_build_ms_ = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - build_start).count();
+            return false;
+        }
+        assignments = skm.Assign(clustering_centroids->data(),
+                                 trained_super_centroids.data(),
+                                 static_cast<size_t>(nlist_),
+                                 static_cast<size_t>(n_super));
+    } catch (const std::exception&) {
+        coarse_hierarchy_ = HierarchicalCoarseIndex{};
+        last_coarse_hierarchy_build_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - build_start).count();
+        return false;
+    }
+    if (assignments.size() != nlist_) {
+        coarse_hierarchy_ = HierarchicalCoarseIndex{};
+        last_coarse_hierarchy_build_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - build_start).count();
+        return false;
+    }
+
+    hierarchy.child_offsets.assign(static_cast<size_t>(n_super) + 1, 0);
+    for (uint32_t child = 0; child < nlist_; ++child) {
+        const uint32_t sid = assignments[child];
+        if (sid >= n_super) {
+            coarse_hierarchy_ = HierarchicalCoarseIndex{};
+            last_coarse_hierarchy_build_ms_ = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - build_start).count();
+            return false;
+        }
+        ++hierarchy.child_offsets[static_cast<size_t>(sid) + 1];
+    }
+    for (uint32_t s = 1; s <= n_super; ++s) {
+        hierarchy.child_offsets[s] += hierarchy.child_offsets[s - 1];
+    }
+    hierarchy.child_centroid_ids.assign(nlist_, 0);
+    std::vector<uint32_t> cursors = hierarchy.child_offsets;
+    for (uint32_t child = 0; child < nlist_; ++child) {
+        const uint32_t sid = assignments[child];
+        hierarchy.child_centroid_ids[cursors[sid]++] = child;
+    }
+
+    hierarchy.super_centroids = trained_super_centroids;
+    BuildCoarsePackedLayout(
+        hierarchy.super_centroids, n_super, dim_, &hierarchy.packed_super_centroids);
+    if (effective_metric_ == "ip" && requested_metric_ == "cosine") {
+        hierarchy.normalized_super_centroids.resize(hierarchy.super_centroids.size());
+        for (uint32_t s = 0; s < n_super; ++s) {
+            NormalizeVector(hierarchy.super_centroids.data() + static_cast<size_t>(s) * dim_,
+                            hierarchy.normalized_super_centroids.data() + static_cast<size_t>(s) * dim_,
+                            dim_);
+        }
+        BuildCoarsePackedLayout(hierarchy.normalized_super_centroids, n_super, dim_,
+                                &hierarchy.packed_normalized_super_centroids);
+    }
+
+    hierarchy.packed_child_centroids_by_super.resize(n_super);
+    if (cosine_path && !normalized_centroids_.empty()) {
+        hierarchy.packed_normalized_child_centroids_by_super.resize(n_super);
+    }
+    for (uint32_t s = 0; s < n_super; ++s) {
+        const uint32_t begin = hierarchy.child_offsets[s];
+        const uint32_t end = hierarchy.child_offsets[s + 1];
+        const uint32_t count = end - begin;
+        BuildCoarsePackedLayoutFromChildIds(centroids_,
+                                            hierarchy.child_centroid_ids,
+                                            begin,
+                                            count,
+                                            dim_,
+                                            &hierarchy.packed_child_centroids_by_super[s]);
+        if (cosine_path && !normalized_centroids_.empty()) {
+            BuildCoarsePackedLayoutFromChildIds(
+                normalized_centroids_,
+                hierarchy.child_centroid_ids,
+                begin,
+                count,
+                dim_,
+                &hierarchy.packed_normalized_child_centroids_by_super[s]);
+        }
+    }
+    hierarchy.ready = true;
+    coarse_hierarchy_ = std::move(hierarchy);
+    last_coarse_hierarchy_build_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - build_start).count();
+    return true;
+}
 
 // ============================================================================
 // Open — load index from directory
@@ -443,9 +704,30 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
 
 std::vector<ClusterID> IvfIndex::FindNearestClusters(
     const float* query, uint32_t nprobe) const {
+    if (use_two_level_coarse_routing_ &&
+        nlist_ > two_level_coarse_threshold_ &&
+        effective_metric_ == "ip") {
+        auto result = FindNearestClustersTwoLevel(query, nprobe);
+        if (!result.empty() || nprobe == 0 || cluster_ids_.empty()) {
+            return result;
+        }
+    }
+    return FindNearestClustersExact(query, nprobe);
+}
+
+std::vector<ClusterID> IvfIndex::FindNearestClustersExact(
+    const float* query, uint32_t nprobe) const {
     if (nprobe == 0 || cluster_ids_.empty()) {
         return {};
     }
+    last_coarse_routing_mode_ = 0;
+    last_coarse_super_count_ = 0;
+    last_coarse_super_probes_ = 0;
+    last_coarse_child_candidates_scored_ = 0;
+    last_coarse_candidate_budget_ = 0;
+    last_coarse_exact_fallback_ = 0;
+    last_coarse_exact_overlap_ = 0;
+    last_coarse_hierarchy_build_ms_ = 0.0;
 
     const uint32_t actual_nprobe = std::min(nprobe, nlist_);
     if (!coarse_scratch_) {
@@ -533,6 +815,156 @@ std::vector<ClusterID> IvfIndex::FindNearestClusters(
         result[i] = cluster_ids_[scratch.order[i]];
     }
 
+    return result;
+}
+
+std::vector<ClusterID> IvfIndex::FindNearestClustersTwoLevel(
+    const float* query, uint32_t nprobe) const {
+    if (nprobe == 0 || cluster_ids_.empty()) {
+        return {};
+    }
+    if (!EnsureCoarseHierarchy(nprobe) || !coarse_hierarchy_.ready) {
+        auto result = FindNearestClustersExact(query, nprobe);
+        last_coarse_exact_fallback_ = 1;
+        return result;
+    }
+
+    const uint32_t actual_nprobe = std::min(nprobe, nlist_);
+    const uint32_t candidate_budget = ResolveTwoLevelCandidateBudget(actual_nprobe);
+    const uint32_t n_super = coarse_hierarchy_.n_super;
+    if (candidate_budget < actual_nprobe || n_super == 0) {
+        auto result = FindNearestClustersExact(query, nprobe);
+        last_coarse_exact_fallback_ = 1;
+        return result;
+    }
+    if (!coarse_scratch_) {
+        coarse_scratch_ = std::make_unique<CoarseScratch>();
+    }
+    CoarseScratch& scratch = *coarse_scratch_;
+
+    const uint32_t avg_children =
+        std::max<uint32_t>(1, (nlist_ + n_super - 1) / n_super);
+    const uint32_t super_probe = std::min<uint32_t>(
+        n_super, std::max<uint32_t>(1, (candidate_budget + avg_children - 1) / avg_children));
+
+    const auto coarse_score_start = std::chrono::steady_clock::now();
+    const CoarsePackedLayout* super_layout = &coarse_hierarchy_.packed_super_centroids;
+    const size_t packed_dim = super_layout->packed_dim;
+    scratch.query_buffer.assign(packed_dim, 0.0f);
+    const float* query_ip = scratch.query_buffer.data();
+    if (requested_metric_ == "cosine") {
+        NormalizeVector(query, scratch.query_buffer.data(), dim_);
+        if (!coarse_hierarchy_.packed_normalized_super_centroids.empty()) {
+            super_layout = &coarse_hierarchy_.packed_normalized_super_centroids;
+        }
+    } else {
+        std::memcpy(scratch.query_buffer.data(), query,
+                    static_cast<size_t>(dim_) * sizeof(float));
+    }
+    scratch.super_scores.resize(n_super);
+    ComputeCoarseIPScoresDispatch(
+        query_ip, *super_layout, n_super, scratch.super_scores.data());
+    last_coarse_score_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - coarse_score_start).count();
+
+    const auto coarse_topn_start = std::chrono::steady_clock::now();
+    scratch.super_order.resize(n_super);
+    simd::SelectTopNProbeSmall(scratch.super_scores.data(), n_super,
+                               super_probe, scratch.super_order.data());
+
+    uint32_t child_count = 0;
+    for (uint32_t i = 0; i < super_probe; ++i) {
+        const uint32_t sid = scratch.super_order[i];
+        child_count +=
+            coarse_hierarchy_.child_offsets[sid + 1] -
+            coarse_hierarchy_.child_offsets[sid];
+    }
+    if (child_count < actual_nprobe) {
+        auto result = FindNearestClustersExact(query, nprobe);
+        last_coarse_exact_fallback_ = 1;
+        return result;
+    }
+
+    scratch.child_topk.clear();
+    scratch.child_topk.reserve(actual_nprobe);
+    scratch.child_scores.clear();
+    const bool use_normalized_child_packed =
+        requested_metric_ == "cosine" &&
+        coarse_hierarchy_.packed_normalized_child_centroids_by_super.size() == n_super;
+    for (uint32_t i = 0; i < super_probe; ++i) {
+        const uint32_t sid = scratch.super_order[i];
+        const uint32_t begin = coarse_hierarchy_.child_offsets[sid];
+        const uint32_t end = coarse_hierarchy_.child_offsets[sid + 1];
+        const uint32_t count = end - begin;
+        if (count == 0) {
+            continue;
+        }
+        const CoarsePackedLayout& child_layout =
+            use_normalized_child_packed
+                ? coarse_hierarchy_.packed_normalized_child_centroids_by_super[sid]
+                : coarse_hierarchy_.packed_child_centroids_by_super[sid];
+        scratch.child_scores.resize(count);
+        ComputeCoarseIPScoresDispatch(
+            query_ip, child_layout, count, scratch.child_scores.data());
+        for (uint32_t local = 0; local < count; ++local) {
+            const uint32_t child =
+                coarse_hierarchy_.child_centroid_ids[static_cast<size_t>(begin) + local];
+            PushChildTopK(&scratch.child_topk,
+                          actual_nprobe,
+                          scratch.child_scores[local],
+                          child);
+        }
+    }
+    if (scratch.child_topk.size() < actual_nprobe) {
+        auto result = FindNearestClustersExact(query, nprobe);
+        last_coarse_exact_fallback_ = 1;
+        return result;
+    }
+    std::sort(scratch.child_topk.begin(), scratch.child_topk.end(), TopKScoreLess);
+    last_coarse_topn_ms_ = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - coarse_topn_start).count();
+
+    last_coarse_routing_mode_ = 1;
+    last_coarse_super_count_ = n_super;
+    last_coarse_super_probes_ = super_probe;
+    last_coarse_child_candidates_scored_ = child_count;
+    last_coarse_candidate_budget_ = candidate_budget;
+    last_coarse_exact_fallback_ = 0;
+    last_coarse_exact_overlap_ = 0;
+
+    if (two_level_coarse_exact_overlap_) {
+        scratch.scores.resize(nlist_);
+        scratch.exact_order_for_overlap.resize(nlist_);
+        ComputeCoarseIPScoresDispatch(
+            query_ip,
+            requested_metric_ == "cosine" && !packed_normalized_centroids_.empty()
+                ? packed_normalized_centroids_
+                : packed_centroids_,
+            nlist_,
+            scratch.scores.data());
+        simd::SelectTopNProbeSmall(scratch.scores.data(), nlist_,
+                                   actual_nprobe,
+                                   scratch.exact_order_for_overlap.data());
+        scratch.child_seen.assign(nlist_, 0);
+        for (uint32_t i = 0; i < actual_nprobe; ++i) {
+            const uint32_t child = scratch.child_topk[i].child;
+            scratch.child_seen[child] = 1;
+        }
+        uint32_t overlap = 0;
+        for (uint32_t i = 0; i < actual_nprobe; ++i) {
+            const uint32_t exact_child = scratch.exact_order_for_overlap[i];
+            if (exact_child < scratch.child_seen.size() && scratch.child_seen[exact_child]) {
+                ++overlap;
+            }
+        }
+        last_coarse_exact_overlap_ = overlap;
+    }
+
+    std::vector<ClusterID> result(actual_nprobe);
+    for (uint32_t i = 0; i < actual_nprobe; ++i) {
+        const uint32_t child = scratch.child_topk[i].child;
+        result[i] = cluster_ids_[child];
+    }
     return result;
 }
 

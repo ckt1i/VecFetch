@@ -12,6 +12,7 @@
 ///       [--bits 4] [--metric l2|cosine|ip] [--crc 1] [--early-stop 1]
 ///       [--outdir ./results]
 ///       [--centroids /path/to/centroids.fvecs] [--assignments /path/to/assign.ivecs]
+///       [--epsilon-sampling-mode legacy_per_cluster|global_pair]
 ///       [--pad-to-pow2 1] [--index-dir /path/to/existing/index]
 ///       [--tmp-dir /tmp/bench_vs] [--keep-index]
 
@@ -134,6 +135,14 @@ int main(int argc, char* argv[]) {
     std::string metric = GetArg(argc, argv, "--metric", "l2");
     std::string coarse_builder = GetArg(argc, argv, "--coarse-builder", "auto");
     uint32_t epsilon_samples = static_cast<uint32_t>(GetIntArg(argc, argv, "--epsilon-samples", 100));
+    auto epsilon_sampling_mode_or = ParseEpsilonSamplingModeArg(
+        GetArg(argc, argv, "--epsilon-sampling-mode", "legacy_per_cluster"));
+    if (!epsilon_sampling_mode_or.ok()) {
+        std::fprintf(stderr, "%s\n",
+                     epsilon_sampling_mode_or.status().ToString().c_str());
+        return 1;
+    }
+    EpsilonSamplingMode epsilon_sampling_mode = epsilon_sampling_mode_or.value();
     float epsilon_percentile = GetFloatArg(argc, argv, "--epsilon-percentile", 0.99f);
     float safein_dk_percentile = GetFloatArg(argc, argv, "--safein-dk-percentile", -1.0f);
     float safein_epsilon_percentile = GetFloatArg(argc, argv, "--safein-epsilon-percentile", -1.0f);
@@ -158,6 +167,7 @@ int main(int argc, char* argv[]) {
             "[--coarse-builder auto|superkmeans|hierarchical_superkmeans|faiss_kmeans] "
             "[--outdir dir] "
             "[--centroids <path>] [--assignments <path>] [--image-ids <path>] "
+            "[--epsilon-sampling-mode legacy_per_cluster|global_pair] "
             "[--pad-to-pow2 1] "
             "[--enable-stage1-safein 0|1] "
             "[--index-dir <path>] [--tmp-dir <path>] [--keep-index]\n");
@@ -507,6 +517,8 @@ int main(int argc, char* argv[]) {
     float runtime_safein_dk = index.conann().safein_d_k();
     float runtime_safein_eps = index.conann().epsilon();
     float runtime_safeout_eps = index.conann().epsilon();
+    EpsilonCalibrationStats safein_epsilon_stats;
+    EpsilonCalibrationStats safeout_epsilon_stats;
     std::vector<std::vector<uint32_t>> cluster_members_for_stats;
     bool have_cluster_members_for_stats = false;
     if (!arg_index_dir.empty() && !image_ids.empty()) {
@@ -556,13 +568,15 @@ int main(int argc, char* argv[]) {
             runtime_safein_eps = CalibrateSplitEpsilon(
                 all_codes, cluster_members_for_stats, base.data.data(), index.centroids(),
                 index.rotation(), dim, epsilon_samples, safein_epsilon_percentile,
-                seed, runtime_safein_dk, bits, nullptr);
+                seed, runtime_safein_dk, bits, nullptr, epsilon_sampling_mode,
+                &safein_epsilon_stats);
         }
         if (safeout_epsilon_percentile >= 0.0f) {
             runtime_safeout_eps = CalibrateSplitEpsilon(
                 all_codes, cluster_members_for_stats, base.data.data(), index.centroids(),
                 index.rotation(), dim, epsilon_samples, safeout_epsilon_percentile,
-                seed, runtime_safein_dk, bits, nullptr);
+                seed, runtime_safein_dk, bits, nullptr, epsilon_sampling_mode,
+                &safeout_epsilon_stats);
         }
         index.OverrideConANN(runtime_safeout_eps, index.conann().legacy_d_k(),
                              runtime_safein_dk, true);
@@ -835,6 +849,17 @@ int main(int argc, char* argv[]) {
         jf << "  \"safein_epsilon\": " << runtime_safein_eps << ",\n";
         jf << "  \"safeout_epsilon_percentile\": " << safeout_epsilon_percentile << ",\n";
         jf << "  \"safeout_epsilon\": " << runtime_safeout_eps << ",\n";
+        jf << "  \"epsilon_sampling_mode\": \""
+           << EpsilonSamplingModeName(epsilon_sampling_mode) << "\",\n";
+        jf << "  \"epsilon_requested_samples\": " << epsilon_samples << ",\n";
+        jf << "  \"safein_epsilon_valid_error_count\": "
+           << safein_epsilon_stats.valid_error_count << ",\n";
+        jf << "  \"safein_epsilon_attempted_pairs\": "
+           << safein_epsilon_stats.attempted_pairs << ",\n";
+        jf << "  \"safeout_epsilon_valid_error_count\": "
+           << safeout_epsilon_stats.valid_error_count << ",\n";
+        jf << "  \"safeout_epsilon_attempted_pairs\": "
+           << safeout_epsilon_stats.attempted_pairs << ",\n";
         jf << "  \"enable_stage1_safein\": " << (enable_stage1_safein ? "true" : "false") << ",\n";
         jf << "  \"recall_at_1\": " << recall_1 << ",\n";
         jf << "  \"recall_at_5\": " << recall_5 << ",\n";

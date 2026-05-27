@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -16,6 +17,18 @@ namespace bench {
 enum class SafeInDkSamplingMode {
     Unique,
     WithReplacement,
+};
+
+enum class EpsilonSamplingMode {
+    LegacyPerCluster,
+    GlobalPair,
+};
+
+struct EpsilonCalibrationStats {
+    EpsilonSamplingMode sampling_mode = EpsilonSamplingMode::LegacyPerCluster;
+    uint32_t requested_samples = 0;
+    uint32_t valid_error_count = 0;
+    uint32_t attempted_pairs = 0;
 };
 
 StatusOr<std::vector<uint32_t>> LoadAssignments(const std::string& path,
@@ -93,7 +106,15 @@ float CalibrateSplitEpsilon(
     uint64_t seed,
     float d_k,
     uint8_t bits,
-    const std::vector<uint32_t>* cluster_subset);
+    const std::vector<uint32_t>* cluster_subset,
+    EpsilonSamplingMode sampling_mode =
+        EpsilonSamplingMode::LegacyPerCluster,
+    EpsilonCalibrationStats* stats = nullptr);
+
+const char* EpsilonSamplingModeName(EpsilonSamplingMode mode);
+
+StatusOr<EpsilonSamplingMode> ParseEpsilonSamplingModeArg(
+    const std::string& value);
 
 StatusOr<index::SafeInDkSearchScope> ParseSafeInDkSearchScopeArg(
     const std::string& value);

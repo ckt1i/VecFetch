@@ -460,6 +460,14 @@ struct QueryResult {
     double coarse_select_ms = 0;
     double coarse_score_ms = 0;
     double coarse_topn_ms = 0;
+    uint32_t coarse_routing_mode = 0;
+    uint32_t coarse_super_count = 0;
+    uint32_t coarse_super_probes = 0;
+    uint32_t coarse_child_candidates_scored = 0;
+    uint32_t coarse_candidate_budget = 0;
+    uint32_t coarse_exact_fallback = 0;
+    uint32_t coarse_exact_overlap = 0;
+    double coarse_hierarchy_build_ms = 0;
     double probe_time_ms;
     double probe_prepare_ms = 0;
     double probe_prepare_rotation_ms = 0;
@@ -558,6 +566,14 @@ struct RoundMetrics {
     double avg_coarse_select = 0;
     double avg_coarse_score = 0;
     double avg_coarse_topn = 0;
+    double avg_coarse_routing_mode = 0;
+    double avg_coarse_super_count = 0;
+    double avg_coarse_super_probes = 0;
+    double avg_coarse_child_candidates_scored = 0;
+    double avg_coarse_candidate_budget = 0;
+    double avg_coarse_exact_fallback = 0;
+    double avg_coarse_exact_overlap = 0;
+    double avg_coarse_hierarchy_build_ms = 0;
     double avg_probe = 0;
     double avg_probe_prepare = 0;
     double avg_probe_prepare_rotation = 0;
@@ -684,6 +700,16 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         }
     }
 
+    if (search_cfg.enable_two_level_coarse_routing) {
+        index.SetTwoLevelCoarseRouting(search_cfg.enable_two_level_coarse_routing,
+                                       search_cfg.two_level_coarse_threshold,
+                                       search_cfg.two_level_coarse_super_count,
+                                       search_cfg.two_level_coarse_super_factor,
+                                       search_cfg.two_level_coarse_budget_factor,
+                                       search_cfg.enable_two_level_coarse_exact_overlap);
+        (void)index.PrepareTwoLevelCoarseRouting(search_cfg.nprobe);
+    }
+
     std::unique_ptr<OverlapScheduler> scheduler;
     if (data_reader != nullptr) {
         scheduler = std::make_unique<OverlapScheduler>(
@@ -705,6 +731,15 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.coarse_select_ms = results.stats().coarse_select_ms;
         qr.coarse_score_ms = results.stats().coarse_score_ms;
         qr.coarse_topn_ms = results.stats().coarse_topn_ms;
+        qr.coarse_routing_mode = results.stats().coarse_routing_mode;
+        qr.coarse_super_count = results.stats().coarse_super_count;
+        qr.coarse_super_probes = results.stats().coarse_super_probes;
+        qr.coarse_child_candidates_scored =
+            results.stats().coarse_child_candidates_scored;
+        qr.coarse_candidate_budget = results.stats().coarse_candidate_budget;
+        qr.coarse_exact_fallback = results.stats().coarse_exact_fallback;
+        qr.coarse_exact_overlap = results.stats().coarse_exact_overlap;
+        qr.coarse_hierarchy_build_ms = results.stats().coarse_hierarchy_build_ms;
         qr.probe_time_ms = results.stats().probe_time_ms;
         qr.probe_prepare_ms = results.stats().probe_prepare_ms;
         qr.probe_prepare_rotation_ms = results.stats().probe_prepare_rotation_ms;
@@ -866,6 +901,14 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_false_so = 0, sum_false_si = 0;
     double sum_io_wait = 0, sum_total = 0;
     double sum_coarse_select = 0, sum_coarse_score = 0, sum_coarse_topn = 0;
+    double sum_coarse_routing_mode = 0;
+    double sum_coarse_super_count = 0;
+    double sum_coarse_super_probes = 0;
+    double sum_coarse_child_candidates_scored = 0;
+    double sum_coarse_candidate_budget = 0;
+    double sum_coarse_exact_fallback = 0;
+    double sum_coarse_exact_overlap = 0;
+    double sum_coarse_hierarchy_build = 0;
     double sum_probe = 0, sum_probe_prepare = 0;
     double sum_probe_prepare_rotation = 0;
     double sum_probe_prepare_subtract = 0;
@@ -940,6 +983,15 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_coarse_select += qresults[qi].coarse_select_ms;
         sum_coarse_score += qresults[qi].coarse_score_ms;
         sum_coarse_topn += qresults[qi].coarse_topn_ms;
+        sum_coarse_routing_mode += qresults[qi].coarse_routing_mode;
+        sum_coarse_super_count += qresults[qi].coarse_super_count;
+        sum_coarse_super_probes += qresults[qi].coarse_super_probes;
+        sum_coarse_child_candidates_scored +=
+            qresults[qi].coarse_child_candidates_scored;
+        sum_coarse_candidate_budget += qresults[qi].coarse_candidate_budget;
+        sum_coarse_exact_fallback += qresults[qi].coarse_exact_fallback;
+        sum_coarse_exact_overlap += qresults[qi].coarse_exact_overlap;
+        sum_coarse_hierarchy_build += qresults[qi].coarse_hierarchy_build_ms;
         sum_probe += qresults[qi].probe_time_ms;
         sum_probe_prepare += qresults[qi].probe_prepare_ms;
         sum_probe_prepare_rotation += qresults[qi].probe_prepare_rotation_ms;
@@ -1027,6 +1079,15 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_coarse_select = sum_coarse_select / Q;
     m.avg_coarse_score = sum_coarse_score / Q;
     m.avg_coarse_topn = sum_coarse_topn / Q;
+    m.avg_coarse_routing_mode = sum_coarse_routing_mode / Q;
+    m.avg_coarse_super_count = sum_coarse_super_count / Q;
+    m.avg_coarse_super_probes = sum_coarse_super_probes / Q;
+    m.avg_coarse_child_candidates_scored =
+        sum_coarse_child_candidates_scored / Q;
+    m.avg_coarse_candidate_budget = sum_coarse_candidate_budget / Q;
+    m.avg_coarse_exact_fallback = sum_coarse_exact_fallback / Q;
+    m.avg_coarse_exact_overlap = sum_coarse_exact_overlap / Q;
+    m.avg_coarse_hierarchy_build_ms = sum_coarse_hierarchy_build / Q;
     m.avg_probe = sum_probe / Q;
     m.avg_probe_prepare = sum_probe_prepare / Q;
     m.avg_probe_prepare_rotation = sum_probe_prepare_rotation / Q;
@@ -1271,6 +1332,16 @@ int main(int argc, char* argv[]) {
     int arg_rair_strict_second_choice =
         GetIntArg(argc, argv, "--rair-strict-second-choice", 0);
     int arg_epsilon_samples = GetIntArg(argc, argv, "--epsilon-samples", 100);
+    auto epsilon_sampling_mode_or = ParseEpsilonSamplingModeArg(
+        GetStringArg(argc, argv, "--epsilon-sampling-mode",
+                     "legacy_per_cluster"));
+    if (!epsilon_sampling_mode_or.ok()) {
+        std::fprintf(stderr, "%s\n",
+                     epsilon_sampling_mode_or.status().ToString().c_str());
+        return 1;
+    }
+    EpsilonSamplingMode arg_epsilon_sampling_mode =
+        epsilon_sampling_mode_or.value();
     float arg_epsilon_percentile = GetFloatArg(argc, argv, "--epsilon-percentile", 0.99f);
     int arg_io_queue_depth = GetIntArg(argc, argv, "--io-queue-depth", 64);
     int arg_fixed_vec_buffer_count =
@@ -1301,6 +1372,18 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--coarse-select-simd", 1);
     int arg_coarse_select_phase2 =
         GetIntArg(argc, argv, "--coarse-select-phase2", 0);
+    int arg_two_level_coarse_routing =
+        GetIntArg(argc, argv, "--two-level-coarse-routing", 0);
+    int arg_two_level_coarse_threshold =
+        GetIntArg(argc, argv, "--two-level-coarse-threshold", 4096);
+    int arg_two_level_coarse_super_count =
+        GetIntArg(argc, argv, "--two-level-coarse-super-count", 0);
+    int arg_two_level_coarse_super_factor =
+        GetIntArg(argc, argv, "--two-level-coarse-super-factor", 0);
+    int arg_two_level_coarse_budget_factor =
+        GetIntArg(argc, argv, "--two-level-coarse-budget-factor", 8);
+    int arg_two_level_coarse_exact_overlap =
+        GetIntArg(argc, argv, "--two-level-coarse-exact-overlap", 0);
     int arg_stage2_block_first =
         GetIntArg(argc, argv, "--stage2-block-first", 1);
     int arg_stage2_batch_classify =
@@ -1318,6 +1401,9 @@ int main(int argc, char* argv[]) {
     bool arg_sqpoll = HasFlag(argc, argv, "--sqpoll");
     const bool query_only_mode = (arg_query_only != 0);
     const bool skip_gt = query_only_mode || (arg_skip_gt != 0);
+    if (arg_two_level_coarse_routing != 0 && skip_gt) {
+        Log("WARNING: two-level coarse routing is running without real GT recall; do not use this run as final performance evidence.\n");
+    }
     const bool external_gt_requested = !arg_gt_file.empty();
 
     if (arg_submission_mode != "shared" &&
@@ -1850,6 +1936,8 @@ int main(int argc, char* argv[]) {
     }
     float runtime_safein_epsilon = index.conann().epsilon();
     float runtime_safeout_epsilon = index.conann().epsilon();
+    EpsilonCalibrationStats safein_epsilon_stats;
+    EpsilonCalibrationStats safeout_epsilon_stats;
     std::vector<float> safein_dk_sample_values;
     const bool has_safein_epsilon_override =
         arg_safein_epsilon_percentile >= 0.0f ||
@@ -2022,7 +2110,8 @@ int main(int argc, char* argv[]) {
                 static_cast<uint32_t>(arg_epsilon_samples),
                 arg_safein_epsilon_percentile, static_cast<uint64_t>(arg_seed),
                 runtime_safein_d_k, static_cast<uint8_t>(arg_bits),
-                calibration_cluster_subset_ptr);
+                calibration_cluster_subset_ptr, arg_epsilon_sampling_mode,
+                &safein_epsilon_stats);
         } else if (arg_safein_epsilon_override >= 0.0f) {
             runtime_safein_epsilon = arg_safein_epsilon_override;
         }
@@ -2033,7 +2122,8 @@ int main(int argc, char* argv[]) {
                 static_cast<uint32_t>(arg_epsilon_samples),
                 arg_safeout_epsilon_percentile, static_cast<uint64_t>(arg_seed),
                 runtime_safein_d_k, static_cast<uint8_t>(arg_bits),
-                calibration_cluster_subset_ptr);
+                calibration_cluster_subset_ptr, arg_epsilon_sampling_mode,
+                &safeout_epsilon_stats);
         }
         index.OverrideConANN(runtime_safeout_epsilon, index.conann().legacy_d_k(),
                              runtime_safein_d_k, true);
@@ -2322,6 +2412,18 @@ int main(int argc, char* argv[]) {
         (arg_rerank_batched_distance_simd != 0);
     search_cfg.enable_coarse_select_simd = (arg_coarse_select_simd != 0);
     search_cfg.enable_coarse_select_phase2 = (arg_coarse_select_phase2 != 0);
+    search_cfg.enable_two_level_coarse_routing =
+        (arg_two_level_coarse_routing != 0);
+    search_cfg.two_level_coarse_threshold =
+        static_cast<uint32_t>(std::max(1, arg_two_level_coarse_threshold));
+    search_cfg.two_level_coarse_super_count =
+        static_cast<uint32_t>(std::max(0, arg_two_level_coarse_super_count));
+    search_cfg.two_level_coarse_super_factor =
+        static_cast<uint32_t>(std::max(0, arg_two_level_coarse_super_factor));
+    search_cfg.two_level_coarse_budget_factor =
+        static_cast<uint32_t>(std::max(1, arg_two_level_coarse_budget_factor));
+    search_cfg.enable_two_level_coarse_exact_overlap =
+        (arg_two_level_coarse_exact_overlap != 0);
     search_cfg.enable_stage1_safein = (arg_enable_stage1_safein != 0);
     search_cfg.enable_stage2_collect_block_first = (arg_stage2_block_first != 0);
     search_cfg.enable_stage2_scatter_batch_classify = (arg_stage2_batch_classify != 0);
@@ -2632,6 +2734,8 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("rabitq_c_factor", arg_c_factor) << ",\n";
         f << "    " << JInt("page_size", arg_page_size) << ",\n";
         f << "    " << JInt("epsilon_samples", arg_epsilon_samples) << ",\n";
+        f << "    " << JStr("epsilon_sampling_mode",
+                             EpsilonSamplingModeName(arg_epsilon_sampling_mode)) << ",\n";
         f << "    " << JNum("epsilon_percentile", arg_epsilon_percentile) << ",\n";
         f << "    " << JBool("pad_to_pow2", arg_pad_to_pow2 != 0) << ",\n";
         f << "    " << JBool("blocked_hadamard_permuted", arg_blocked_hadamard_permuted != 0) << ",\n";
@@ -2670,6 +2774,12 @@ int main(int argc, char* argv[]) {
         f << "    " << JBool("enable_rerank_batched_distance_simd", search_cfg.enable_rerank_batched_distance_simd) << ",\n";
         f << "    " << JBool("enable_coarse_select_simd", search_cfg.enable_coarse_select_simd) << ",\n";
         f << "    " << JBool("enable_coarse_select_phase2", search_cfg.enable_coarse_select_phase2) << ",\n";
+        f << "    " << JBool("enable_two_level_coarse_routing", search_cfg.enable_two_level_coarse_routing) << ",\n";
+        f << "    " << JInt("two_level_coarse_threshold", search_cfg.two_level_coarse_threshold) << ",\n";
+        f << "    " << JInt("two_level_coarse_super_count", search_cfg.two_level_coarse_super_count) << ",\n";
+        f << "    " << JInt("two_level_coarse_super_factor", search_cfg.two_level_coarse_super_factor) << ",\n";
+        f << "    " << JInt("two_level_coarse_budget_factor", search_cfg.two_level_coarse_budget_factor) << ",\n";
+        f << "    " << JBool("enable_two_level_coarse_exact_overlap", search_cfg.enable_two_level_coarse_exact_overlap) << ",\n";
         f << "    " << JBool("enable_stage1_safein", search_cfg.enable_stage1_safein) << ",\n";
         f << "    " << JBool("enable_stage2_scatter_batch_classify",
                              search_cfg.enable_stage2_scatter_batch_classify) << ",\n";
@@ -2727,6 +2837,17 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("safein_epsilon_percentile", arg_safein_epsilon_percentile) << ",\n";
         f << "    " << JNum("safein_epsilon_override_arg", arg_safein_epsilon_override) << ",\n";
         f << "    " << JNum("safeout_epsilon_percentile", arg_safeout_epsilon_percentile) << ",\n";
+        f << "    " << JStr("epsilon_sampling_mode",
+                             EpsilonSamplingModeName(arg_epsilon_sampling_mode)) << ",\n";
+        f << "    " << JInt("epsilon_requested_samples", arg_epsilon_samples) << ",\n";
+        f << "    " << JInt("safein_epsilon_valid_error_count",
+                             safein_epsilon_stats.valid_error_count) << ",\n";
+        f << "    " << JInt("safein_epsilon_attempted_pairs",
+                             safein_epsilon_stats.attempted_pairs) << ",\n";
+        f << "    " << JInt("safeout_epsilon_valid_error_count",
+                             safeout_epsilon_stats.valid_error_count) << ",\n";
+        f << "    " << JInt("safeout_epsilon_attempted_pairs",
+                             safeout_epsilon_stats.attempted_pairs) << ",\n";
         f << "    " << JStr("assignment_mode", AssignmentModeName(index.assignment_mode())) << ",\n";
         f << "    " << JStr("coarse_builder", CoarseBuilderName(index.coarse_builder())) << ",\n";
         f << "    " << JStr("requested_metric", index.requested_metric()) << ",\n";
@@ -2778,6 +2899,18 @@ int main(int argc, char* argv[]) {
         f << "    " << JInt("safein_dk_nprobe", arg_safein_dk_nprobe) << ",\n";
         f << "    " << JNum("safein_epsilon_percentile", arg_safein_epsilon_percentile) << ",\n";
         f << "    " << JNum("safein_epsilon_override_arg", arg_safein_epsilon_override) << ",\n";
+        f << "    " << JNum("safeout_epsilon_percentile", arg_safeout_epsilon_percentile) << ",\n";
+        f << "    " << JStr("epsilon_sampling_mode",
+                            EpsilonSamplingModeName(arg_epsilon_sampling_mode)) << ",\n";
+        f << "    " << JInt("epsilon_requested_samples", arg_epsilon_samples) << ",\n";
+        f << "    " << JInt("safein_epsilon_valid_error_count",
+                            safein_epsilon_stats.valid_error_count) << ",\n";
+        f << "    " << JInt("safein_epsilon_attempted_pairs",
+                            safein_epsilon_stats.attempted_pairs) << ",\n";
+        f << "    " << JInt("safeout_epsilon_valid_error_count",
+                            safeout_epsilon_stats.valid_error_count) << ",\n";
+        f << "    " << JInt("safeout_epsilon_attempted_pairs",
+                            safeout_epsilon_stats.attempted_pairs) << ",\n";
         f << "    " << JBool("recall_available", metrics.recall_available) << ",\n";
         f << "    " << JInt("logical_dimension", index.logical_dim()) << ",\n";
         f << "    " << JInt("effective_dimension", index.effective_dim()) << ",\n";
@@ -2827,6 +2960,14 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_coarse_select_ms", metrics.avg_coarse_select) << ",\n";
         f << "    " << JNum("avg_coarse_score_ms", metrics.avg_coarse_score) << ",\n";
         f << "    " << JNum("avg_coarse_topn_ms", metrics.avg_coarse_topn) << ",\n";
+        f << "    " << JNum("avg_coarse_routing_mode", metrics.avg_coarse_routing_mode) << ",\n";
+        f << "    " << JNum("avg_coarse_super_count", metrics.avg_coarse_super_count) << ",\n";
+        f << "    " << JNum("avg_coarse_super_probes", metrics.avg_coarse_super_probes) << ",\n";
+        f << "    " << JNum("avg_coarse_child_candidates_scored", metrics.avg_coarse_child_candidates_scored) << ",\n";
+        f << "    " << JNum("avg_coarse_candidate_budget", metrics.avg_coarse_candidate_budget) << ",\n";
+        f << "    " << JNum("avg_coarse_exact_fallback", metrics.avg_coarse_exact_fallback) << ",\n";
+        f << "    " << JNum("avg_coarse_exact_overlap", metrics.avg_coarse_exact_overlap) << ",\n";
+        f << "    " << JNum("avg_coarse_hierarchy_build_ms", metrics.avg_coarse_hierarchy_build_ms) << ",\n";
         f << "    " << JNum("avg_probe_time_ms", metrics.avg_probe) << ",\n";
         f << "    " << JNum("avg_probe_prepare_ms", metrics.avg_probe_prepare) << ",\n";
         f << "    " << JNum("avg_probe_prepare_rotation_ms", metrics.avg_probe_prepare_rotation) << ",\n";
@@ -2930,6 +3071,14 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("coarse_select_ms", qr.coarse_select_ms) << ",\n";
             f << "      " << JNum("coarse_score_ms", qr.coarse_score_ms) << ",\n";
             f << "      " << JNum("coarse_topn_ms", qr.coarse_topn_ms) << ",\n";
+            f << "      " << JInt("coarse_routing_mode", qr.coarse_routing_mode) << ",\n";
+            f << "      " << JInt("coarse_super_count", qr.coarse_super_count) << ",\n";
+            f << "      " << JInt("coarse_super_probes", qr.coarse_super_probes) << ",\n";
+            f << "      " << JInt("coarse_child_candidates_scored", qr.coarse_child_candidates_scored) << ",\n";
+            f << "      " << JInt("coarse_candidate_budget", qr.coarse_candidate_budget) << ",\n";
+            f << "      " << JInt("coarse_exact_fallback", qr.coarse_exact_fallback) << ",\n";
+            f << "      " << JInt("coarse_exact_overlap", qr.coarse_exact_overlap) << ",\n";
+            f << "      " << JNum("coarse_hierarchy_build_ms", qr.coarse_hierarchy_build_ms) << ",\n";
             f << "      " << JNum("probe_ms", qr.probe_time_ms) << ",\n";
             f << "      " << JNum("probe_prepare_ms", qr.probe_prepare_ms) << ",\n";
             f << "      " << JNum("probe_prepare_rotation_ms", qr.probe_prepare_rotation_ms) << ",\n";

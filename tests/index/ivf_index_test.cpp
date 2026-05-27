@@ -224,6 +224,48 @@ TEST_F(IvfIndexTest, NprobeZero_ReturnsEmpty) {
     EXPECT_TRUE(result.empty());
 }
 
+TEST(IvfIndexTwoLevelCoarseTest, DefaultParameterDerivation) {
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelSuperCount(0), 0u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelSuperCount(1), 1u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelSuperCount(4096), 32u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelSuperCount(8192), 64u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelSuperCount(16384), 128u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelSuperCount(16384, 512), 512u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelSuperCount(16, 512), 16u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelSuperCount(16384, 0, 256, 2), 512u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelSuperCount(16384, 1024, 256, 2), 1024u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelSuperCount(300, 0, 256, 2), 300u);
+
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(0, 256, 8), 0u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(16384, 0, 8), 0u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(16384, 256, 8), 2048u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(1024, 256, 8), 1024u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(16384, 256, 0), 256u);
+}
+
+TEST_F(IvfIndexTest, TwoLevelRoutingDisabledMatchesExact) {
+    IvfIndex idx;
+    ASSERT_TRUE(idx.Open(test_dir_).ok());
+
+    const float* query = vectors_.data();
+    auto exact = idx.FindNearestClusters(query, kNlist);
+    idx.SetTwoLevelCoarseRouting(false, 0, 0, 0, 8);
+    auto disabled = idx.FindNearestClusters(query, kNlist);
+    EXPECT_EQ(disabled, exact);
+    EXPECT_EQ(idx.last_coarse_routing_mode(), 0u);
+}
+
+TEST_F(IvfIndexTest, TwoLevelRoutingFallsBackForL2Path) {
+    IvfIndex idx;
+    ASSERT_TRUE(idx.Open(test_dir_).ok());
+
+    idx.SetTwoLevelCoarseRouting(true, 0, 0, 0, 8);
+    auto result = idx.FindNearestClusters(vectors_.data(), kNlist);
+    EXPECT_EQ(result.size(), kNlist);
+    EXPECT_EQ(idx.last_coarse_routing_mode(), 0u);
+    EXPECT_EQ(idx.last_coarse_exact_fallback(), 0u);
+}
+
 TEST_F(IvfIndexTest, OpenInvalidDir_Fails) {
     IvfIndex idx;
     auto s = idx.Open("/tmp/nonexistent_ivf_dir_12345");
@@ -252,4 +294,25 @@ TEST_F(IvfIndexCosineTailTest, FindNearestClusters_CosineSortedWithTailCentroids
         EXPECT_GE(prev_score + 1e-5f, curr_score)
             << "Clusters not sorted by cosine score at position " << i;
     }
+}
+
+TEST_F(IvfIndexCosineTailTest, TwoLevelRoutingBuildsHierarchyAndMatchesExactWhenAllChildrenCovered) {
+    IvfIndex idx;
+    ASSERT_TRUE(idx.Open(test_dir_).ok());
+
+    const float* query = vectors_.data() + static_cast<size_t>(3) * kDim;
+    auto exact = idx.FindNearestClusters(query, kNlist);
+
+    idx.SetTwoLevelCoarseRouting(true, 0, 1, 0, 8, true);
+    EXPECT_TRUE(idx.PrepareTwoLevelCoarseRouting(kNlist));
+    EXPECT_TRUE(idx.PrepareTwoLevelCoarseRouting(kNlist));
+    auto routed = idx.FindNearestClusters(query, kNlist);
+
+    EXPECT_EQ(routed, exact);
+    EXPECT_EQ(idx.last_coarse_routing_mode(), 1u);
+    EXPECT_EQ(idx.last_coarse_super_count(), 1u);
+    EXPECT_EQ(idx.last_coarse_super_probes(), 1u);
+    EXPECT_EQ(idx.last_coarse_child_candidates_scored(), kNlist);
+    EXPECT_EQ(idx.last_coarse_exact_fallback(), 0u);
+    EXPECT_EQ(idx.last_coarse_exact_overlap(), kNlist);
 }
