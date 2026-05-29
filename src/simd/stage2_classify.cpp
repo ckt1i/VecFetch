@@ -18,7 +18,7 @@ Stage2ClassifyMasks Stage2ClassifyBatch(const float* VDB_RESTRICT ip_raw,
                                         float norm_qc_sq,
                                         float inv_margin_s2_divisor,
                                         float safein_dk,
-                                        float dynamic_d_k) {
+                                        float safeout_frontier_upper) {
     Stage2ClassifyMasks masks{};
 #if defined(VDB_USE_AVX2)
     const __m256 v_ip_raw = _mm256_load_ps(ip_raw);
@@ -28,8 +28,8 @@ Stage2ClassifyMasks Stage2ClassifyBatch(const float* VDB_RESTRICT ip_raw,
     const __m256 v_norm_qc_sq = _mm256_set1_ps(norm_qc_sq);
     const __m256 v_two_norm_qc = _mm256_set1_ps(2.0f * norm_qc);
     const __m256 v_zero = _mm256_setzero_ps();
-    const __m256 v_margin_mul = _mm256_set1_ps(2.0f * inv_margin_s2_divisor);
-    const __m256 v_dynamic_dk = _mm256_set1_ps(dynamic_d_k);
+    const __m256 v_margin_mul = _mm256_set1_ps(inv_margin_s2_divisor);
+    const __m256 v_safeout_frontier = _mm256_set1_ps(safeout_frontier_upper);
     const __m256 v_safein_dk = _mm256_set1_ps(safein_dk);
 
     const __m256 v_ip_est = _mm256_mul_ps(v_ip_raw, v_xipnorm);
@@ -39,9 +39,9 @@ Stage2ClassifyMasks Stage2ClassifyBatch(const float* VDB_RESTRICT ip_raw,
         _mm256_mul_ps(_mm256_mul_ps(v_two_norm_qc, v_norm_oc), v_ip_est));
     v_est_dist = _mm256_max_ps(v_est_dist, v_zero);
 
-    const __m256 v_margin_twice = _mm256_mul_ps(v_margin_s1, v_margin_mul);
-    const __m256 v_safeout_th = _mm256_add_ps(v_dynamic_dk, v_margin_twice);
-    const __m256 v_safein_th = _mm256_sub_ps(v_safein_dk, v_margin_twice);
+    const __m256 v_margin = _mm256_mul_ps(v_margin_s1, v_margin_mul);
+    const __m256 v_safeout_th = _mm256_add_ps(v_safeout_frontier, v_margin);
+    const __m256 v_safein_th = _mm256_sub_ps(v_safein_dk, v_margin);
 
     masks.safeout = static_cast<uint32_t>(_mm256_movemask_ps(
                         _mm256_cmp_ps(v_est_dist, v_safeout_th, _CMP_GT_OQ))) &
@@ -58,10 +58,10 @@ Stage2ClassifyMasks Stage2ClassifyBatch(const float* VDB_RESTRICT ip_raw,
         float est_dist = norm_oc[lane] * norm_oc[lane] + norm_qc_sq -
                          2.0f * norm_oc[lane] * norm_qc * ip_est;
         est_dist = std::max(est_dist, 0.0f);
-        const float margin_twice = 2.0f * margin_s1[lane] * inv_margin_s2_divisor;
-        if (est_dist > dynamic_d_k + margin_twice) {
+        const float margin = margin_s1[lane] * inv_margin_s2_divisor;
+        if (est_dist > safeout_frontier_upper + margin) {
             masks.safeout |= lane_bit;
-        } else if (est_dist < safein_dk - margin_twice) {
+        } else if (est_dist < safein_dk - margin) {
             masks.safein |= lane_bit;
         } else {
             masks.uncertain |= lane_bit;

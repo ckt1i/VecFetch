@@ -76,10 +76,49 @@ class OverlapSchedulerTest : public ::testing::Test {
         return all;
     }
 
+    std::pair<float, float> ReplaceMaxErrorEntryAndReadState() {
+        PreadFallbackReader reader;
+        SearchConfig config;
+        config.top_k = 3;
+        config.nprobe = kNprobe;
+        OverlapScheduler scheduler(*index_, reader, config);
+
+        scheduler.est_top_k_ = 3;
+        scheduler.est_heap_ = {
+            {3.0f, 10.0f},
+            {2.0f, 2.0f},
+            {1.0f, 1.0f},
+        };
+        std::make_heap(scheduler.est_heap_.begin(), scheduler.est_heap_.end());
+        scheduler.est_heap_upper_frontier_ =
+            scheduler.est_heap_.front().distance + 10.0f;
+
+        const OverlapScheduler::EstimateHeapEntry replacement{0.5f, 3.0f};
+        std::pop_heap(scheduler.est_heap_.begin(), scheduler.est_heap_.end());
+        scheduler.est_heap_.back() = replacement;
+        std::push_heap(scheduler.est_heap_.begin(), scheduler.est_heap_.end());
+
+        float max_error = 0.0f;
+        for (const auto& entry : scheduler.est_heap_) {
+            max_error = std::max(max_error, entry.error_bound);
+        }
+
+        scheduler.est_heap_upper_frontier_ =
+            scheduler.est_heap_.front().distance + max_error;
+        return {max_error, scheduler.est_heap_upper_frontier_};
+    }
+
     fs::path test_dir_;
     std::vector<float> vectors_;
     std::unique_ptr<IvfIndex> index_;
 };
+
+TEST_F(OverlapSchedulerTest, EstimateHeapReplacementRecomputesMaxError) {
+    const auto [max_error, frontier] = ReplaceMaxErrorEntryAndReadState();
+
+    EXPECT_FLOAT_EQ(max_error, 3.0f);
+    EXPECT_FLOAT_EQ(frontier, 5.0f);
+}
 
 TEST_F(OverlapSchedulerTest, EndToEnd_PreadFallback) {
     PreadFallbackReader reader;
@@ -444,6 +483,13 @@ TEST_F(OverlapSchedulerTest, WindowAndFullPreloadModesProduceSameResults) {
     EXPECT_EQ(preload_results.stats().parse_cluster_ms, 0.0);
     EXPECT_TRUE(index_->segment().resident_preload_enabled());
     EXPECT_GT(index_->segment().resident_preload_bytes(), 0u);
+    if (preload_results.stats().stage2_masked_kernel_calls > 0) {
+        EXPECT_GT(preload_results.stats().stage2_lanes_total_valid, 0u);
+        EXPECT_GT(preload_results.stats().stage2_lanes_requested, 0u);
+        EXPECT_EQ(preload_results.stats().stage2_lanes_requested +
+                  preload_results.stats().stage2_lanes_skipped,
+                  preload_results.stats().stage2_lanes_total_valid);
+    }
 }
 
 TEST_F(OverlapSchedulerTest, RedundantAssignmentDeduplicatesBeforeRerank) {

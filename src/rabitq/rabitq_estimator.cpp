@@ -379,6 +379,33 @@ void RaBitQEstimator::EstimateDistanceFastScan(
     EstimateDistanceFastScan(*view.prepared, packed_codes, block_norms, count, out_dist);
 }
 
+simd::FastScanStage1EvalResult RaBitQEstimator::EvaluateStage1FastScan(
+    const PreparedClusterQueryView& view,
+    const uint8_t* packed_codes,
+    const float* block_norms,
+    uint32_t count,
+    float safeout_frontier_upper,
+    float safein_threshold_base,
+    bool enable_safein,
+    float* out_dist) const {
+    const PreparedQuery& pq = *view.prepared;
+    alignas(64) uint32_t raw_accu[32] = {0};
+    simd::AccumulateBlock(packed_codes, pq.lut_aligned, raw_accu, dim_);
+
+    simd::FastScanStage1EvalResult result{};
+    simd::FastScanStage1Evaluate(raw_accu, block_norms, count,
+                                 pq.fs_shift, pq.fs_width, pq.sum_q,
+                                 inv_sqrt_dim_, pq.norm_qc, pq.norm_qc_sq,
+                                 safeout_frontier_upper,
+                                 view.safeout_margin_factor,
+                                 safein_threshold_base,
+                                 view.safein_margin_factor,
+                                 enable_safein,
+                                 out_dist,
+                                 &result);
+    return result;
+}
+
 // ============================================================================
 // EstimateDistanceAccurate — float dot product path (1-bit)
 // ============================================================================

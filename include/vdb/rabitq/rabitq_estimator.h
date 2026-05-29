@@ -7,6 +7,7 @@
 #include "vdb/common/types.h"
 #include "vdb/rabitq/rabitq_encoder.h"
 #include "vdb/rabitq/rabitq_rotation.h"
+#include "vdb/simd/fastscan.h"
 
 namespace vdb {
 namespace rabitq {
@@ -198,6 +199,17 @@ class RaBitQEstimator {
                                    const float* block_norms,
                                    uint32_t count,
                                    float* out_dist) const;
+
+    /// FastScan Stage 1 fused distance + classification evaluation.
+    simd::FastScanStage1EvalResult EvaluateStage1FastScan(
+        const PreparedClusterQueryView& view,
+        const uint8_t* packed_codes,
+        const float* block_norms,
+        uint32_t count,
+        float safeout_frontier_upper,
+        float safein_threshold_base,
+        bool enable_safein,
+        float* out_dist) const;
 
     /// Stage 2: Estimate distance using full M-bit LUT scan.
     ///

@@ -23,7 +23,7 @@ Stage2ClassifyMasks Stage2ClassifyBatch(const float* VDB_RESTRICT ip_raw,
                                         float norm_qc_sq,
                                         float inv_margin_s2_divisor,
                                         float safein_dk,
-                                        float dynamic_d_k);
+                                        float safeout_frontier_upper);
 
 }  // namespace simd
 }  // namespace vdb

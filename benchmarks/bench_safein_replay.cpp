@@ -41,7 +41,7 @@ struct CandidateRow {
     double margin_s1 = 0.0;
     double margin_s2 = 0.0;
     double d_k_static = 0.0;
-    double dynamic_d_k = 0.0;
+    double safeout_frontier_upper = 0.0;
 };
 
 struct Counts {
@@ -130,12 +130,12 @@ static void AddCount(Counts* counts, ResultClass rc, bool is_true_topk) {
 static ResultClass ReplayClass(double est_dist,
                                double safeout_margin_current,
                                double safein_margin_replay,
-                               double dynamic_d_k,
+                               double safeout_frontier_upper,
                                double d_k_static) {
-    if (est_dist > dynamic_d_k + 2.0 * safeout_margin_current) {
+    if (est_dist > safeout_frontier_upper + safeout_margin_current) {
         return ResultClass::SafeOut;
     }
-    if (est_dist < d_k_static - 2.0 * safein_margin_replay) {
+    if (est_dist < d_k_static - safein_margin_replay) {
         return ResultClass::SafeIn;
     }
     return ResultClass::Uncertain;
@@ -222,8 +222,9 @@ int main(int argc, char* argv[]) {
         row.est_dist_s1 = ParseDoubleOr(fields[col["est_dist_s1"]], 0.0);
         row.margin_s1 = ParseDoubleOr(fields[col["margin_s1"]], 0.0);
         row.d_k_static = ParseDoubleOr(fields[col["d_k_static"]], 0.0);
-        row.dynamic_d_k = ParseDoubleOr(fields[col["dynamic_d_k_before_cluster"]],
-                                        std::numeric_limits<double>::infinity());
+        row.safeout_frontier_upper =
+            ParseDoubleOr(fields[col["dynamic_d_k_before_cluster"]],
+                          std::numeric_limits<double>::infinity());
         row.stage2_evaluated = !fields[col["est_dist_s2"]].empty();
         if (row.stage2_evaluated) {
             row.est_dist_s2 = ParseDoubleOr(fields[col["est_dist_s2"]], 0.0);
@@ -250,7 +251,7 @@ int main(int argc, char* argv[]) {
             const double replay_margin_s1 = row.margin_s1 * scale;
             const ResultClass s1 = ReplayClass(
                 row.est_dist_s1, row.margin_s1, replay_margin_s1,
-                row.dynamic_d_k, row.d_k_static);
+                row.safeout_frontier_upper, row.d_k_static);
             AddCount(&summary.s1, s1, row.is_true_topk);
 
             ResultClass final_rc = s1;
@@ -258,7 +259,7 @@ int main(int argc, char* argv[]) {
                 const double replay_margin_s2 = row.margin_s2 * scale;
                 const ResultClass s2 = ReplayClass(
                     row.est_dist_s2, row.margin_s2, replay_margin_s2,
-                    row.dynamic_d_k, row.d_k_static);
+                    row.safeout_frontier_upper, row.d_k_static);
                 AddCount(&summary.s2, s2, row.is_true_topk);
                 final_rc = s2;
             }

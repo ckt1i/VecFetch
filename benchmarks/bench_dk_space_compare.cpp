@@ -608,7 +608,7 @@ int main(int argc, char* argv[]) {
                 const float margin_s2 = margin_s1 / margin_s2_divisor;
                 s2_dists.push_back(est_s2);
                 if (est_s2 < d_k_exact) ++qs.count_s2_lt_dk_exact;
-                const bool safein_exact = est_s2 < d_k_exact - 2.0f * margin_s2;
+                const bool safein_exact = est_s2 < d_k_exact - margin_s2;
                 if (safein_exact) {
                     ++qs.count_safein_current_exact_dk;
                     if (truth_available && !is_true) ++qs.false_safein_exact_dk;
@@ -656,7 +656,7 @@ int main(int argc, char* argv[]) {
                 const float margin_s1 = margin_factor * code.norm;
                 const float margin_s2 = margin_s1 / margin_s2_divisor;
                 if (est_s2 < d_k_rabitq) ++qs.count_s2_lt_dk_rabitq;
-                const bool safein_rabitq = est_s2 < d_k_rabitq - 2.0f * margin_s2;
+                const bool safein_rabitq = est_s2 < d_k_rabitq - margin_s2;
                 if (safein_rabitq) {
                     ++qs.count_safein_current_rabitq_dk;
                     if (truth_available && !is_true) ++qs.false_safein_rabitq_dk;

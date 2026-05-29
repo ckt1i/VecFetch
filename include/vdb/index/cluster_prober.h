@@ -31,6 +31,7 @@ struct CandidateBatch {
     uint32_t count = 0;
     uint32_t global_idx[kMaxCandidates] = {};
     float est_dist[kMaxCandidates] = {};
+    float est_error[kMaxCandidates] = {};
     CandidateClass cls[kMaxCandidates] = {};
     AddressEntry decoded_addr[kMaxCandidates] = {};
 };
@@ -64,6 +65,13 @@ struct ProbeStats {
     uint32_t num_stage2_candidates = 0;
     uint32_t num_stage2_block_lookups = 0;
     uint32_t num_stage2_block_reuses = 0;
+    uint32_t stage1_fused_blocks = 0;
+    uint32_t stage1_fused_safeout_lanes = 0;
+    uint32_t stage1_fused_safein_lanes = 0;
+    uint64_t stage2_masked_kernel_calls = 0;
+    uint64_t stage2_lanes_requested = 0;
+    uint64_t stage2_lanes_skipped = 0;
+    uint64_t stage2_lanes_total_valid = 0;
     double stage1_ms = 0;
     double stage1_estimate_ms = 0;
     double stage1_mask_ms = 0;
@@ -86,9 +94,10 @@ struct ProbeStats {
 ///
 /// Usage:
 ///   float margin_factor = 2.0f * pq.norm_qc * conann.epsilon();
-///   float dynamic_d_k   = est_heap_full ? est_heap.front().first
-///                                        : infinity;
-///   prober.Probe(pc, pq, margin_factor, dynamic_d_k, sink, stats);
+///   float safeout_frontier_upper =
+///       est_heap_full ? max(entry.distance + entry.error_bound in est_heap)
+///                     : infinity;
+///   prober.Probe(pc, pq, safeout_frontier_upper, sink, stats);
 class ClusterProber {
  public:
     /// @param conann  ConANN classifier (caller owns, must outlive ClusterProber)
@@ -106,15 +115,16 @@ class ClusterProber {
     ///
     /// @param pc             Parsed cluster (Region 1 + Region 2)
     /// @param view           Lightweight prepared query view for this cluster
-    /// @param dynamic_d_k    Current k-th estimate distance:
-    ///                         (est_heap.size() >= top_k) ? est_heap.front()
-    ///                                                     : +infinity
+    /// @param safeout_frontier_upper  Conservative top-k upper frontier:
+    ///                         (est_heap.size() >= top_k)
+    ///                           ? max(entry.distance + entry.error_bound in est_heap)
+    ///                           : +infinity
     /// @param sink           Receives non-SafeOut candidates
     /// @param stats          Accumulated classification statistics
     void Probe(const query::ParsedCluster& pc,
                uint32_t cluster_id,
                const rabitq::PreparedClusterQueryView& view,
-               float dynamic_d_k,
+               float safeout_frontier_upper,
                bool enable_address_decode_simd,
                bool enable_fine_grained_timing,
                bool enable_stage1_safein,

@@ -152,6 +152,7 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     next_to_submit_ = 0;
     inflight_clusters_ = 0;
     est_heap_.clear();
+    est_heap_upper_frontier_ = 0.0f;
 
     auto t_search_start = std::chrono::steady_clock::now();
     const float* effective_query_vec = query_vec;
@@ -512,7 +513,7 @@ void OverlapScheduler::ProbeResidentThinPath(
         if (config_.early_stop) {
             if (use_crc_) {
                 float est_kth = (est_heap_.size() >= est_top_k_)
-                    ? est_heap_.front().first
+                    ? est_heap_.front().distance
                     : std::numeric_limits<float>::infinity();
                 auto t_crc_decision = std::chrono::steady_clock::now();
                 const bool should_stop = crc_stopper_.ShouldStop(
@@ -948,14 +949,29 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
             auto t_crc_merge = std::chrono::steady_clock::now();
             ctx_.stats().total_crc_estimates_merged +=
                 static_cast<uint32_t>(crc_estimates_.size());
-            for (float est_dist : crc_estimates_) {
+            auto recompute_upper_frontier = [&] {
+                sched_.est_heap_upper_frontier_ = 0.0f;
+                for (const auto& entry : sched_.est_heap_) {
+                    sched_.est_heap_upper_frontier_ =
+                        std::max(sched_.est_heap_upper_frontier_,
+                                 entry.distance + entry.error_bound);
+                }
+            };
+            for (const auto& estimate : crc_estimates_) {
+                if (sched_.est_top_k_ == 0) {
+                    continue;
+                }
                 if (sched_.est_heap_.size() < sched_.est_top_k_) {
-                    sched_.est_heap_.push_back({est_dist, 0u});
+                    sched_.est_heap_.push_back(estimate);
                     std::push_heap(sched_.est_heap_.begin(), sched_.est_heap_.end());
-                } else if (est_dist < sched_.est_heap_.front().first) {
+                    sched_.est_heap_upper_frontier_ =
+                        std::max(sched_.est_heap_upper_frontier_,
+                                 estimate.distance + estimate.error_bound);
+                } else if (estimate.distance < sched_.est_heap_.front().distance) {
                     std::pop_heap(sched_.est_heap_.begin(), sched_.est_heap_.end());
-                    sched_.est_heap_.back() = {est_dist, 0u};
+                    sched_.est_heap_.back() = estimate;
                     std::push_heap(sched_.est_heap_.begin(), sched_.est_heap_.end());
+                    recompute_upper_frontier();
                 }
             }
             crc_pending_ = false;
@@ -1002,7 +1018,7 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
 
             if (sched_.use_crc_) {
                 auto t_crc_buffer = std::chrono::steady_clock::now();
-                crc_estimates_.push_back(batch.est_dist[i]);
+                crc_estimates_.push_back({batch.est_dist[i], batch.est_error[i]});
                 ctx_.stats().total_crc_estimates_buffered++;
                 ctx_.stats().crc_buffer_ms += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t_crc_buffer).count();
@@ -1052,7 +1068,7 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
     bool skip_dedup_ = false;
     SubmitScratch& scratch_;
     bool crc_pending_ = false;
-    std::vector<float> crc_estimates_;
+    std::vector<EstimateHeapEntry> crc_estimates_;
 };
 
 // ============================================================================
@@ -1118,19 +1134,19 @@ void OverlapScheduler::ProbeCluster(
             prep_timing.quantize_ms + prep_timing.lut_build_ms;
     }
 
-    // dynamic_d_k:
+    // safeout_frontier_upper:
     // - When CRC is disabled, keep +inf to avoid any estimate-driven SafeOut.
-    // - When CRC is enabled and the estimate heap is full, use the current
-    //   query-time estimated kth distance directly.
-    float dynamic_d_k = std::numeric_limits<float>::infinity();
+    // - When CRC is enabled and the estimate heap is full, use the largest
+    //   upper bound among the retained estimate top-k entries.
+    float safeout_frontier_upper = std::numeric_limits<float>::infinity();
     if (use_crc_ && est_heap_.size() >= est_top_k_) {
-        dynamic_d_k = est_heap_.front().first;
+        safeout_frontier_upper = est_heap_upper_frontier_;
     }
 
     AsyncIOSink sink(*this, ctx, dat_fd);
     index::ProbeStats local_stats;
     auto classify_start = std::chrono::steady_clock::now();
-    prober_.Probe(pc, cluster_id, prepared, dynamic_d_k,
+    prober_.Probe(pc, cluster_id, prepared, safeout_frontier_upper,
                   config_.enable_address_decode_simd,
                   config_.enable_fine_grained_timing,
                   config_.enable_stage1_safein,
@@ -1168,6 +1184,13 @@ void OverlapScheduler::ProbeCluster(
         ctx.stats().probe_stage1_ms += stage1_ms;
         ctx.stats().probe_stage2_ms += stage2_ms;
     }
+    ctx.stats().stage1_fused_blocks += local_stats.stage1_fused_blocks;
+    ctx.stats().stage1_fused_safeout_lanes += local_stats.stage1_fused_safeout_lanes;
+    ctx.stats().stage1_fused_safein_lanes += local_stats.stage1_fused_safein_lanes;
+    ctx.stats().stage2_masked_kernel_calls += local_stats.stage2_masked_kernel_calls;
+    ctx.stats().stage2_lanes_requested += local_stats.stage2_lanes_requested;
+    ctx.stats().stage2_lanes_skipped += local_stats.stage2_lanes_skipped;
+    ctx.stats().stage2_lanes_total_valid += local_stats.stage2_lanes_total_valid;
     sink.FinalizeCluster();
     ctx.stats().probe_submit_ms += sink.submit_cpu_ms();
     ctx.stats().probe_submit_prepare_vec_only_ms += sink.prepare_vec_only_ms_;
@@ -1448,7 +1471,7 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
                 stop_safe_flush();
                 // CRC early stop: use RaBitQ estimate heap distance
                 float est_kth = (est_heap_.size() >= est_top_k_)
-                    ? est_heap_.front().first
+                    ? est_heap_.front().distance
                     : std::numeric_limits<float>::infinity();
                 auto t_crc_decision = std::chrono::steady_clock::now();
                 const bool should_stop = crc_stopper_.ShouldStop(

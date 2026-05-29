@@ -60,7 +60,7 @@ ClusterProber::~ClusterProber() = default;
 void ClusterProber::Probe(const query::ParsedCluster& pc,
                            uint32_t cluster_id,
                            const rabitq::PreparedClusterQueryView& view,
-                           float dynamic_d_k,
+                           float safeout_frontier_upper,
                            bool enable_address_decode_simd,
                            bool enable_fine_grained_timing,
                            bool enable_stage1_safein,
@@ -98,31 +98,27 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
         const float* block_norms =
             reinterpret_cast<const float*>(block_ptr + packed_sz);
 
-        // Stage 1a: batch-32 FastScan distance estimation
+        // Stage 1a/1b: fused batch-32 FastScan distance estimation and masks.
         alignas(64) float dists[32];
+        simd::FastScanStage1EvalResult stage1_eval{};
         if (enable_fine_grained_timing) {
             auto estimate_start = std::chrono::steady_clock::now();
-            estimator_.EstimateDistanceFastScan(
-                view, block_ptr, block_norms, count, dists);
+            stage1_eval = estimator_.EvaluateStage1FastScan(
+                view, block_ptr, block_norms, count, safeout_frontier_upper,
+                safein_threshold_base, enable_stage1_safein, dists);
             stats.stage1_estimate_ms += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - estimate_start).count();
         } else {
-            estimator_.EstimateDistanceFastScan(view, block_ptr, block_norms, count, dists);
+            stage1_eval = estimator_.EvaluateStage1FastScan(
+                view, block_ptr, block_norms, count, safeout_frontier_upper,
+                safein_threshold_base, enable_stage1_safein, dists);
         }
 
-        // Stage 1b: batch SafeOut classification via SIMD bitmask.
-        // Bit v set  ⟺  dists[v] > dynamic_d_k + 2 * margin_factor * block_norms[v]
-        uint32_t so_mask = 0;
-        if (enable_fine_grained_timing) {
-            auto mask_start = std::chrono::steady_clock::now();
-            so_mask = simd::FastScanSafeOutMask(
-                dists, block_norms, count, dynamic_d_k, view.safeout_margin_factor);
-            stats.stage1_mask_ms += std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - mask_start).count();
-        } else {
-            so_mask = simd::FastScanSafeOutMask(
-                dists, block_norms, count, dynamic_d_k, view.safeout_margin_factor);
-        }
+        // Bit v set  ⟺  dists[v] - margin_v > safeout_frontier_upper
+        uint32_t so_mask = stage1_eval.safeout_mask;
+        ++stats.stage1_fused_blocks;
+        stats.stage1_fused_safeout_lanes +=
+            static_cast<uint32_t>(__builtin_popcount(so_mask));
         stats.s1_safeout += static_cast<uint32_t>(__builtin_popcount(so_mask));
         if (collect_false_stats && so_mask != 0) {
             uint32_t m = so_mask;
@@ -139,10 +135,10 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
         const uint32_t lane_valid = LaneMaskForCount(count);
         const uint32_t maybe_in = (~so_mask) & lane_valid;
         const uint32_t safein_mask = enable_stage1_safein
-            ? (simd::FastScanSafeInMask(
-                   dists, block_norms, count, safein_threshold_base,
-                   view.safein_margin_factor) & maybe_in)
+            ? (stage1_eval.safein_mask & maybe_in)
             : 0u;
+        stats.stage1_fused_safein_lanes +=
+            static_cast<uint32_t>(__builtin_popcount(safein_mask));
         const uint32_t uncertain_mask = maybe_in & ~safein_mask;
 
         uint32_t survivor_lanes[32];
@@ -291,6 +287,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
 
             batch.global_idx[batch.count] = global_idx;
             batch.est_dist[batch.count] = est_dist_s1;
+            batch.est_error[batch.count] = safeout_margin_s1;
             batch.cls[batch.count] = (rc_final == ResultClass::SafeIn)
                 ? CandidateClass::SafeIn
                 : CandidateClass::Uncertain;
@@ -322,10 +319,24 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         pc.exrabitq_batch_parallel_block_view(block.block_id);
                     if (parallel_view.abs_slices != nullptr &&
                         parallel_view.sign_words != nullptr) {
-                        simd::IPExRaBitQBatchPackedSignParallelCompact(
+                        const uint32_t full_valid_mask =
+                            parallel_view.valid_count >= 32
+                                ? 0xFFFFFFFFu
+                                : ((1u << parallel_view.valid_count) - 1u);
+                        const uint32_t requested_mask =
+                            block.lane_mask & full_valid_mask;
+                        const uint32_t requested_lanes =
+                            static_cast<uint32_t>(__builtin_popcount(requested_mask));
+                        stats.stage2_masked_kernel_calls += 1;
+                        stats.stage2_lanes_requested += requested_lanes;
+                        stats.stage2_lanes_total_valid += parallel_view.valid_count;
+                        stats.stage2_lanes_skipped +=
+                            parallel_view.valid_count - requested_lanes;
+                        simd::IPExRaBitQBatchPackedSignParallelCompactMasked(
                             rotated_query,
                             parallel_view.abs_slices,
                             parallel_view.sign_words,
+                            requested_mask,
                             parallel_view.valid_count,
                             dim_,
                             pc.exrabitq_dim_block,
@@ -426,7 +437,6 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                 alignas(32) float lane_xipnorm[kStage2BatchSize] = {};
                 alignas(32) float lane_norm_oc[kStage2BatchSize] = {};
                 alignas(32) float lane_margin_s1[kStage2BatchSize] = {};
-                alignas(32) float lane_safeout_margin_s1[kStage2BatchSize] = {};
                 uint32_t chunk_idx = 0;
                 for (uint32_t lane = 0; lane < kStage2BatchSize; ++lane) {
                     if ((block.lane_mask & (1u << lane)) == 0) continue;
@@ -439,7 +449,6 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         : ip_raw_batch[chunk_idx++];
                     lane_norm_oc[lane] = entry.norm_oc;
                     lane_margin_s1[lane] = entry.margin_s1;
-                    lane_safeout_margin_s1[lane] = entry.safeout_margin_s1;
                 }
 
                 const bool split_stage2_margin =
@@ -455,7 +464,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         pq.norm_qc_sq,
                         1.0f / margin_s2_divisor_,
                         conann_.safein_d_k(),
-                        dynamic_d_k);
+                        safeout_frontier_upper);
 
                     stats.s2_safein += static_cast<uint32_t>(__builtin_popcount(classify_masks.safein));
                     stats.s2_safeout += static_cast<uint32_t>(__builtin_popcount(classify_masks.safeout));
@@ -483,8 +492,17 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                     for (uint32_t lane = 0; lane < kStage2BatchSize; ++lane) {
                         if ((keep_mask & (1u << lane)) == 0) continue;
                         const Stage2LaneEntry& entry = block.lanes[lane];
+                        const float xipnorm = lane_xipnorm[lane];
+                        const float ip_raw = lane_ip_raw[lane];
+                        const float ip_est = ip_raw * xipnorm;
+                        float est_dist_s2 = entry.norm_oc * entry.norm_oc + pq.norm_qc_sq
+                                          - 2.0f * entry.norm_oc * pq.norm_qc * ip_est;
+                        est_dist_s2 = std::max(est_dist_s2, 0.0f);
+                        const float safeout_margin_s2 =
+                            entry.safeout_margin_s1 / margin_s2_divisor_;
                         batch.global_idx[batch.count] = entry.global_idx;
-                        batch.est_dist[batch.count] = entry.est_dist_s1;
+                        batch.est_dist[batch.count] = est_dist_s2;
+                        batch.est_error[batch.count] = safeout_margin_s2;
                         batch.cls[batch.count] = ((classify_masks.safein >> lane) & 1u) != 0
                             ? CandidateClass::SafeIn
                             : CandidateClass::Uncertain;
@@ -507,7 +525,8 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                             entry.safeout_margin_s1 / margin_s2_divisor_;
                         const ResultClass rc_s2 =
                             conann_.ClassifyAdaptive(est_dist_s2, safein_margin_s2,
-                                                     safeout_margin_s2, dynamic_d_k);
+                                                     safeout_margin_s2,
+                                                     safeout_frontier_upper);
 
                         if (rc_s2 == ResultClass::SafeIn) {
                             ++stats.s2_safein;
@@ -525,7 +544,8 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         }
 
                         batch.global_idx[batch.count] = entry.global_idx;
-                        batch.est_dist[batch.count] = entry.est_dist_s1;
+                        batch.est_dist[batch.count] = est_dist_s2;
+                        batch.est_error[batch.count] = safeout_margin_s2;
                         batch.cls[batch.count] = (rc_s2 == ResultClass::SafeIn)
                             ? CandidateClass::SafeIn
                             : CandidateClass::Uncertain;

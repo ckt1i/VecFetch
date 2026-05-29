@@ -161,6 +161,13 @@ struct SearchStats {
     double probe_stage2_kernel_abs_fma_ms = 0;
     double probe_stage2_kernel_tail_ms = 0;
     double probe_stage2_kernel_reduce_ms = 0;
+    uint32_t stage1_fused_blocks = 0;
+    uint32_t stage1_fused_safeout_lanes = 0;
+    uint32_t stage1_fused_safein_lanes = 0;
+    uint64_t stage2_masked_kernel_calls = 0;
+    uint64_t stage2_lanes_requested = 0;
+    uint64_t stage2_lanes_skipped = 0;
+    uint64_t stage2_lanes_total_valid = 0;
     double probe_classify_ms = 0;
     double probe_submit_ms = 0;
     double probe_submit_prepare_vec_only_ms = 0;

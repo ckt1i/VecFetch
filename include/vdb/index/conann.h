@@ -80,29 +80,30 @@ class ConANN {
     /// @return             SafeIn / SafeOut / Uncertain
     ResultClass Classify(float approx_dist, float margin) const;
 
-    /// Classify with dynamic SafeOut threshold.
+    /// Classify with dynamic SafeOut upper frontier.
     ///
-    /// SafeOut uses dynamic_d_k (from RaBitQ estimate heap) instead of static d_k.
-    /// SafeIn remains static and uses safein_d_k_ when available, otherwise
-    /// falls back to the legacy d_k_ for backward compatibility.
+    /// SafeOut uses candidate lower-bound semantics:
+    ///   approx_dist - margin > safeout_frontier_upper.
+    /// SafeIn uses candidate upper-bound semantics:
+    ///   approx_dist + margin < safein_d_k_.
     ///
     /// @param approx_dist  Approximate squared L2 distance from RaBitQ
     /// @param margin       Dynamic distance error bound for this (cluster, query)
-    /// @param dynamic_d_k  Current k-th distance from RaBitQ estimate heap
+    /// @param safeout_frontier_upper  Conservative top-k upper frontier
     /// @return             SafeIn / SafeOut / Uncertain
     VDB_FORCE_INLINE ResultClass ClassifyAdaptive(float approx_dist, float margin,
-                                                   float dynamic_d_k) const {
-        if (approx_dist > dynamic_d_k + 2 * margin) return ResultClass::SafeOut;
-        if (approx_dist < safein_d_k_ - 2 * margin)  return ResultClass::SafeIn;
+                                                   float safeout_frontier_upper) const {
+        if (approx_dist > safeout_frontier_upper + margin) return ResultClass::SafeOut;
+        if (approx_dist < safein_d_k_ - margin) return ResultClass::SafeIn;
         return ResultClass::Uncertain;
     }
 
     VDB_FORCE_INLINE ResultClass ClassifyAdaptive(float approx_dist,
                                                   float safein_margin,
                                                   float safeout_margin,
-                                                  float dynamic_d_k) const {
-        if (approx_dist > dynamic_d_k + 2 * safeout_margin) return ResultClass::SafeOut;
-        if (approx_dist < safein_d_k_ - 2 * safein_margin) return ResultClass::SafeIn;
+                                                  float safeout_frontier_upper) const {
+        if (approx_dist > safeout_frontier_upper + safeout_margin) return ResultClass::SafeOut;
+        if (approx_dist < safein_d_k_ - safein_margin) return ResultClass::SafeIn;
         return ResultClass::Uncertain;
     }
 

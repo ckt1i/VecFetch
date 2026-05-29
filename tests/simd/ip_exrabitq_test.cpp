@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "vdb/simd/ip_exrabitq.h"
@@ -50,6 +52,44 @@ std::vector<uint8_t> MakeSign(uint32_t dim, int mode) {
     return out;
 }
 
+void BuildParallelCompactLayout(uint32_t dim,
+                                uint32_t dim_block,
+                                const std::vector<std::vector<uint8_t>>& lane_abs,
+                                const std::vector<std::vector<uint8_t>>& lane_sign,
+                                std::vector<uint8_t>& abs_slices,
+                                std::vector<uint16_t>& sign_words) {
+    const uint32_t num_dim_blocks = (dim + dim_block - 1) / dim_block;
+    const uint32_t slices_per_dim_block = (dim_block + 15) / 16;
+    abs_slices.assign(
+        static_cast<size_t>(num_dim_blocks) * slices_per_dim_block * 8u * 16u,
+        0);
+    sign_words.assign(
+        static_cast<size_t>(num_dim_blocks) * slices_per_dim_block * 8u,
+        0);
+    for (uint32_t db = 0; db < num_dim_blocks; ++db) {
+        for (uint32_t sub = 0; sub < slices_per_dim_block; ++sub) {
+            const uint32_t dim_start = db * dim_block + sub * 16u;
+            for (uint32_t lane = 0; lane < 8; ++lane) {
+                uint16_t sign_word = 0;
+                for (uint32_t offset = 0; offset < 16; ++offset) {
+                    const uint32_t d = dim_start + offset;
+                    const size_t abs_idx =
+                        ((static_cast<size_t>(db) * slices_per_dim_block + sub) * 8u +
+                         lane) * 16u + offset;
+                    if (d < dim) {
+                        abs_slices[abs_idx] = lane_abs[lane][d];
+                        if (lane_sign[lane][d] != 0) {
+                            sign_word |= static_cast<uint16_t>(1u << offset);
+                        }
+                    }
+                }
+                sign_words[(static_cast<size_t>(db) * slices_per_dim_block + sub) * 8u +
+                           lane] = sign_word;
+            }
+        }
+    }
+}
+
 }  // namespace
 
 TEST(IPExRaBitQTest, MatchesScalarAcrossDimsAndSignPatterns) {
@@ -67,6 +107,50 @@ TEST(IPExRaBitQTest, MatchesScalarAcrossDimsAndSignPatterns) {
 
             EXPECT_NEAR(actual, expected, 1e-4f)
                 << "dim=" << dim << " sign_mode=" << sign_mode;
+        }
+    }
+}
+
+TEST(IPExRaBitQTest, MaskedParallelCompactMatchesFullKernelForSelectedLanes) {
+    for (uint32_t dim : {512u, 768u, 1024u}) {
+        for (uint32_t dim_block : {32u, 64u}) {
+            const uint32_t slices_per_dim_block = (dim_block + 15) / 16;
+            const auto query = MakeQuery(dim);
+            std::vector<std::vector<uint8_t>> lane_abs(8);
+            std::vector<std::vector<uint8_t>> lane_sign(8);
+            for (uint32_t lane = 0; lane < 8; ++lane) {
+                lane_abs[lane] = MakeCodeAbs(dim);
+                lane_sign[lane] = MakeSign(dim, static_cast<int>(lane % 3));
+                for (uint32_t d = 0; d < dim; ++d) {
+                    lane_abs[lane][d] =
+                        static_cast<uint8_t>((lane_abs[lane][d] + lane * 3u + d) & 0x0F);
+                }
+            }
+
+            std::vector<uint8_t> abs_slices;
+            std::vector<uint16_t> sign_words;
+            BuildParallelCompactLayout(
+                dim, dim_block, lane_abs, lane_sign, abs_slices, sign_words);
+
+            std::vector<float> full(8, 0.0f);
+            vdb::simd::IPExRaBitQBatchPackedSignParallelCompact(
+                query.data(), abs_slices.data(), sign_words.data(), 8, dim,
+                dim_block, slices_per_dim_block, full.data());
+
+            for (uint32_t mask : {0x00u, 0x01u, 0x80u, 0x55u, 0xA6u, 0xFFu}) {
+                std::vector<float> masked(8, 0.0f);
+                vdb::simd::IPExRaBitQBatchPackedSignParallelCompactMasked(
+                    query.data(), abs_slices.data(), sign_words.data(), mask, 8, dim,
+                    dim_block, slices_per_dim_block, masked.data());
+                for (uint32_t lane = 0; lane < 8; ++lane) {
+                    if ((mask & (1u << lane)) == 0) {
+                        continue;
+                    }
+                    EXPECT_NEAR(masked[lane], full[lane], 1e-3f)
+                        << "dim=" << dim << " dim_block=" << dim_block
+                        << " mask=" << mask << " lane=" << lane;
+                }
+            }
         }
     }
 }

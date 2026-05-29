@@ -1,7 +1,7 @@
 ./bench_vector_search \
   --base /home/zcq/VDB/data/coco_100k/image_embeddings.fvecs \
   --query /home/zcq/VDB/data/coco_100k/query_embeddings.fvecs \
-  --nlist 2048 --nprobe 150 --topk 10 --bits 4 --queries 1000 --crc 1 \
+  --nlist 2048 --nprobe 64 --topk 10 --bits 4 --queries 1000 --crc 1 \
   --tmp-dir /tmp/bench_vs_coco --epsilon-samples 500 --epsilon-percentile 0.95 --crc-alpha 0.01
 
 ./bench_vector_search \
@@ -50,6 +50,7 @@ PYTHONUNBUFFERED=1 /home/zcq/anaconda3/envs/labnew/bin/python \
 ./bench_e2e --dataset /home/zcq/VDB/data/coco_100k --index-dir /home/zcq/VDB/test/data/COCO100k/index_fkmeans_2048 --output /home/zcq/VDB/test/tmp --nlist 2048 --bits 4 --topk 10 --nprobe 500 --queries 1000 --io-queue-depth 64 --submission-mode shared --sqpoll --epsilon-percentile 0.9 --crc-alpha 0.05
 
 ./build/benchmarks/bench_e2e   --dataset /home/zcq/VDB/data/coco_100k   --output /home/zcq/VDB/test   --nlist 2048   --bits 4   --epsilon-percentile 0.90   --build-only
-./build/benchmarks/bench_e2e   --dataset /home/zcq/VDB/data/coco_100k   --output /home/zcq/VDB/test   --index-dir /home/zcq/VDB/test/data/COCO100k/index_fkmeans_2048_bits4_eps0.90   --nlist 2048   --nprobe 64   --topk 10   --queries 2000   --bits 4   --clu-read-mode full_preload   --use-resident-clusters 1 --io-queue-depth 64 --cluster-submit-reserve 8 --prefetch-depth 16 --initial-prefetch 16 --refill-threshold 4 --refill-count 8 --submit-batch 32  --early-stop 0   --crc 1 --fine-grained-timing 0 --hotpath-detailed-timing 0 --fixed-vec-buffer-count 512
+./build/benchmarks/bench_e2e   --dataset /home/zcq/VDB/data/coco_100k   --output /home/zcq/VDB/test/frontier_upper_s2heap_coco100k_safein_dk_p0.95_manual   --index-dir /home/zcq/VDB/test/data/COCO100k/index_fkmeans_2048_bits4_eps0.90   --nlist 2048   --nprobe 64   --topk 10   --queries 1000   --bits 4   --clu-read-mode full_preload   --use-resident-clusters 1   --io-queue-depth 64   --cluster-submit-reserve 8   --prefetch-depth 16   --initial-prefetch 16   --refill-threshold 4   --refill-count 8   --submit-batch 32   --early-stop 0   --crc 1   --fine-grained-timing 0   --hotpath-detailed-timing 0   --fixed-vec-buffer-count 512   --enable-stage1-safein 1   --safein-dk-samples-input /home/zcq/VDB/test/coco100k_safein_dk_samples_s1000_n2048_frontier/dk_samples.npy   --safein-dk-percentile 0.95
 
 ./build/benchmarks/bench_e2e --dataset /home/zcq/VDB/test/msmarco_fht_kac_adapter --index-dir /home/zcq/VDB/test/data/MSMARCO/fht_kac_rotator --output /home/zcq/VDB/test/hotpath_timing_ablation/recall_full --query-only 0 --skip-gt 0 --queries 1000 --topk 10 --nprobe 256 --clu-read-mode full_preload --use-resident-clusters 1 --io-queue-depth 64 --cluster-submit-reserve 8 --prefetch-depth 16 --initial-prefetch 16 --refill-threshold 4 --refill-count 8 --submit-batch 32 --crc 1 --fine-grained-timing 0 --hotpath-detailed-timing 0  --fixed-vec-buffer-count 512
+

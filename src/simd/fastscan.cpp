@@ -819,7 +819,7 @@ uint32_t FastScanSafeInMask(const float* VDB_RESTRICT dists,
                              float safein_threshold_base,
                              float margin_factor) {
 #if defined(VDB_USE_AVX512)
-    const __m512 v_mfac = _mm512_set1_ps(2.0f * margin_factor);
+    const __m512 v_mfac = _mm512_set1_ps(margin_factor);
     const __m512 v_base = _mm512_set1_ps(safein_threshold_base);
     uint32_t result = 0;
     for (uint32_t base = 0; base < count; base += 16) {
@@ -841,7 +841,7 @@ uint32_t FastScanSafeInMask(const float* VDB_RESTRICT dists,
     }
     return result;
 #elif defined(VDB_USE_AVX2)
-    const __m256 v_mfac = _mm256_set1_ps(2.0f * margin_factor);
+    const __m256 v_mfac = _mm256_set1_ps(margin_factor);
     const __m256 v_base = _mm256_set1_ps(safein_threshold_base);
     uint32_t result = 0;
     for (uint32_t base = 0; base < count; base += 8) {
@@ -860,9 +860,8 @@ uint32_t FastScanSafeInMask(const float* VDB_RESTRICT dists,
     return result;
 #else
     uint32_t result = 0;
-    const float threshold_mul = 2.0f * margin_factor;
     for (uint32_t v = 0; v < count; ++v) {
-        const float threshold = safein_threshold_base - threshold_mul * block_norms[v];
+        const float threshold = safein_threshold_base - margin_factor * block_norms[v];
         if (dists[v] < threshold) {
             result |= 1u << v;
         }
@@ -874,12 +873,11 @@ uint32_t FastScanSafeInMask(const float* VDB_RESTRICT dists,
 uint32_t FastScanSafeOutMask(const float* VDB_RESTRICT dists,
                               const float* VDB_RESTRICT block_norms,
                               uint32_t count,
-                              float est_kth,
+                              float safeout_frontier_upper,
                               float margin_factor) {
 #if defined(VDB_USE_AVX512)
-    const __m512 v_mfac    = _mm512_set1_ps(margin_factor);
-    const __m512 v_est_kth = _mm512_set1_ps(est_kth);
-    const __m512 v_two     = _mm512_set1_ps(2.0f);
+    const __m512 v_mfac = _mm512_set1_ps(margin_factor);
+    const __m512 v_frontier = _mm512_set1_ps(safeout_frontier_upper);
 
     uint32_t result = 0;
 
@@ -900,9 +898,9 @@ uint32_t FastScanSafeOutMask(const float* VDB_RESTRICT dists,
             v_norms = _mm512_maskz_loadu_ps(lane_mask, block_norms + base);
         }
 
-        // so_thresh = est_kth + 2 * margin_factor * norm
+        // so_thresh = safeout_frontier_upper + margin_factor * norm
         __m512 v_margin = _mm512_mul_ps(v_mfac, v_norms);
-        __m512 v_so_thr = _mm512_fmadd_ps(v_two, v_margin, v_est_kth);
+        __m512 v_so_thr = _mm512_add_ps(v_frontier, v_margin);
         // bit = (dist > so_thresh) within valid lanes
         __mmask16 so_mask = _mm512_mask_cmp_ps_mask(
             lane_mask, v_dists, v_so_thr, _CMP_GT_OQ);
@@ -912,7 +910,7 @@ uint32_t FastScanSafeOutMask(const float* VDB_RESTRICT dists,
 #else
     uint32_t result = 0;
     for (uint32_t v = 0; v < count; ++v) {
-        float so_thresh = est_kth + 2.0f * margin_factor * block_norms[v];
+        float so_thresh = safeout_frontier_upper + margin_factor * block_norms[v];
         if (dists[v] > so_thresh) {
             result |= 1u << v;
         }
@@ -988,6 +986,99 @@ void FastScanDequantize(const uint32_t* VDB_RESTRICT raw_accu,
         out_dist[v] = std::max(dist_sq, 0.0f);
     }
 #endif
+}
+
+void FastScanStage1Evaluate(const uint32_t* VDB_RESTRICT raw_accu,
+                            const float* VDB_RESTRICT block_norms,
+                            uint32_t count,
+                            int32_t fs_shift,
+                            float fs_width,
+                            float sum_q,
+                            float inv_sqrt_dim,
+                            float norm_qc,
+                            float norm_qc_sq,
+                            float safeout_frontier_upper,
+                            float safeout_margin_factor,
+                            float safein_threshold_base,
+                            float safein_margin_factor,
+                            bool enable_safein,
+                            float* VDB_RESTRICT out_dist,
+                            FastScanStage1EvalResult* VDB_RESTRICT result) {
+    FastScanStage1EvalResult local{};
+#if defined(VDB_USE_AVX512)
+    const __m512 v_shift = _mm512_set1_ps(static_cast<float>(fs_shift));
+    const __m512 v_width = _mm512_set1_ps(fs_width);
+    const __m512 v_sum_q = _mm512_set1_ps(sum_q);
+    const __m512 v_inv_sqrt = _mm512_set1_ps(inv_sqrt_dim);
+    const __m512 v_norm_qc = _mm512_set1_ps(norm_qc);
+    const __m512 v_norm_qc_sq = _mm512_set1_ps(norm_qc_sq);
+    const __m512 v_two = _mm512_set1_ps(2.0f);
+    const __m512 v_zero = _mm512_setzero_ps();
+    const __m512 v_safeout_frontier = _mm512_set1_ps(safeout_frontier_upper);
+    const __m512 v_safeout_margin_factor = _mm512_set1_ps(safeout_margin_factor);
+    const __m512 v_safein_base = _mm512_set1_ps(safein_threshold_base);
+    const __m512 v_safein_margin_factor = _mm512_set1_ps(safein_margin_factor);
+
+    for (uint32_t base = 0; base < count; base += 16) {
+        const uint32_t valid = std::min<uint32_t>(16u, count - base);
+        const __mmask16 lane_mask = (valid >= 16)
+            ? __mmask16(0xFFFF)
+            : __mmask16((1u << valid) - 1u);
+
+        const __m512i v_raw_i = (valid >= 16)
+            ? _mm512_loadu_si512(reinterpret_cast<const __m512i*>(raw_accu + base))
+            : _mm512_maskz_loadu_epi32(lane_mask, raw_accu + base);
+        const __m512 v_raw = _mm512_cvtepu32_ps(v_raw_i);
+        const __m512 v_ip_raw =
+            _mm512_mul_ps(_mm512_add_ps(v_raw, v_shift), v_width);
+        const __m512 v_ip_est =
+            _mm512_mul_ps(_mm512_fmsub_ps(v_two, v_ip_raw, v_sum_q),
+                          v_inv_sqrt);
+        const __m512 v_norm_oc = (valid >= 16)
+            ? _mm512_loadu_ps(block_norms + base)
+            : _mm512_maskz_loadu_ps(lane_mask, block_norms + base);
+        __m512 v_dist =
+            _mm512_fmadd_ps(v_norm_oc, v_norm_oc, v_norm_qc_sq);
+        const __m512 v_two_oc_qc =
+            _mm512_mul_ps(v_two, _mm512_mul_ps(v_norm_oc, v_norm_qc));
+        v_dist = _mm512_fnmadd_ps(v_two_oc_qc, v_ip_est, v_dist);
+        v_dist = _mm512_max_ps(v_dist, v_zero);
+        if (valid >= 16) {
+            _mm512_storeu_ps(out_dist + base, v_dist);
+        } else {
+            _mm512_mask_storeu_ps(out_dist + base, lane_mask, v_dist);
+        }
+
+        const __m512 v_so_thresh = _mm512_add_ps(
+            v_safeout_frontier,
+            _mm512_mul_ps(v_safeout_margin_factor, v_norm_oc));
+        const __mmask16 so_mask = _mm512_mask_cmp_ps_mask(
+            lane_mask, v_dist, v_so_thresh, _CMP_GT_OQ);
+        local.safeout_mask |= static_cast<uint32_t>(so_mask) << base;
+
+        if (enable_safein) {
+            const __m512 v_si_thresh = _mm512_sub_ps(
+                v_safein_base,
+                _mm512_mul_ps(v_safein_margin_factor, v_norm_oc));
+            const __mmask16 si_mask = _mm512_mask_cmp_ps_mask(
+                lane_mask, v_dist, v_si_thresh, _CMP_LT_OQ);
+            local.safein_mask |= static_cast<uint32_t>(si_mask) << base;
+        }
+    }
+#else
+    FastScanDequantize(raw_accu, block_norms, count, fs_shift, fs_width,
+                       sum_q, inv_sqrt_dim, norm_qc, norm_qc_sq, out_dist);
+    local.safeout_mask = FastScanSafeOutMask(
+        out_dist, block_norms, count, safeout_frontier_upper,
+        safeout_margin_factor);
+    local.safein_mask = enable_safein
+        ? FastScanSafeInMask(out_dist, block_norms, count,
+                             safein_threshold_base, safein_margin_factor)
+        : 0u;
+#endif
+    if (result != nullptr) {
+        *result = local;
+    }
 }
 
 }  // namespace simd

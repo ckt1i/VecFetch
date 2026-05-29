@@ -18,6 +18,8 @@
 #include "vdb/query/search_results.h"
 #include "vdb/rabitq/rabitq_estimator.h"
 
+class OverlapSchedulerTest;
+
 namespace vdb {
 namespace query {
 
@@ -39,6 +41,8 @@ class OverlapScheduler {
     SearchResults Search(const float* query_vec);
 
  private:
+    friend class ::OverlapSchedulerTest;
+
     enum class PendingBufferCleanup : uint8_t {
         None,
         Free,
@@ -199,7 +203,17 @@ class OverlapScheduler {
 
     // CRC early stop state (reset per Search() call)
     index::CrcStopper crc_stopper_;
-    std::vector<std::pair<float, uint32_t>> est_heap_;
+    struct EstimateHeapEntry {
+        float distance = 0.0f;
+        float error_bound = 0.0f;
+
+        bool operator<(const EstimateHeapEntry& other) const {
+            return distance < other.distance;
+        }
+    };
+
+    std::vector<EstimateHeapEntry> est_heap_;
+    float est_heap_upper_frontier_ = 0.0f;
     uint32_t est_top_k_ = 0;
     bool use_crc_ = false;
 

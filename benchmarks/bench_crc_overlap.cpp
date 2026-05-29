@@ -42,6 +42,24 @@ using namespace vdb::index;
 // Helpers
 // ============================================================================
 
+struct EstimateHeapEntry {
+    float distance = 0.0f;
+    float error_bound = 0.0f;
+    uint32_t id = 0;
+
+    bool operator<(const EstimateHeapEntry& other) const {
+        return distance < other.distance;
+    }
+};
+
+static float RecomputeMaxError(const std::vector<EstimateHeapEntry>& heap) {
+    float max_error = 0.0f;
+    for (const EstimateHeapEntry& entry : heap) {
+        max_error = std::max(max_error, entry.error_bound);
+    }
+    return max_error;
+}
+
 static std::string GetArg(int argc, char* argv[], const char* name,
                           const std::string& def) {
     for (int i = 1; i + 1 < argc; ++i) {
@@ -176,8 +194,9 @@ static SafeOutStats ClassifyAllVectors(
     }
     std::sort(centroid_dists.begin(), centroid_dists.end());
 
-    // est_heap for dynamic_d_k
-    std::vector<std::pair<float, uint32_t>> est_heap;
+    // Estimate heap for the relaxed SafeOut frontier.
+    std::vector<EstimateHeapEntry> est_heap;
+    float max_error_in_est_heap = 0.0f;
 
     for (uint32_t p = 0; p < nlist; ++p) {
         uint32_t cid = centroid_dists[p].second;
@@ -195,9 +214,8 @@ static SafeOutStats ClassifyAllVectors(
         }
         float margin = 2.0f * r_max * pq.norm_qc * conann.epsilon();
 
-        // dynamic_d_k from est_heap at cluster start
-        float dynamic_d_k = (use_dynamic && est_heap.size() >= top_k)
-            ? est_heap.front().first
+        float safeout_frontier_upper = (use_dynamic && est_heap.size() >= top_k)
+            ? est_heap.front().distance + max_error_in_est_heap
             : conann.d_k();
 
         for (uint32_t vi = 0; vi < enc.count; ++vi) {
@@ -209,22 +227,9 @@ static SafeOutStats ClassifyAllVectors(
 
             float dist = estimator.EstimateDistanceRaw(pq, words, num_words, norm_oc);
 
-            // Update est_heap
-            if (use_dynamic) {
-                uint32_t gid = cluster_members[cid][vi];
-                if (est_heap.size() < top_k) {
-                    est_heap.push_back({dist, gid});
-                    std::push_heap(est_heap.begin(), est_heap.end());
-                } else if (dist < est_heap.front().first) {
-                    std::pop_heap(est_heap.begin(), est_heap.end());
-                    est_heap.back() = {dist, gid};
-                    std::push_heap(est_heap.begin(), est_heap.end());
-                }
-            }
-
             // Classify
             ResultClass rc = use_dynamic
-                ? conann.ClassifyAdaptive(dist, margin, dynamic_d_k)
+                ? conann.ClassifyAdaptive(dist, margin, safeout_frontier_upper)
                 : conann.Classify(dist, margin);
 
             uint32_t gid = cluster_members[cid][vi];
@@ -235,6 +240,21 @@ static SafeOutStats ClassifyAllVectors(
                 stats.safe_in++;
             } else {
                 stats.uncertain++;
+            }
+
+            if (use_dynamic && rc != ResultClass::SafeOut) {
+                const EstimateHeapEntry estimate{dist, margin, gid};
+                if (est_heap.size() < top_k) {
+                    est_heap.push_back(estimate);
+                    std::push_heap(est_heap.begin(), est_heap.end());
+                    max_error_in_est_heap =
+                        std::max(max_error_in_est_heap, estimate.error_bound);
+                } else if (estimate.distance < est_heap.front().distance) {
+                    std::pop_heap(est_heap.begin(), est_heap.end());
+                    est_heap.back() = estimate;
+                    std::push_heap(est_heap.begin(), est_heap.end());
+                    max_error_in_est_heap = RecomputeMaxError(est_heap);
+                }
             }
         }
     }

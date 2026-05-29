@@ -137,7 +137,7 @@ TEST(ConANNTest, Classify_LargeEpsilon) {
     EXPECT_EQ(conann.Classify(201.1f), ResultClass::SafeOut);
 }
 
-TEST(ConANNTest, ClassifyAdaptive_UsesSafeInDkAndDynamicSafeOut) {
+TEST(ConANNTest, ClassifyAdaptive_UsesSafeInDkAndSafeOutFrontier) {
     ConANN conann(/*epsilon=*/0.1f, /*legacy_d_k=*/1.0f,
                   /*safein_d_k=*/1.3f, /*has_safein_d_k=*/true);
 
@@ -148,7 +148,7 @@ TEST(ConANNTest, ClassifyAdaptive_UsesSafeInDkAndDynamicSafeOut) {
               ResultClass::SafeIn);
     EXPECT_EQ(conann.ClassifyAdaptive(/*approx_dist=*/1.15f,
                                       /*margin=*/0.05f,
-                                      /*dynamic_d_k=*/1.0f),
+                                      /*safeout_frontier_upper=*/1.0f),
               ResultClass::SafeOut);
 }
 
@@ -286,111 +286,91 @@ TEST(ConANNTest, CalibrateDistanceThreshold_EdgeCase_Empty) {
 }
 
 // ============================================================================
-// ConANN::ClassifyAdaptive — dynamic SafeOut threshold
+// ConANN::ClassifyAdaptive — interval-bound classification
 // ============================================================================
 
-TEST(ConANNTest, ClassifyAdaptive_DynamicSafeOut) {
-    // epsilon=0.2, d_k=1.0
-    // Classify(margin=0): SafeOut > 1.0 + 0 = 1.0, SafeIn < 1.0 - 0 = 1.0
-    ConANN conann(0.0f, 1.0f);
-    float margin = 0.0f;
-
-    // With dynamic_d_k = 0.5 (tighter than static d_k=1.0):
-    // SafeOut: dist > 0.5 → more SafeOut
-    EXPECT_EQ(conann.ClassifyAdaptive(0.6f, margin, 0.5f), ResultClass::SafeOut);
-    // Same dist with static Classify would NOT be SafeOut (0.6 < 1.0)
-    EXPECT_NE(conann.Classify(0.6f, margin), ResultClass::SafeOut);
-}
-
-TEST(ConANNTest, ClassifyAdaptive_SafeInUsesStaticDk) {
-    // d_k=1.0, margin=0
-    ConANN conann(0.0f, 1.0f);
-    float margin = 0.0f;
-
-    // SafeIn threshold is ALWAYS static d_k_ - 2*margin = 1.0
-    // dynamic_d_k = 0.5: SafeOut if dist > 0.5, so pick dist below both thresholds
-    // dist=0.4 < 0.5 → not SafeOut; dist=0.4 < 1.0 → SafeIn
-    EXPECT_EQ(conann.ClassifyAdaptive(0.4f, margin, 0.5f), ResultClass::SafeIn);
-    // Same with static Classify
-    EXPECT_EQ(conann.Classify(0.4f, margin), ResultClass::SafeIn);
-
-    // dist=0.9 > dynamic_d_k=0.5 → SafeOut (dynamic threshold wins)
-    // But with static Classify: 0.9 < d_k=1.0 → SafeIn
-    EXPECT_EQ(conann.ClassifyAdaptive(0.9f, margin, 0.5f), ResultClass::SafeOut);
-    EXPECT_EQ(conann.Classify(0.9f, margin), ResultClass::SafeIn);
-}
-
-TEST(ConANNTest, ClassifyAdaptive_DynamicDkLargerThanStatic) {
-    // dynamic_d_k > static d_k → SafeOut threshold is HIGHER → fewer SafeOut
-    ConANN conann(0.0f, 1.0f);
-    float margin = 0.0f;
-
-    // dist=1.5, dynamic_d_k=2.0 → 1.5 < 2.0 → NOT SafeOut
-    EXPECT_NE(conann.ClassifyAdaptive(1.5f, margin, 2.0f), ResultClass::SafeOut);
-    // But with static d_k=1.0 → 1.5 > 1.0 → SafeOut
-    EXPECT_EQ(conann.Classify(1.5f, margin), ResultClass::SafeOut);
-}
-
-TEST(ConANNTest, ClassifyAdaptive_WithMargin) {
-    ConANN conann(0.5f, 10.0f);
-    float margin = 1.0f;  // 2*margin = 2.0
-    float dynamic_d_k = 5.0f;
-
-    // SafeOut threshold: 5.0 + 2.0 = 7.0
-    // SafeIn threshold:  10.0 - 2.0 = 8.0 (static)
-    // Note: SafeOut checked first, so overlap zone [7.0, 8.0] → SafeOut wins
-
-    // dist=7.1 > 7.0 → SafeOut
-    EXPECT_EQ(conann.ClassifyAdaptive(7.1f, margin, dynamic_d_k), ResultClass::SafeOut);
-    // dist=7.0 → NOT > 7.0 → check SafeIn: 7.0 < 8.0 → SafeIn
-    EXPECT_EQ(conann.ClassifyAdaptive(7.0f, margin, dynamic_d_k), ResultClass::SafeIn);
-
-    // dist=4.0 < 7.0 and < 8.0 → SafeIn
-    EXPECT_EQ(conann.ClassifyAdaptive(4.0f, margin, dynamic_d_k), ResultClass::SafeIn);
-
-    // Now use dynamic_d_k=9.0 (close to static d_k=10.0, no overlap)
-    // SafeOut threshold: 9.0 + 2.0 = 11.0
-    // SafeIn threshold:  10.0 - 2.0 = 8.0
-    // Uncertain zone: [8.0, 11.0]
-    EXPECT_EQ(conann.ClassifyAdaptive(9.0f, 1.0f, 9.0f), ResultClass::Uncertain);
-    EXPECT_EQ(conann.ClassifyAdaptive(7.9f, 1.0f, 9.0f), ResultClass::SafeIn);
-    EXPECT_EQ(conann.ClassifyAdaptive(11.1f, 1.0f, 9.0f), ResultClass::SafeOut);
-}
-
-TEST(ConANNTest, ClassifyAdaptive_MoreSafeOutWithTighterDk) {
-    // Verify that lowering dynamic_d_k increases SafeOut count
+TEST(ConANNTest, ClassifyAdaptive_SafeOutUsesCandidateLowerBound) {
     ConANN conann(0.0f, 10.0f);
-    float margin = 0.5f;
-    // SafeOut threshold = ddk + 1.0, SafeIn threshold = 10.0 - 1.0 = 9.0
+    const float margin = 1.0f;
+    const float safeout_frontier_upper = 5.0f;
 
-    std::vector<float> test_dists = {2, 4, 6, 8, 10, 12, 14, 16};
-    auto count_safeout = [&](float ddk) {
+    // SafeOut iff approx_dist - margin > frontier, i.e. approx_dist > 6.0.
+    EXPECT_EQ(conann.ClassifyAdaptive(6.1f, margin, safeout_frontier_upper),
+              ResultClass::SafeOut);
+    EXPECT_NE(conann.ClassifyAdaptive(6.0f, margin, safeout_frontier_upper),
+              ResultClass::SafeOut);
+}
+
+TEST(ConANNTest, ClassifyAdaptive_SafeInUsesCandidateUpperBound) {
+    ConANN conann(/*epsilon=*/0.0f, /*legacy_d_k=*/10.0f,
+                  /*safein_d_k=*/8.0f, /*has_safein_d_k=*/true);
+    const float margin = 1.0f;
+    const float safeout_frontier_upper = 20.0f;
+
+    // SafeIn iff approx_dist + margin < safein_d_k, i.e. approx_dist < 7.0.
+    EXPECT_EQ(conann.ClassifyAdaptive(6.9f, margin, safeout_frontier_upper),
+              ResultClass::SafeIn);
+    EXPECT_EQ(conann.ClassifyAdaptive(7.0f, margin, safeout_frontier_upper),
+              ResultClass::Uncertain);
+}
+
+TEST(ConANNTest, ClassifyAdaptive_SafeOutCheckedBeforeSafeIn) {
+    ConANN conann(/*epsilon=*/0.0f, /*legacy_d_k=*/10.0f,
+                  /*safein_d_k=*/8.0f, /*has_safein_d_k=*/true);
+
+    EXPECT_EQ(conann.ClassifyAdaptive(/*approx_dist=*/6.2f,
+                                      /*safein_margin=*/1.0f,
+                                      /*safeout_margin=*/1.0f,
+                                      /*safeout_frontier_upper=*/5.0f),
+              ResultClass::SafeOut);
+}
+
+TEST(ConANNTest, ClassifyAdaptive_SplitMargins) {
+    ConANN conann(/*epsilon=*/0.0f, /*legacy_d_k=*/10.0f,
+                  /*safein_d_k=*/8.0f, /*has_safein_d_k=*/true);
+    const float safeout_frontier_upper = 5.0f;
+
+    EXPECT_EQ(conann.ClassifyAdaptive(/*approx_dist=*/6.6f,
+                                      /*safein_margin=*/0.5f,
+                                      /*safeout_margin=*/1.5f,
+                                      safeout_frontier_upper),
+              ResultClass::SafeOut);
+    EXPECT_EQ(conann.ClassifyAdaptive(/*approx_dist=*/7.4f,
+                                      /*safein_margin=*/0.5f,
+                                      /*safeout_margin=*/3.0f,
+                                      safeout_frontier_upper),
+              ResultClass::SafeIn);
+    EXPECT_EQ(conann.ClassifyAdaptive(/*approx_dist=*/7.6f,
+                                      /*safein_margin=*/0.5f,
+                                      /*safeout_margin=*/3.0f,
+                                      safeout_frontier_upper),
+              ResultClass::Uncertain);
+}
+
+TEST(ConANNTest, ClassifyAdaptive_InfiniteFrontierDisablesSafeOut) {
+    ConANN conann(/*epsilon=*/0.0f, /*legacy_d_k=*/10.0f,
+                  /*safein_d_k=*/8.0f, /*has_safein_d_k=*/true);
+
+    EXPECT_NE(conann.ClassifyAdaptive(100.0f, 1.0f,
+                                      std::numeric_limits<float>::infinity()),
+              ResultClass::SafeOut);
+}
+
+TEST(ConANNTest, ClassifyAdaptive_MoreSafeOutWithLowerFrontier) {
+    ConANN conann(0.0f, 10.0f);
+    const float margin = 0.5f;
+    const std::vector<float> test_dists = {2, 4, 6, 8, 10, 12, 14, 16};
+    auto count_safeout = [&](float frontier) {
         int count = 0;
         for (float d : test_dists) {
-            if (conann.ClassifyAdaptive(d, margin, ddk) == ResultClass::SafeOut)
+            if (conann.ClassifyAdaptive(d, margin, frontier) == ResultClass::SafeOut) {
                 count++;
+            }
         }
         return count;
     };
 
-    // ddk=10.0 → SafeOut > 11.0 → {12,14,16} = 3
-    // ddk=5.0  → SafeOut > 6.0  → {8,10,12,14,16} = 5 (and some SafeIn become SafeOut)
-    int so_high = count_safeout(10.0f);
-    int so_low = count_safeout(5.0f);
-    EXPECT_GT(so_low, so_high);
-
-    // With no overlap (ddk close to d_k), SafeIn count is stable
-    // ddk=10.0: SafeIn < 9.0 → {2,4,6,8} = 4
-    // ddk=9.0:  SafeOut > 10.0 → {12,14,16}; SafeIn < 9.0 → {2,4,6,8} = 4
-    auto count_safein = [&](float ddk) {
-        int count = 0;
-        for (float d : test_dists) {
-            if (conann.ClassifyAdaptive(d, margin, ddk) == ResultClass::SafeIn)
-                count++;
-        }
-        return count;
-    };
-    EXPECT_EQ(count_safein(10.0f), count_safein(9.0f));
+    EXPECT_GT(count_safeout(5.0f), count_safeout(10.0f));
 }
 
 // ============================================================================

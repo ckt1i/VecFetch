@@ -71,6 +71,24 @@ using namespace vdb::index;
 
 namespace fs = std::filesystem;
 
+struct EstimateHeapEntry {
+    float distance = 0.0f;
+    float error_bound = 0.0f;
+    uint32_t id = 0;
+
+    bool operator<(const EstimateHeapEntry& other) const {
+        return distance < other.distance;
+    }
+};
+
+static float RecomputeMaxError(const std::vector<EstimateHeapEntry>& heap) {
+    float max_error = 0.0f;
+    for (const EstimateHeapEntry& entry : heap) {
+        max_error = std::max(max_error, entry.error_bound);
+    }
+    return max_error;
+}
+
 // ---------------------------------------------------------------------------
 // Power-of-2 padding helpers
 // ---------------------------------------------------------------------------
@@ -829,7 +847,7 @@ int main(int argc, char* argv[]) {
 #ifdef VDB_USE_MKL
     std::vector<float> qc(nlist);
 #endif
-    std::vector<std::pair<float, uint32_t>> est_heap;
+    std::vector<EstimateHeapEntry> est_heap;
     std::vector<std::pair<float, uint32_t>> exact_heap;
     est_heap.reserve(top_k * 2);
     exact_heap.reserve(top_k * 2);
@@ -870,6 +888,7 @@ int main(int argc, char* argv[]) {
         // Dual heaps: max-heap (largest at front) — reuse allocated capacity
         est_heap.clear();
         exact_heap.clear();
+        float max_error_in_est_heap = 0.0f;
 
         // One-time query rotation (Hadamard path): rotated_q = P^T × q.
         // Per-cluster FWHT is then replaced by O(dim) vector subtraction.
@@ -900,9 +919,9 @@ int main(int argc, char* argv[]) {
                 const auto& blocks = cluster_fs_blocks[cid];
                 const auto& members = cluster_members[cid];
 
-                // Cache est_kth across vectors; only refresh when est_heap mutates.
-                float est_kth = (est_heap.size() >= top_k)
-                    ? est_heap.front().first
+                // Cache SafeOut frontier across vectors; refresh when est_heap mutates.
+                float safeout_frontier_upper = (est_heap.size() >= top_k)
+                    ? est_heap.front().distance + max_error_in_est_heap
                     : std::numeric_limits<float>::infinity();
 
                 for (uint32_t b = 0; b < blocks.size(); ++b) {
@@ -914,7 +933,8 @@ int main(int argc, char* argv[]) {
                     // Phase 1: batch SafeOut classification via SIMD bitmask.
                     // Bit v in so_mask is 1 iff lane v is SafeOut.
                     uint32_t so_mask = simd::FastScanSafeOutMask(
-                        fs_dists, fb.norms.data(), fb.count, est_kth, margin_factor);
+                        fs_dists, fb.norms.data(), fb.count,
+                        safeout_frontier_upper, margin_factor);
                     uint32_t so_count = static_cast<uint32_t>(__builtin_popcount(so_mask));
                     s1_safeout += so_count;
                     final_safeout += so_count;
@@ -951,7 +971,7 @@ int main(int argc, char* argv[]) {
                         // Reclassify the non-SafeOut lane as SafeIn or Uncertain.
                         // (SafeOut already removed via mask.)
                         ResultClass rc_s1;
-                        if (est_dist_s1 < d_k - 2.0f * margin_s1) {
+                        if (est_dist_s1 < d_k - margin_s1) {
                             rc_s1 = ResultClass::SafeIn;
                             s1_safein++;
                         } else {
@@ -975,7 +995,8 @@ int main(int argc, char* argv[]) {
                                               - 2.0f * norm_oc * pq.norm_qc * ip_est;
                             est_dist_s2 = std::max(est_dist_s2, 0.0f);
                             float margin_s2 = margin_s1 / margin_s2_divisor;
-                            ResultClass rc_s2 = conann.ClassifyAdaptive(est_dist_s2, margin_s2, est_kth);
+                            ResultClass rc_s2 = conann.ClassifyAdaptive(
+                                est_dist_s2, margin_s2, safeout_frontier_upper);
 
                             if (rc_s2 == ResultClass::SafeIn) s2_safein++;
                             else if (rc_s2 == ResultClass::SafeOut) s2_safeout++;
@@ -991,18 +1012,24 @@ int main(int argc, char* argv[]) {
                         // Only non-SafeOut reach here (SafeIn + Uncertain)
 
                         bool est_heap_modified = false;
+                        const EstimateHeapEntry estimate{
+                            est_dist_s1, margin_s1, vid};
                         if (est_heap.size() < top_k) {
-                            est_heap.push_back({est_dist_s1, vid});
+                            est_heap.push_back(estimate);
                             std::push_heap(est_heap.begin(), est_heap.end());
+                            max_error_in_est_heap =
+                                std::max(max_error_in_est_heap, estimate.error_bound);
                             est_heap_modified = true;
-                        } else if (est_dist_s1 < est_heap.front().first) {
+                        } else if (estimate.distance < est_heap.front().distance) {
                             std::pop_heap(est_heap.begin(), est_heap.end());
-                            est_heap.back() = {est_dist_s1, vid};
+                            est_heap.back() = estimate;
                             std::push_heap(est_heap.begin(), est_heap.end());
+                            max_error_in_est_heap = RecomputeMaxError(est_heap);
                             est_heap_modified = true;
                         }
                         if (est_heap_modified && est_heap.size() >= top_k) {
-                            est_kth = est_heap.front().first;
+                            safeout_frontier_upper =
+                                est_heap.front().distance + max_error_in_est_heap;
                         }
 
                         float exact_dist = simd::L2Sqr(q_vec,
@@ -1019,15 +1046,16 @@ int main(int argc, char* argv[]) {
                 }
             } else {
             // --- Original popcount classify path ---
-            // Cache est_kth across vectors; only refresh on heap mutation.
-            float est_kth = (est_heap.size() >= top_k)
-                ? est_heap.front().first
+            // Cache SafeOut frontier across vectors; only refresh on heap mutation.
+            float safeout_frontier_upper = (est_heap.size() >= top_k)
+                ? est_heap.front().distance + max_error_in_est_heap
                 : std::numeric_limits<float>::infinity();
             for (uint32_t vid : cluster_members[cid]) {
                 float est_dist_s1 = estimator.EstimateDistance(pq, codes[vid]);
                 float margin_s1 = margin_factor * codes[vid].norm;  // per-vector
 
-                ResultClass rc_s1 = conann.ClassifyAdaptive(est_dist_s1, margin_s1, est_kth);
+                ResultClass rc_s1 = conann.ClassifyAdaptive(
+                    est_dist_s1, margin_s1, safeout_frontier_upper);
 
                 if (rc_s1 == ResultClass::SafeIn) s1_safein++;
                 else if (rc_s1 == ResultClass::SafeOut) { s1_safeout++; final_safeout++; continue; }
@@ -1048,7 +1076,8 @@ int main(int argc, char* argv[]) {
                                       - 2.0f * norm_oc_s2 * pq.norm_qc * ip_est;
                     est_dist_s2 = std::max(est_dist_s2, 0.0f);
                     float margin_s2 = margin_s1 / margin_s2_divisor;
-                    ResultClass rc_s2 = conann.ClassifyAdaptive(est_dist_s2, margin_s2, est_kth);
+                    ResultClass rc_s2 = conann.ClassifyAdaptive(
+                        est_dist_s2, margin_s2, safeout_frontier_upper);
 
                     if (rc_s2 == ResultClass::SafeIn) s2_safein++;
                     else if (rc_s2 == ResultClass::SafeOut) s2_safeout++;
@@ -1063,18 +1092,23 @@ int main(int argc, char* argv[]) {
 
                 // SafeIn and Uncertain: update est_heap
                 bool est_heap_modified = false;
+                const EstimateHeapEntry estimate{est_dist_s1, margin_s1, vid};
                 if (est_heap.size() < top_k) {
-                    est_heap.push_back({est_dist_s1, vid});
+                    est_heap.push_back(estimate);
                     std::push_heap(est_heap.begin(), est_heap.end());
+                    max_error_in_est_heap =
+                        std::max(max_error_in_est_heap, estimate.error_bound);
                     est_heap_modified = true;
-                } else if (est_dist_s1 < est_heap.front().first) {
+                } else if (estimate.distance < est_heap.front().distance) {
                     std::pop_heap(est_heap.begin(), est_heap.end());
-                    est_heap.back() = {est_dist_s1, vid};
+                    est_heap.back() = estimate;
                     std::push_heap(est_heap.begin(), est_heap.end());
+                    max_error_in_est_heap = RecomputeMaxError(est_heap);
                     est_heap_modified = true;
                 }
                 if (est_heap_modified && est_heap.size() >= top_k) {
-                    est_kth = est_heap.front().first;
+                    safeout_frontier_upper =
+                        est_heap.front().distance + max_error_in_est_heap;
                 }
 
                 // Rerank with exact L2 (both SafeIn and Uncertain read vectors)
@@ -1096,7 +1130,7 @@ int main(int argc, char* argv[]) {
             // Early stop: CRC or legacy d_k
             if (use_crc && crc_active) {
                 float est_kth = (est_heap.size() >= top_k)
-                    ? est_heap.front().first
+                    ? est_heap.front().distance
                     : std::numeric_limits<float>::infinity();
                 if (crc_stopper.ShouldStop(probed, est_kth)) {
                     stopped_early = true;

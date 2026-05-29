@@ -221,7 +221,7 @@ int main(int argc, char* argv[]) {
             ++st.count_s2_lt_dk;
             if (is_true_topk) ++st.count_true_topk_s2_lt_dk;
         }
-        if (s2 < dk - 2.0 * margin_s2) {
+        if (s2 < dk - margin_s2) {
             ++st.count_s2_safein_current;
             if (is_true_topk) ++st.count_true_topk_s2_safein_current;
         }

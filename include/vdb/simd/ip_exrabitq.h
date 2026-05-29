@@ -80,5 +80,20 @@ void IPExRaBitQBatchPackedSignParallelCompact(
     float* VDB_RESTRICT out_ip_raw,
     IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
 
+/// Mask-aware variant of the parallel-friendly Stage2 kernel.
+/// Computes and writes only lanes selected by `lane_mask`; lane indexes in
+/// `out_ip_raw` remain the original block-local lane ids.
+void IPExRaBitQBatchPackedSignParallelCompactMasked(
+    const float* VDB_RESTRICT query,
+    const uint8_t* VDB_RESTRICT abs_slices,
+    const uint16_t* VDB_RESTRICT sign_words,
+    uint32_t lane_mask,
+    uint32_t valid_count,
+    Dim dim,
+    uint32_t dim_block,
+    uint32_t slices_per_dim_block,
+    float* VDB_RESTRICT out_ip_raw,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
 }  // namespace simd
 }  // namespace vdb

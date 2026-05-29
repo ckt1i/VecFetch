@@ -82,10 +82,9 @@ VDB_FORCE_INLINE uint32_t Stage1SafeInMask(const float* dists,
                                            uint32_t count,
                                            float safein_threshold_base,
                                            float margin_factor) {
-    const float threshold_mul = 2.0f * margin_factor;
     uint32_t mask = 0;
     for (uint32_t i = 0; i < count; ++i) {
-        const float threshold = safein_threshold_base - threshold_mul * block_norms[i];
+        const float threshold = safein_threshold_base - margin_factor * block_norms[i];
         if (dists[i] < threshold) {
             mask |= (1u << i);
         }
@@ -123,7 +122,7 @@ Stage1Masks ComputeStage1Masks(const index::IvfIndex& index,
                                const rabitq::PreparedClusterQueryView& view,
                                const query::ParsedCluster& pc,
                                uint32_t block_idx,
-                               float dynamic_d_k,
+                               float safeout_frontier_upper,
                                uint8_t bits,
                                float* out_dists) {
     Stage1Masks out;
@@ -137,11 +136,13 @@ Stage1Masks ComputeStage1Masks(const index::IvfIndex& index,
     rabitq::RaBitQEstimator est(index.dim(), bits);
     est.EstimateDistanceFastScan(view, block_ptr, block_norms, count, out_dists);
     out.so_mask = simd::FastScanSafeOutMask(
-        out_dists, block_norms, count, dynamic_d_k, view.margin_factor);
+        out_dists, block_norms, count,
+        safeout_frontier_upper, view.safeout_margin_factor);
     const uint32_t lane_valid = LaneMaskForCount(count);
     const uint32_t maybe_in = (~out.so_mask) & lane_valid;
     out.safein_mask = Stage1SafeInMask(
-        out_dists, block_norms, count, index.conann().d_k(), view.margin_factor) & maybe_in;
+        out_dists, block_norms, count,
+        index.conann().d_k(), view.safein_margin_factor) & maybe_in;
     out.uncertain_mask = maybe_in & ~out.safein_mask;
     return out;
 }
@@ -152,7 +153,7 @@ Stage2Values ComputeV10Stage2(const index::IvfIndex& index,
                               uint32_t global_idx,
                               float norm_oc,
                               float margin_s1,
-                              float dynamic_d_k,
+                              float safeout_frontier_upper,
                               uint8_t bits) {
     Stage2Values v;
     const auto ex = pc.exrabitq_view(global_idx, index.dim());
@@ -164,7 +165,8 @@ Stage2Values ComputeV10Stage2(const index::IvfIndex& index,
                   - 2.0f * norm_oc * pq.norm_qc * v.ip_est;
     v.est_dist_s2 = std::max(v.est_dist_s2, 0.0f);
     const float margin_s2 = margin_s1 / static_cast<float>(1u << (bits - 1));
-    v.rc_s2 = index.conann().ClassifyAdaptive(v.est_dist_s2, margin_s2, dynamic_d_k);
+    v.rc_s2 = index.conann().ClassifyAdaptive(
+        v.est_dist_s2, margin_s2, safeout_frontier_upper);
     return v;
 }
 
@@ -174,7 +176,7 @@ Stage2Values ComputeV11Stage2(const index::IvfIndex& index,
                               uint32_t global_idx,
                               float norm_oc,
                               float margin_s1,
-                              float dynamic_d_k,
+                              float safeout_frontier_upper,
                               uint8_t bits) {
     Stage2Values v;
     const uint32_t block_id = global_idx / 8u;
@@ -195,7 +197,8 @@ Stage2Values ComputeV11Stage2(const index::IvfIndex& index,
                   - 2.0f * norm_oc * pq.norm_qc * v.ip_est;
     v.est_dist_s2 = std::max(v.est_dist_s2, 0.0f);
     const float margin_s2 = margin_s1 / static_cast<float>(1u << (bits - 1));
-    v.rc_s2 = index.conann().ClassifyAdaptive(v.est_dist_s2, margin_s2, dynamic_d_k);
+    v.rc_s2 = index.conann().ClassifyAdaptive(
+        v.est_dist_s2, margin_s2, safeout_frontier_upper);
     return v;
 }
 
@@ -294,8 +297,8 @@ int main(int argc, char* argv[]) {
             float mf_b = 0.0f;
             PrepareForCluster(index_a, query, cid_a, &psa, &mf_a);
             PrepareForCluster(index_b, query, cid_b, &psb, &mf_b);
-            rabitq::PreparedClusterQueryView va{&psa.prepared, &psa.scratch, mf_a};
-            rabitq::PreparedClusterQueryView vb{&psb.prepared, &psb.scratch, mf_b};
+            rabitq::PreparedClusterQueryView va{&psa.prepared, &psa.scratch, mf_a, mf_a};
+            rabitq::PreparedClusterQueryView vb{&psb.prepared, &psb.scratch, mf_b, mf_b};
             const float dyn_a = (heap_a.size() >= 10) ? std::max(heap_a.front().first, index_a.conann().d_k())
                                                       : std::numeric_limits<float>::infinity();
             const float dyn_b = (heap_b.size() >= 10) ? std::max(heap_b.front().first, index_b.conann().d_k())
@@ -305,9 +308,11 @@ int main(int argc, char* argv[]) {
             index::ProbeStats stats_a;
             index::ProbeStats stats_b;
             prober_a.Probe(*cpa, cid_a, va, dyn_a,
-                           false, false, false, false, nullptr, nullptr, sink_a, stats_a);
+                           false, false, false, false, false,
+                           nullptr, nullptr, sink_a, stats_a);
             prober_b.Probe(*cpb, cid_b, vb, dyn_b,
-                           false, false, false, false, nullptr, nullptr, sink_b, stats_b);
+                           false, false, false, false, false,
+                           nullptr, nullptr, sink_b, stats_b);
             if (sink_a.est_dists.size() != sink_b.est_dists.size()) {
                 std::printf("CRC_PROBE_DIFF rank=%d cid=%u dyn(a,b)=%.9f,%.9f emitted_count(a,b)=%zu,%zu\n",
                             pr, cid_a, dyn_a, dyn_b, sink_a.est_dists.size(), sink_b.est_dists.size());
@@ -393,17 +398,22 @@ int main(int argc, char* argv[]) {
                 state_a.prepared.sum_q, state_b.prepared.sum_q,
                 margin_factor_a, margin_factor_b);
 
-    rabitq::PreparedClusterQueryView view_a{&state_a.prepared, &state_a.scratch, margin_factor_a};
-    rabitq::PreparedClusterQueryView view_b{&state_b.prepared, &state_b.scratch, margin_factor_b};
-    const float dynamic_d_k = std::max(index_a.conann().d_k(), index_b.conann().d_k());
+    rabitq::PreparedClusterQueryView view_a{
+        &state_a.prepared, &state_a.scratch, margin_factor_a, margin_factor_a};
+    rabitq::PreparedClusterQueryView view_b{
+        &state_b.prepared, &state_b.scratch, margin_factor_b, margin_factor_b};
+    const float safeout_frontier_upper =
+        std::max(index_a.conann().d_k(), index_b.conann().d_k());
 
     alignas(64) float dists_a[32];
     alignas(64) float dists_b[32];
     bool any_diff = false;
     const uint32_t num_blocks = std::min(pc_a->num_fastscan_blocks, pc_b->num_fastscan_blocks);
     for (uint32_t b = 0; b < num_blocks; ++b) {
-        const Stage1Masks m_a = ComputeStage1Masks(index_a, view_a, *pc_a, b, dynamic_d_k, bits_a, dists_a);
-        const Stage1Masks m_b = ComputeStage1Masks(index_b, view_b, *pc_b, b, dynamic_d_k, bits_b, dists_b);
+        const Stage1Masks m_a = ComputeStage1Masks(
+            index_a, view_a, *pc_a, b, safeout_frontier_upper, bits_a, dists_a);
+        const Stage1Masks m_b = ComputeStage1Masks(
+            index_b, view_b, *pc_b, b, safeout_frontier_upper, bits_b, dists_b);
         const uint32_t base_idx = b * 32;
         const uint32_t count = std::min(32u, pc_a->num_records - base_idx);
         if (m_a.so_mask != m_b.so_mask ||
@@ -445,9 +455,11 @@ int main(int argc, char* argv[]) {
             const float margin_s1_a = margin_factor_a * norm_oc_a;
             const float margin_s1_b = margin_factor_b * norm_oc_b;
             const Stage2Values s2_a = ComputeV10Stage2(
-                index_a, state_a.prepared, *pc_a, global_idx, norm_oc_a, margin_s1_a, dynamic_d_k, bits_a);
+                index_a, state_a.prepared, *pc_a, global_idx, norm_oc_a,
+                margin_s1_a, safeout_frontier_upper, bits_a);
             const Stage2Values s2_b = ComputeV11Stage2(
-                index_b, state_b.prepared, *pc_b, global_idx, norm_oc_b, margin_s1_b, dynamic_d_k, bits_b);
+                index_b, state_b.prepared, *pc_b, global_idx, norm_oc_b,
+                margin_s1_b, safeout_frontier_upper, bits_b);
             if (std::abs(s2_a.ip_raw - s2_b.ip_raw) > 1e-4f ||
                 std::abs(s2_a.ip_est - s2_b.ip_est) > 1e-4f ||
                 std::abs(s2_a.est_dist_s2 - s2_b.est_dist_s2) > 1e-4f ||

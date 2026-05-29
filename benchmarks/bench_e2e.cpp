@@ -496,6 +496,13 @@ struct QueryResult {
     double probe_stage2_kernel_abs_fma_ms = 0;
     double probe_stage2_kernel_tail_ms = 0;
     double probe_stage2_kernel_reduce_ms = 0;
+    uint32_t stage1_fused_blocks = 0;
+    uint32_t stage1_fused_safeout_lanes = 0;
+    uint32_t stage1_fused_safein_lanes = 0;
+    uint64_t stage2_masked_kernel_calls = 0;
+    uint64_t stage2_lanes_requested = 0;
+    uint64_t stage2_lanes_skipped = 0;
+    uint64_t stage2_lanes_total_valid = 0;
     double probe_classify_ms = 0;
     double probe_submit_ms = 0;
     double probe_submit_prepare_vec_only_ms = 0;
@@ -609,6 +616,14 @@ struct RoundMetrics {
     double avg_probe_stage2_kernel_abs_fma = 0;
     double avg_probe_stage2_kernel_tail = 0;
     double avg_probe_stage2_kernel_reduce = 0;
+    double avg_stage1_fused_blocks = 0;
+    double avg_stage1_fused_safeout_lanes = 0;
+    double avg_stage1_fused_safein_lanes = 0;
+    double avg_stage2_masked_kernel_calls = 0;
+    double avg_stage2_lanes_requested = 0;
+    double avg_stage2_lanes_skipped = 0;
+    double avg_stage2_lanes_total_valid = 0;
+    double avg_stage2_lane_density = 0;
     double avg_probe_classify = 0;
     double avg_probe_submit = 0;
     double avg_probe_submit_prepare_vec_only = 0;
@@ -791,6 +806,13 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.probe_stage2_kernel_abs_fma_ms = results.stats().probe_stage2_kernel_abs_fma_ms;
         qr.probe_stage2_kernel_tail_ms = results.stats().probe_stage2_kernel_tail_ms;
         qr.probe_stage2_kernel_reduce_ms = results.stats().probe_stage2_kernel_reduce_ms;
+        qr.stage1_fused_blocks = results.stats().stage1_fused_blocks;
+        qr.stage1_fused_safeout_lanes = results.stats().stage1_fused_safeout_lanes;
+        qr.stage1_fused_safein_lanes = results.stats().stage1_fused_safein_lanes;
+        qr.stage2_masked_kernel_calls = results.stats().stage2_masked_kernel_calls;
+        qr.stage2_lanes_requested = results.stats().stage2_lanes_requested;
+        qr.stage2_lanes_skipped = results.stats().stage2_lanes_skipped;
+        qr.stage2_lanes_total_valid = results.stats().stage2_lanes_total_valid;
         qr.probe_classify_ms = results.stats().probe_classify_ms;
         qr.probe_submit_ms = results.stats().probe_submit_ms;
         qr.probe_submit_prepare_vec_only_ms =
@@ -963,6 +985,13 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_probe_stage2_kernel_abs_fma = 0;
     double sum_probe_stage2_kernel_tail = 0;
     double sum_probe_stage2_kernel_reduce = 0;
+    double sum_stage1_fused_blocks = 0;
+    double sum_stage1_fused_safeout_lanes = 0;
+    double sum_stage1_fused_safein_lanes = 0;
+    double sum_stage2_masked_kernel_calls = 0;
+    double sum_stage2_lanes_requested = 0;
+    double sum_stage2_lanes_skipped = 0;
+    double sum_stage2_lanes_total_valid = 0;
     double sum_probe_classify = 0, sum_probe_submit = 0;
     double sum_probe_submit_prepare_vec_only = 0;
     double sum_probe_submit_prepare_all = 0;
@@ -1058,6 +1087,13 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_probe_stage2_kernel_abs_fma += qresults[qi].probe_stage2_kernel_abs_fma_ms;
         sum_probe_stage2_kernel_tail += qresults[qi].probe_stage2_kernel_tail_ms;
         sum_probe_stage2_kernel_reduce += qresults[qi].probe_stage2_kernel_reduce_ms;
+        sum_stage1_fused_blocks += qresults[qi].stage1_fused_blocks;
+        sum_stage1_fused_safeout_lanes += qresults[qi].stage1_fused_safeout_lanes;
+        sum_stage1_fused_safein_lanes += qresults[qi].stage1_fused_safein_lanes;
+        sum_stage2_masked_kernel_calls += qresults[qi].stage2_masked_kernel_calls;
+        sum_stage2_lanes_requested += qresults[qi].stage2_lanes_requested;
+        sum_stage2_lanes_skipped += qresults[qi].stage2_lanes_skipped;
+        sum_stage2_lanes_total_valid += qresults[qi].stage2_lanes_total_valid;
         sum_probe_classify += qresults[qi].probe_classify_ms;
         sum_probe_submit += qresults[qi].probe_submit_ms;
         sum_probe_submit_prepare_vec_only +=
@@ -1162,6 +1198,16 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_probe_stage2_kernel_abs_fma = sum_probe_stage2_kernel_abs_fma / Q;
     m.avg_probe_stage2_kernel_tail = sum_probe_stage2_kernel_tail / Q;
     m.avg_probe_stage2_kernel_reduce = sum_probe_stage2_kernel_reduce / Q;
+    m.avg_stage1_fused_blocks = sum_stage1_fused_blocks / Q;
+    m.avg_stage1_fused_safeout_lanes = sum_stage1_fused_safeout_lanes / Q;
+    m.avg_stage1_fused_safein_lanes = sum_stage1_fused_safein_lanes / Q;
+    m.avg_stage2_masked_kernel_calls = sum_stage2_masked_kernel_calls / Q;
+    m.avg_stage2_lanes_requested = sum_stage2_lanes_requested / Q;
+    m.avg_stage2_lanes_skipped = sum_stage2_lanes_skipped / Q;
+    m.avg_stage2_lanes_total_valid = sum_stage2_lanes_total_valid / Q;
+    m.avg_stage2_lane_density = sum_stage2_lanes_total_valid > 0.0
+        ? sum_stage2_lanes_requested / sum_stage2_lanes_total_valid
+        : 0.0;
     m.avg_probe_classify = sum_probe_classify / Q;
     m.avg_probe_submit = sum_probe_submit / Q;
     m.avg_probe_submit_prepare_vec_only = sum_probe_submit_prepare_vec_only / Q;
@@ -2733,6 +2779,10 @@ int main(int argc, char* argv[]) {
     Log("  stage1_estimate=%.3f ms  stage1_mask=%.3f ms  stage1_iterate=%.3f ms  stage1_classify=%.3f ms\n",
         metrics.avg_probe_stage1_estimate, metrics.avg_probe_stage1_mask,
         metrics.avg_probe_stage1_iterate, metrics.avg_probe_stage1_classify_only);
+    Log("  stage1_fused_blocks=%.1f  fused_safeout_lanes=%.1f  fused_safein_lanes=%.1f\n",
+        metrics.avg_stage1_fused_blocks,
+        metrics.avg_stage1_fused_safeout_lanes,
+        metrics.avg_stage1_fused_safein_lanes);
     Log("  stage2_collect=%.3f ms  stage2_kernel=%.3f ms  stage2_scatter=%.3f ms\n",
         metrics.avg_probe_stage2_collect, metrics.avg_probe_stage2_kernel,
         metrics.avg_probe_stage2_scatter);
@@ -2741,6 +2791,12 @@ int main(int argc, char* argv[]) {
         metrics.avg_probe_stage2_kernel_abs_fma,
         metrics.avg_probe_stage2_kernel_tail,
         metrics.avg_probe_stage2_kernel_reduce);
+    Log("  stage2_masked_calls=%.1f  lanes_requested=%.1f  lanes_skipped=%.1f  lanes_total_valid=%.1f  lane_density=%.4f\n",
+        metrics.avg_stage2_masked_kernel_calls,
+        metrics.avg_stage2_lanes_requested,
+        metrics.avg_stage2_lanes_skipped,
+        metrics.avg_stage2_lanes_total_valid,
+        metrics.avg_stage2_lane_density);
     Log("  clu_mode=%s  resident=%d  preload_time=%.3f ms  preload_bytes=%.0f  resident_mem=%.0f  parallel_view_build=%.3f ms  parallel_view_bytes=%.0f\n",
         arg_clu_read_mode.c_str(),
         metrics.query_uses_resident_clusters ? 1 : 0,
@@ -3069,6 +3125,14 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_probe_stage2_kernel_abs_fma_ms", metrics.avg_probe_stage2_kernel_abs_fma) << ",\n";
         f << "    " << JNum("avg_probe_stage2_kernel_tail_ms", metrics.avg_probe_stage2_kernel_tail) << ",\n";
         f << "    " << JNum("avg_probe_stage2_kernel_reduce_ms", metrics.avg_probe_stage2_kernel_reduce) << ",\n";
+        f << "    " << JNum("avg_stage1_fused_blocks", metrics.avg_stage1_fused_blocks) << ",\n";
+        f << "    " << JNum("avg_stage1_fused_safeout_lanes", metrics.avg_stage1_fused_safeout_lanes) << ",\n";
+        f << "    " << JNum("avg_stage1_fused_safein_lanes", metrics.avg_stage1_fused_safein_lanes) << ",\n";
+        f << "    " << JNum("avg_stage2_masked_kernel_calls", metrics.avg_stage2_masked_kernel_calls) << ",\n";
+        f << "    " << JNum("avg_stage2_lanes_requested", metrics.avg_stage2_lanes_requested) << ",\n";
+        f << "    " << JNum("avg_stage2_lanes_skipped", metrics.avg_stage2_lanes_skipped) << ",\n";
+        f << "    " << JNum("avg_stage2_lanes_total_valid", metrics.avg_stage2_lanes_total_valid) << ",\n";
+        f << "    " << JNum("avg_stage2_lane_density", metrics.avg_stage2_lane_density) << ",\n";
         f << "    " << JNum("avg_probe_classify_ms", metrics.avg_probe_classify) << ",\n";
         f << "    " << JNum("avg_probe_submit_ms", metrics.avg_probe_submit) << ",\n";
         f << "    " << JNum("avg_probe_submit_prepare_vec_only_ms", metrics.avg_probe_submit_prepare_vec_only) << ",\n";
@@ -3187,6 +3251,13 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("probe_stage2_kernel_abs_fma_ms", qr.probe_stage2_kernel_abs_fma_ms) << ",\n";
             f << "      " << JNum("probe_stage2_kernel_tail_ms", qr.probe_stage2_kernel_tail_ms) << ",\n";
             f << "      " << JNum("probe_stage2_kernel_reduce_ms", qr.probe_stage2_kernel_reduce_ms) << ",\n";
+            f << "      " << JNum("stage1_fused_blocks", qr.stage1_fused_blocks) << ",\n";
+            f << "      " << JNum("stage1_fused_safeout_lanes", qr.stage1_fused_safeout_lanes) << ",\n";
+            f << "      " << JNum("stage1_fused_safein_lanes", qr.stage1_fused_safein_lanes) << ",\n";
+            f << "      " << JNum("stage2_masked_kernel_calls", qr.stage2_masked_kernel_calls) << ",\n";
+            f << "      " << JNum("stage2_lanes_requested", qr.stage2_lanes_requested) << ",\n";
+            f << "      " << JNum("stage2_lanes_skipped", qr.stage2_lanes_skipped) << ",\n";
+            f << "      " << JNum("stage2_lanes_total_valid", qr.stage2_lanes_total_valid) << ",\n";
             f << "      " << JNum("probe_classify_ms", qr.probe_classify_ms) << ",\n";
             f << "      " << JNum("probe_submit_ms", qr.probe_submit_ms) << ",\n";
             f << "      " << JNum("probe_submit_prepare_vec_only_ms", qr.probe_submit_prepare_vec_only_ms) << ",\n";

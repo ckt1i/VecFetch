@@ -472,6 +472,10 @@ if(VDB_BUILD_TESTS)
     target_link_libraries(test_signed_dot PRIVATE vdb_simd GTest::gtest GTest::gtest_main)
     add_test(NAME test_signed_dot COMMAND test_signed_dot)
 
+    add_executable(test_classify_masks tests/simd/classify_masks_test.cpp)
+    target_link_libraries(test_classify_masks PRIVATE vdb_simd GTest::gtest GTest::gtest_main)
+    add_test(NAME test_classify_masks COMMAND test_classify_masks)
+
     # -------------------------------------------------------------------------
     # RaBitQ tests (Phase 4)
     # -------------------------------------------------------------------------

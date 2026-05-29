@@ -100,6 +100,16 @@ struct SummaryStats {
     std::vector<float> normalized_err_s2;
 };
 
+struct EstimateHeapEntry {
+    float distance = 0.0f;
+    float error_bound = 0.0f;
+    uint32_t row = 0;
+
+    bool operator<(const EstimateHeapEntry& other) const {
+        return distance < other.distance;
+    }
+};
+
 static std::string GetArg(int argc, char* argv[], const char* name,
                           const std::string& def) {
     for (int i = 1; i + 1 < argc; ++i) {
@@ -414,6 +424,14 @@ static void WriteSummaryJson(const std::string& path,
     f << "\n}\n";
 }
 
+static float RecomputeMaxError(const std::vector<EstimateHeapEntry>& heap) {
+    float max_error = 0.0f;
+    for (const EstimateHeapEntry& entry : heap) {
+        max_error = std::max(max_error, entry.error_bound);
+    }
+    return max_error;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -605,8 +623,9 @@ int main(int argc, char* argv[]) {
         if (qi % 10 == 0) Log("query %u/%u\n", qi, Q);
         const float* q_vec = qry.data.data() + static_cast<size_t>(qi) * dim;
         const std::vector<ClusterID> probed = index.FindNearestClusters(q_vec, nprobe);
-        std::vector<std::pair<float, uint32_t>> est_heap;
+        std::vector<EstimateHeapEntry> est_heap;
         est_heap.reserve(top_k + 1);
+        float max_error_in_est_heap = 0.0f;
 
         for (uint32_t rank = 0; rank < probed.size(); ++rank) {
             const uint32_t cid = probed[rank];
@@ -615,9 +634,10 @@ int main(int argc, char* argv[]) {
             const auto& cluster_codes = ensure_cluster_codes(cid);
             const auto& members = cluster_members[cid];
             const float margin_factor = 2.0f * pq.norm_qc * eps_ip;
-            const float dynamic_d_k_before_cluster =
-                (est_heap.size() >= top_k) ? est_heap.front().first
-                                           : std::numeric_limits<float>::infinity();
+            const float safeout_frontier_upper =
+                (est_heap.size() >= top_k)
+                    ? est_heap.front().distance + max_error_in_est_heap
+                    : std::numeric_limits<float>::infinity();
 
             for (size_t local_idx = 0; local_idx < members.size(); ++local_idx) {
                 const uint32_t row = members[local_idx];
@@ -635,7 +655,7 @@ int main(int argc, char* argv[]) {
                 m.norm_qc = pq.norm_qc;
                 m.norm_oc = code.norm;
                 m.d_k_static = d_k_static;
-                m.dynamic_d_k_before_cluster = dynamic_d_k_before_cluster;
+                m.dynamic_d_k_before_cluster = safeout_frontier_upper;
                 m.exact_dist = simd::L2Sqr(q_vec,
                     base.data.data() + static_cast<size_t>(row) * dim, dim);
                 m.est_dist_s1 = estimator.EstimateDistance(pq, code);
@@ -644,10 +664,10 @@ int main(int argc, char* argv[]) {
                 const float denom_s1 = 2.0f * std::max(1e-12f, pq.norm_qc * code.norm);
                 m.normalized_err_s1 = m.abs_err_s1 / denom_s1;
                 m.safein_gap_s1 = d_k_static - m.est_dist_s1;
-                m.safeout_gap_s1 = m.est_dist_s1 - dynamic_d_k_before_cluster;
-                m.safein_ratio_s1 = m.safein_gap_s1 / std::max(1e-12f, 2.0f * m.margin_s1);
+                m.safeout_gap_s1 = m.est_dist_s1 - safeout_frontier_upper;
+                m.safein_ratio_s1 = m.safein_gap_s1 / std::max(1e-12f, m.margin_s1);
                 m.s1_class = index.conann().ClassifyAdaptive(
-                    m.est_dist_s1, m.margin_s1, dynamic_d_k_before_cluster);
+                    m.est_dist_s1, m.margin_s1, safeout_frontier_upper);
                 m.final_class = m.s1_class;
 
                 ++stats.candidates;
@@ -665,10 +685,10 @@ int main(int argc, char* argv[]) {
                     m.abs_err_s2 = std::abs(m.est_dist_s2 - m.exact_dist);
                     m.normalized_err_s2 = m.abs_err_s2 / denom_s1;
                     m.safein_gap_s2 = d_k_static - m.est_dist_s2;
-                    m.safeout_gap_s2 = m.est_dist_s2 - dynamic_d_k_before_cluster;
-                    m.safein_ratio_s2 = m.safein_gap_s2 / std::max(1e-12f, 2.0f * m.margin_s2);
+                    m.safeout_gap_s2 = m.est_dist_s2 - safeout_frontier_upper;
+                    m.safein_ratio_s2 = m.safein_gap_s2 / std::max(1e-12f, m.margin_s2);
                     m.s2_class = index.conann().ClassifyAdaptive(
-                        m.est_dist_s2, m.margin_s2, dynamic_d_k_before_cluster);
+                        m.est_dist_s2, m.margin_s2, safeout_frontier_upper);
                     m.final_class = m.s2_class;
 
                     ++stats.stage2_candidates;
@@ -701,19 +721,24 @@ int main(int argc, char* argv[]) {
                                << (m.is_true_topk ? 1 : 0) << '\n';
 
                 if (m.final_class != ResultClass::SafeOut) {
+                    const EstimateHeapEntry estimate{
+                        m.est_dist_s1, m.margin_s1, row};
                     if (est_heap.size() < top_k) {
-                        est_heap.push_back({m.est_dist_s1, row});
+                        est_heap.push_back(estimate);
                         std::push_heap(est_heap.begin(), est_heap.end());
-                    } else if (m.est_dist_s1 < est_heap.front().first) {
+                        max_error_in_est_heap =
+                            std::max(max_error_in_est_heap, estimate.error_bound);
+                    } else if (estimate.distance < est_heap.front().distance) {
                         std::pop_heap(est_heap.begin(), est_heap.end());
-                        est_heap.back() = {m.est_dist_s1, row};
+                        est_heap.back() = estimate;
                         std::push_heap(est_heap.begin(), est_heap.end());
+                        max_error_in_est_heap = RecomputeMaxError(est_heap);
                     }
                 }
             }
 
             const float est_kth = est_heap.size() >= top_k
-                ? est_heap.front().first
+                ? est_heap.front().distance
                 : std::numeric_limits<float>::infinity();
             kth << qi << ',' << (rank + 1) << ',' << est_kth << '\n';
         }

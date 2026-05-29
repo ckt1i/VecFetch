@@ -13,6 +13,11 @@ struct FastScanPrepareTimingBreakdown {
     double lut_build_ms = 0.0;
 };
 
+struct FastScanStage1EvalResult {
+    uint32_t safeout_mask = 0;
+    uint32_t safein_mask = 0;
+};
+
 /// VPSHUFB batch-32 accumulation of packed 4-bit LUT lookups.
 ///
 /// Processes 32 vectors simultaneously using VPSHUFB. The packed_codes must
@@ -106,7 +111,7 @@ float QuantizeQuery14BitWithMaxToFastScanLUT(
 ///
 /// For each lane v in [0, count):
 ///   margin_v   = margin_factor * block_norms[v]
-///   so_thresh  = est_kth + 2 * margin_v
+///   so_thresh  = safeout_frontier_upper + margin_v
 ///   bit_v      = 1 if dists[v] > so_thresh else 0
 ///
 /// Lanes beyond `count` (up to ceiling of 32) are forced to 0 in the mask.
@@ -118,19 +123,19 @@ float QuantizeQuery14BitWithMaxToFastScanLUT(
 /// @param dists         Input: estimated L2² distances, length >= count
 /// @param block_norms   Input: per-vector ||o-c||, length >= count
 /// @param count         Number of valid lanes (1..32)
-/// @param est_kth       Current k-th distance threshold
+/// @param safeout_frontier_upper Conservative top-k upper frontier
 /// @param margin_factor Per-cluster constant: 2 * ||q-c|| * eps_ip
 /// @return              SafeOut bitmask: bit v = 1 if lane v is SafeOut
 uint32_t FastScanSafeOutMask(const float* VDB_RESTRICT dists,
                               const float* VDB_RESTRICT block_norms,
                               uint32_t count,
-                              float est_kth,
+                              float safeout_frontier_upper,
                               float margin_factor);
 
 /// Compute a SafeIn bitmask for a batch of FastScan dists.
 ///
-/// A lane is SafeIn when its estimated distance is below the static threshold
-/// minus the dynamic margin. Lanes beyond `count` are forced to 0.
+/// A lane is SafeIn when its estimated upper bound is below the static
+/// acceptance threshold. Lanes beyond `count` are forced to 0.
 uint32_t FastScanSafeInMask(const float* VDB_RESTRICT dists,
                              const float* VDB_RESTRICT block_norms,
                              uint32_t count,
@@ -169,6 +174,33 @@ void FastScanDequantize(const uint32_t* VDB_RESTRICT raw_accu,
                         float norm_qc,
                         float norm_qc_sq,
                         float* VDB_RESTRICT out_dist);
+
+/// Fused Stage1 evaluation for one FastScan block.
+///
+/// Computes the same `out_dist` values as FastScanDequantize and the same
+/// masks as FastScanSafeOutMask / FastScanSafeInMask using current interval
+/// semantics:
+///   SafeOut iff dist > safeout_frontier_upper + safeout_margin_factor * norm
+///   SafeIn  iff dist < safein_threshold_base - safein_margin_factor * norm
+///
+/// When `enable_safein` is false, `result->safein_mask` is set to 0 and the
+/// SafeIn threshold is not evaluated on the hot path.
+void FastScanStage1Evaluate(const uint32_t* VDB_RESTRICT raw_accu,
+                            const float* VDB_RESTRICT block_norms,
+                            uint32_t count,
+                            int32_t fs_shift,
+                            float fs_width,
+                            float sum_q,
+                            float inv_sqrt_dim,
+                            float norm_qc,
+                            float norm_qc_sq,
+                            float safeout_frontier_upper,
+                            float safeout_margin_factor,
+                            float safein_threshold_base,
+                            float safein_margin_factor,
+                            bool enable_safein,
+                            float* VDB_RESTRICT out_dist,
+                            FastScanStage1EvalResult* VDB_RESTRICT result);
 
 }  // namespace simd
 }  // namespace vdb
