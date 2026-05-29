@@ -15,6 +15,10 @@
 #include "vdb/rabitq/rabitq_rotation.h"
 #include "vdb/storage/segment.h"
 
+namespace faiss {
+struct IndexHNSWFlat;
+}
+
 namespace vdb {
 namespace index {
 
@@ -94,6 +98,11 @@ class IvfIndex {
                                   uint32_t budget_factor,
                                   bool exact_overlap = false);
     bool PrepareTwoLevelCoarseRouting(uint32_t nprobe) const;
+    void SetHnswCoarseRouting(bool enabled,
+                              uint32_t m,
+                              uint32_t ef_construction,
+                              uint32_t ef_search);
+    bool PrepareHnswCoarseRouting() const;
     uint32_t last_coarse_routing_mode() const { return last_coarse_routing_mode_; }
     uint32_t last_coarse_super_count() const { return last_coarse_super_count_; }
     uint32_t last_coarse_super_probes() const { return last_coarse_super_probes_; }
@@ -104,6 +113,19 @@ class IvfIndex {
     uint32_t last_coarse_exact_fallback() const { return last_coarse_exact_fallback_; }
     uint32_t last_coarse_exact_overlap() const { return last_coarse_exact_overlap_; }
     double last_coarse_hierarchy_build_ms() const { return last_coarse_hierarchy_build_ms_; }
+    double last_coarse_hnsw_graph_build_ms() const { return last_coarse_hnsw_graph_build_ms_; }
+    uint32_t last_coarse_hnsw_m() const { return last_coarse_hnsw_m_; }
+    uint32_t last_coarse_hnsw_ef_search() const { return last_coarse_hnsw_ef_search_; }
+    uint32_t last_coarse_hnsw_returned_clusters() const {
+        return last_coarse_hnsw_returned_clusters_;
+    }
+    uint32_t last_coarse_hnsw_visited_nodes() const {
+        return last_coarse_hnsw_visited_nodes_;
+    }
+    uint32_t last_coarse_hnsw_distance_computations() const {
+        return last_coarse_hnsw_distance_computations_;
+    }
+    uint32_t last_coarse_hnsw_hops() const { return last_coarse_hnsw_hops_; }
     static uint32_t DefaultTwoLevelSuperCount(uint32_t nlist,
                                               uint32_t override_count = 0,
                                               uint32_t nprobe = 0,
@@ -231,6 +253,18 @@ class IvfIndex {
         bool ready = false;
     };
 
+    struct HnswCoarseGraph {
+        std::unique_ptr<::faiss::IndexHNSWFlat> index;
+        uint32_t m = 0;
+        uint32_t ef_construction = 0;
+        uint32_t ef_search = 0;
+        uint32_t nlist = 0;
+        Dim dim = 0;
+        bool cosine_path = false;
+        bool supported_metric = false;
+        bool ready = false;
+    };
+
     struct CoarseScratch {
         std::vector<float> scores;
         std::vector<uint32_t> order;
@@ -250,13 +284,19 @@ class IvfIndex {
     mutable bool use_coarse_select_simd_ = true;
     mutable bool use_coarse_select_phase2_ = false;
     mutable bool use_two_level_coarse_routing_ = false;
+    mutable bool use_hnsw_coarse_routing_ = false;
+    mutable uint32_t hnsw_coarse_m_ = 32;
+    mutable uint32_t hnsw_coarse_ef_construction_ = 128;
+    mutable uint32_t hnsw_coarse_ef_search_ = 512;
     mutable uint32_t two_level_coarse_threshold_ = 4096;
     mutable uint32_t two_level_coarse_super_count_ = 0;
     mutable uint32_t two_level_coarse_super_factor_ = 0;
     mutable uint32_t two_level_coarse_budget_factor_ = 8;
     mutable bool two_level_coarse_exact_overlap_ = false;
     mutable HierarchicalCoarseIndex coarse_hierarchy_;
+    mutable HnswCoarseGraph coarse_hnsw_;
     mutable double last_coarse_hierarchy_build_ms_ = 0;
+    mutable double last_coarse_hnsw_graph_build_ms_ = 0;
     mutable uint32_t last_coarse_routing_mode_ = 0;
     mutable uint32_t last_coarse_super_count_ = 0;
     mutable uint32_t last_coarse_super_probes_ = 0;
@@ -264,14 +304,23 @@ class IvfIndex {
     mutable uint32_t last_coarse_candidate_budget_ = 0;
     mutable uint32_t last_coarse_exact_fallback_ = 0;
     mutable uint32_t last_coarse_exact_overlap_ = 0;
+    mutable uint32_t last_coarse_hnsw_m_ = 0;
+    mutable uint32_t last_coarse_hnsw_ef_search_ = 0;
+    mutable uint32_t last_coarse_hnsw_returned_clusters_ = 0;
+    mutable uint32_t last_coarse_hnsw_visited_nodes_ = 0;
+    mutable uint32_t last_coarse_hnsw_distance_computations_ = 0;
+    mutable uint32_t last_coarse_hnsw_hops_ = 0;
 
     uint32_t ResolveTwoLevelSuperCount(uint32_t nprobe) const;
     uint32_t ResolveTwoLevelCandidateBudget(uint32_t nprobe) const;
     bool EnsureCoarseHierarchy(uint32_t nprobe) const;
+    bool EnsureHnswCoarseGraph() const;
     std::vector<ClusterID> FindNearestClustersExact(const float* query,
                                                     uint32_t nprobe) const;
     std::vector<ClusterID> FindNearestClustersTwoLevel(const float* query,
                                                        uint32_t nprobe) const;
+    std::vector<ClusterID> FindNearestClustersHnsw(const float* query,
+                                                   uint32_t nprobe) const;
 
 #ifdef VDB_USE_MKL
     // Precomputed ||c||² for each centroid (MKL-accelerated distance)

@@ -468,6 +468,13 @@ struct QueryResult {
     uint32_t coarse_exact_fallback = 0;
     uint32_t coarse_exact_overlap = 0;
     double coarse_hierarchy_build_ms = 0;
+    double coarse_hnsw_graph_build_ms = 0;
+    uint32_t coarse_hnsw_m = 0;
+    uint32_t coarse_hnsw_ef_search = 0;
+    uint32_t coarse_hnsw_returned_clusters = 0;
+    uint32_t coarse_hnsw_visited_nodes = 0;
+    uint32_t coarse_hnsw_distance_computations = 0;
+    uint32_t coarse_hnsw_hops = 0;
     double probe_time_ms;
     double probe_prepare_ms = 0;
     double probe_prepare_rotation_ms = 0;
@@ -574,6 +581,13 @@ struct RoundMetrics {
     double avg_coarse_exact_fallback = 0;
     double avg_coarse_exact_overlap = 0;
     double avg_coarse_hierarchy_build_ms = 0;
+    double avg_coarse_hnsw_graph_build_ms = 0;
+    double avg_coarse_hnsw_m = 0;
+    double avg_coarse_hnsw_ef_search = 0;
+    double avg_coarse_hnsw_returned_clusters = 0;
+    double avg_coarse_hnsw_visited_nodes = 0;
+    double avg_coarse_hnsw_distance_computations = 0;
+    double avg_coarse_hnsw_hops = 0;
     double avg_probe = 0;
     double avg_probe_prepare = 0;
     double avg_probe_prepare_rotation = 0;
@@ -709,6 +723,13 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
                                        search_cfg.enable_two_level_coarse_exact_overlap);
         (void)index.PrepareTwoLevelCoarseRouting(search_cfg.nprobe);
     }
+    if (search_cfg.enable_hnsw_coarse_routing) {
+        index.SetHnswCoarseRouting(search_cfg.enable_hnsw_coarse_routing,
+                                   search_cfg.hnsw_coarse_m,
+                                   search_cfg.hnsw_coarse_ef_construction,
+                                   search_cfg.hnsw_coarse_ef_search);
+        (void)index.PrepareHnswCoarseRouting();
+    }
 
     std::unique_ptr<OverlapScheduler> scheduler;
     if (data_reader != nullptr) {
@@ -740,6 +761,15 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.coarse_exact_fallback = results.stats().coarse_exact_fallback;
         qr.coarse_exact_overlap = results.stats().coarse_exact_overlap;
         qr.coarse_hierarchy_build_ms = results.stats().coarse_hierarchy_build_ms;
+        qr.coarse_hnsw_graph_build_ms = results.stats().coarse_hnsw_graph_build_ms;
+        qr.coarse_hnsw_m = results.stats().coarse_hnsw_m;
+        qr.coarse_hnsw_ef_search = results.stats().coarse_hnsw_ef_search;
+        qr.coarse_hnsw_returned_clusters =
+            results.stats().coarse_hnsw_returned_clusters;
+        qr.coarse_hnsw_visited_nodes = results.stats().coarse_hnsw_visited_nodes;
+        qr.coarse_hnsw_distance_computations =
+            results.stats().coarse_hnsw_distance_computations;
+        qr.coarse_hnsw_hops = results.stats().coarse_hnsw_hops;
         qr.probe_time_ms = results.stats().probe_time_ms;
         qr.probe_prepare_ms = results.stats().probe_prepare_ms;
         qr.probe_prepare_rotation_ms = results.stats().probe_prepare_rotation_ms;
@@ -909,6 +939,13 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_coarse_exact_fallback = 0;
     double sum_coarse_exact_overlap = 0;
     double sum_coarse_hierarchy_build = 0;
+    double sum_coarse_hnsw_graph_build = 0;
+    double sum_coarse_hnsw_m = 0;
+    double sum_coarse_hnsw_ef_search = 0;
+    double sum_coarse_hnsw_returned_clusters = 0;
+    double sum_coarse_hnsw_visited_nodes = 0;
+    double sum_coarse_hnsw_distance_computations = 0;
+    double sum_coarse_hnsw_hops = 0;
     double sum_probe = 0, sum_probe_prepare = 0;
     double sum_probe_prepare_rotation = 0;
     double sum_probe_prepare_subtract = 0;
@@ -992,6 +1029,14 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_coarse_exact_fallback += qresults[qi].coarse_exact_fallback;
         sum_coarse_exact_overlap += qresults[qi].coarse_exact_overlap;
         sum_coarse_hierarchy_build += qresults[qi].coarse_hierarchy_build_ms;
+        sum_coarse_hnsw_graph_build += qresults[qi].coarse_hnsw_graph_build_ms;
+        sum_coarse_hnsw_m += qresults[qi].coarse_hnsw_m;
+        sum_coarse_hnsw_ef_search += qresults[qi].coarse_hnsw_ef_search;
+        sum_coarse_hnsw_returned_clusters += qresults[qi].coarse_hnsw_returned_clusters;
+        sum_coarse_hnsw_visited_nodes += qresults[qi].coarse_hnsw_visited_nodes;
+        sum_coarse_hnsw_distance_computations +=
+            qresults[qi].coarse_hnsw_distance_computations;
+        sum_coarse_hnsw_hops += qresults[qi].coarse_hnsw_hops;
         sum_probe += qresults[qi].probe_time_ms;
         sum_probe_prepare += qresults[qi].probe_prepare_ms;
         sum_probe_prepare_rotation += qresults[qi].probe_prepare_rotation_ms;
@@ -1088,6 +1133,14 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_coarse_exact_fallback = sum_coarse_exact_fallback / Q;
     m.avg_coarse_exact_overlap = sum_coarse_exact_overlap / Q;
     m.avg_coarse_hierarchy_build_ms = sum_coarse_hierarchy_build / Q;
+    m.avg_coarse_hnsw_graph_build_ms = sum_coarse_hnsw_graph_build / Q;
+    m.avg_coarse_hnsw_m = sum_coarse_hnsw_m / Q;
+    m.avg_coarse_hnsw_ef_search = sum_coarse_hnsw_ef_search / Q;
+    m.avg_coarse_hnsw_returned_clusters = sum_coarse_hnsw_returned_clusters / Q;
+    m.avg_coarse_hnsw_visited_nodes = sum_coarse_hnsw_visited_nodes / Q;
+    m.avg_coarse_hnsw_distance_computations =
+        sum_coarse_hnsw_distance_computations / Q;
+    m.avg_coarse_hnsw_hops = sum_coarse_hnsw_hops / Q;
     m.avg_probe = sum_probe / Q;
     m.avg_probe_prepare = sum_probe_prepare / Q;
     m.avg_probe_prepare_rotation = sum_probe_prepare_rotation / Q;
@@ -1372,6 +1425,14 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--coarse-select-simd", 1);
     int arg_coarse_select_phase2 =
         GetIntArg(argc, argv, "--coarse-select-phase2", 0);
+    int arg_hnsw_coarse_routing =
+        GetIntArg(argc, argv, "--hnsw-coarse-routing", 0);
+    int arg_hnsw_coarse_m =
+        GetIntArg(argc, argv, "--hnsw-coarse-m", 32);
+    int arg_hnsw_coarse_ef_construction =
+        GetIntArg(argc, argv, "--hnsw-coarse-ef-construction", 128);
+    int arg_hnsw_coarse_ef_search =
+        GetIntArg(argc, argv, "--hnsw-coarse-ef-search", 512);
     int arg_two_level_coarse_routing =
         GetIntArg(argc, argv, "--two-level-coarse-routing", 0);
     int arg_two_level_coarse_threshold =
@@ -1401,8 +1462,9 @@ int main(int argc, char* argv[]) {
     bool arg_sqpoll = HasFlag(argc, argv, "--sqpoll");
     const bool query_only_mode = (arg_query_only != 0);
     const bool skip_gt = query_only_mode || (arg_skip_gt != 0);
-    if (arg_two_level_coarse_routing != 0 && skip_gt) {
-        Log("WARNING: two-level coarse routing is running without real GT recall; do not use this run as final performance evidence.\n");
+    if ((arg_two_level_coarse_routing != 0 || arg_hnsw_coarse_routing != 0) &&
+        skip_gt) {
+        Log("WARNING: approximate coarse routing is running without real GT recall; do not use this run as final performance evidence.\n");
     }
     const bool external_gt_requested = !arg_gt_file.empty();
 
@@ -2412,6 +2474,13 @@ int main(int argc, char* argv[]) {
         (arg_rerank_batched_distance_simd != 0);
     search_cfg.enable_coarse_select_simd = (arg_coarse_select_simd != 0);
     search_cfg.enable_coarse_select_phase2 = (arg_coarse_select_phase2 != 0);
+    search_cfg.enable_hnsw_coarse_routing = (arg_hnsw_coarse_routing != 0);
+    search_cfg.hnsw_coarse_m =
+        static_cast<uint32_t>(std::max(1, arg_hnsw_coarse_m));
+    search_cfg.hnsw_coarse_ef_construction =
+        static_cast<uint32_t>(std::max(1, arg_hnsw_coarse_ef_construction));
+    search_cfg.hnsw_coarse_ef_search =
+        static_cast<uint32_t>(std::max(1, arg_hnsw_coarse_ef_search));
     search_cfg.enable_two_level_coarse_routing =
         (arg_two_level_coarse_routing != 0);
     search_cfg.two_level_coarse_threshold =
@@ -2774,6 +2843,10 @@ int main(int argc, char* argv[]) {
         f << "    " << JBool("enable_rerank_batched_distance_simd", search_cfg.enable_rerank_batched_distance_simd) << ",\n";
         f << "    " << JBool("enable_coarse_select_simd", search_cfg.enable_coarse_select_simd) << ",\n";
         f << "    " << JBool("enable_coarse_select_phase2", search_cfg.enable_coarse_select_phase2) << ",\n";
+        f << "    " << JBool("enable_hnsw_coarse_routing", search_cfg.enable_hnsw_coarse_routing) << ",\n";
+        f << "    " << JInt("hnsw_coarse_m", search_cfg.hnsw_coarse_m) << ",\n";
+        f << "    " << JInt("hnsw_coarse_ef_construction", search_cfg.hnsw_coarse_ef_construction) << ",\n";
+        f << "    " << JInt("hnsw_coarse_ef_search", search_cfg.hnsw_coarse_ef_search) << ",\n";
         f << "    " << JBool("enable_two_level_coarse_routing", search_cfg.enable_two_level_coarse_routing) << ",\n";
         f << "    " << JInt("two_level_coarse_threshold", search_cfg.two_level_coarse_threshold) << ",\n";
         f << "    " << JInt("two_level_coarse_super_count", search_cfg.two_level_coarse_super_count) << ",\n";
@@ -2968,6 +3041,13 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_coarse_exact_fallback", metrics.avg_coarse_exact_fallback) << ",\n";
         f << "    " << JNum("avg_coarse_exact_overlap", metrics.avg_coarse_exact_overlap) << ",\n";
         f << "    " << JNum("avg_coarse_hierarchy_build_ms", metrics.avg_coarse_hierarchy_build_ms) << ",\n";
+        f << "    " << JNum("avg_coarse_hnsw_graph_build_ms", metrics.avg_coarse_hnsw_graph_build_ms) << ",\n";
+        f << "    " << JNum("avg_coarse_hnsw_m", metrics.avg_coarse_hnsw_m) << ",\n";
+        f << "    " << JNum("avg_coarse_hnsw_ef_search", metrics.avg_coarse_hnsw_ef_search) << ",\n";
+        f << "    " << JNum("avg_coarse_hnsw_returned_clusters", metrics.avg_coarse_hnsw_returned_clusters) << ",\n";
+        f << "    " << JNum("avg_coarse_hnsw_visited_nodes", metrics.avg_coarse_hnsw_visited_nodes) << ",\n";
+        f << "    " << JNum("avg_coarse_hnsw_distance_computations", metrics.avg_coarse_hnsw_distance_computations) << ",\n";
+        f << "    " << JNum("avg_coarse_hnsw_hops", metrics.avg_coarse_hnsw_hops) << ",\n";
         f << "    " << JNum("avg_probe_time_ms", metrics.avg_probe) << ",\n";
         f << "    " << JNum("avg_probe_prepare_ms", metrics.avg_probe_prepare) << ",\n";
         f << "    " << JNum("avg_probe_prepare_rotation_ms", metrics.avg_probe_prepare_rotation) << ",\n";
@@ -3079,6 +3159,13 @@ int main(int argc, char* argv[]) {
             f << "      " << JInt("coarse_exact_fallback", qr.coarse_exact_fallback) << ",\n";
             f << "      " << JInt("coarse_exact_overlap", qr.coarse_exact_overlap) << ",\n";
             f << "      " << JNum("coarse_hierarchy_build_ms", qr.coarse_hierarchy_build_ms) << ",\n";
+            f << "      " << JNum("coarse_hnsw_graph_build_ms", qr.coarse_hnsw_graph_build_ms) << ",\n";
+            f << "      " << JInt("coarse_hnsw_m", qr.coarse_hnsw_m) << ",\n";
+            f << "      " << JInt("coarse_hnsw_ef_search", qr.coarse_hnsw_ef_search) << ",\n";
+            f << "      " << JInt("coarse_hnsw_returned_clusters", qr.coarse_hnsw_returned_clusters) << ",\n";
+            f << "      " << JInt("coarse_hnsw_visited_nodes", qr.coarse_hnsw_visited_nodes) << ",\n";
+            f << "      " << JInt("coarse_hnsw_distance_computations", qr.coarse_hnsw_distance_computations) << ",\n";
+            f << "      " << JInt("coarse_hnsw_hops", qr.coarse_hnsw_hops) << ",\n";
             f << "      " << JNum("probe_ms", qr.probe_time_ms) << ",\n";
             f << "      " << JNum("probe_prepare_ms", qr.probe_prepare_ms) << ",\n";
             f << "      " << JNum("probe_prepare_rotation_ms", qr.probe_prepare_rotation_ms) << ",\n";

@@ -12,6 +12,8 @@
 #include <optional>
 #include <string_view>
 
+#include <faiss/IndexHNSW.h>
+#include <faiss/impl/HNSW.h>
 #include "superkmeans/superkmeans.h"
 #include "vdb/common/aligned_alloc.h"
 #include "vdb/simd/coarse_ip_score.h"
@@ -296,6 +298,25 @@ void IvfIndex::SetTwoLevelCoarseRouting(bool enabled,
     two_level_coarse_exact_overlap_ = exact_overlap;
 }
 
+void IvfIndex::SetHnswCoarseRouting(bool enabled,
+                                    uint32_t m,
+                                    uint32_t ef_construction,
+                                    uint32_t ef_search) {
+    const uint32_t sanitized_m = std::max<uint32_t>(1, m);
+    const uint32_t sanitized_ef_construction = std::max<uint32_t>(1, ef_construction);
+    const uint32_t sanitized_ef_search = std::max<uint32_t>(1, ef_search);
+    if (use_hnsw_coarse_routing_ != enabled ||
+        hnsw_coarse_m_ != sanitized_m ||
+        hnsw_coarse_ef_construction_ != sanitized_ef_construction ||
+        hnsw_coarse_ef_search_ != sanitized_ef_search) {
+        coarse_hnsw_ = HnswCoarseGraph{};
+    }
+    use_hnsw_coarse_routing_ = enabled;
+    hnsw_coarse_m_ = sanitized_m;
+    hnsw_coarse_ef_construction_ = sanitized_ef_construction;
+    hnsw_coarse_ef_search_ = sanitized_ef_search;
+}
+
 uint32_t IvfIndex::ResolveTwoLevelSuperCount(uint32_t nprobe) const {
     return DefaultTwoLevelSuperCount(nlist_,
                                      two_level_coarse_super_count_,
@@ -315,6 +336,13 @@ bool IvfIndex::PrepareTwoLevelCoarseRouting(uint32_t nprobe) const {
         return false;
     }
     return EnsureCoarseHierarchy(nprobe);
+}
+
+bool IvfIndex::PrepareHnswCoarseRouting() const {
+    if (!use_hnsw_coarse_routing_) {
+        return false;
+    }
+    return EnsureHnswCoarseGraph();
 }
 
 bool IvfIndex::EnsureCoarseHierarchy(uint32_t nprobe) const {
@@ -452,6 +480,73 @@ bool IvfIndex::EnsureCoarseHierarchy(uint32_t nprobe) const {
     last_coarse_hierarchy_build_ms_ = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - build_start).count();
     return true;
+}
+
+bool IvfIndex::EnsureHnswCoarseGraph() const {
+    if (!use_hnsw_coarse_routing_) {
+        return false;
+    }
+    if (coarse_hnsw_.ready &&
+        coarse_hnsw_.m == hnsw_coarse_m_ &&
+        coarse_hnsw_.ef_construction == hnsw_coarse_ef_construction_ &&
+        coarse_hnsw_.ef_search == hnsw_coarse_ef_search_ &&
+        coarse_hnsw_.nlist == nlist_ &&
+        coarse_hnsw_.dim == dim_) {
+        last_coarse_hnsw_graph_build_ms_ = 0.0;
+        return true;
+    }
+
+    coarse_hnsw_ = HnswCoarseGraph{};
+    last_coarse_hnsw_graph_build_ms_ = 0.0;
+    if (nlist_ == 0 || dim_ == 0 || centroids_.empty()) {
+        return false;
+    }
+
+    const bool cosine_path = (effective_metric_ == "ip" && requested_metric_ == "cosine");
+    faiss::MetricType metric = faiss::METRIC_L2;
+    const std::vector<float>* graph_centroids = &centroids_;
+    if (effective_metric_ == "ip") {
+        metric = faiss::METRIC_INNER_PRODUCT;
+        if (cosine_path) {
+            if (normalized_centroids_.empty()) {
+                return false;
+            }
+            graph_centroids = &normalized_centroids_;
+        }
+    } else if (effective_metric_ != "l2") {
+        return false;
+    }
+    if (graph_centroids->size() != static_cast<size_t>(nlist_) * dim_) {
+        return false;
+    }
+
+    const auto build_start = std::chrono::steady_clock::now();
+    try {
+        auto hnsw = std::make_unique<faiss::IndexHNSWFlat>(
+            static_cast<int>(dim_), static_cast<int>(hnsw_coarse_m_), metric);
+        hnsw->metric_type = metric;
+        hnsw->hnsw.efConstruction = static_cast<int>(hnsw_coarse_ef_construction_);
+        hnsw->hnsw.efSearch = static_cast<int>(hnsw_coarse_ef_search_);
+        hnsw->add(static_cast<faiss::idx_t>(nlist_), graph_centroids->data());
+
+        coarse_hnsw_.index = std::move(hnsw);
+        coarse_hnsw_.m = hnsw_coarse_m_;
+        coarse_hnsw_.ef_construction = hnsw_coarse_ef_construction_;
+        coarse_hnsw_.ef_search = hnsw_coarse_ef_search_;
+        coarse_hnsw_.nlist = nlist_;
+        coarse_hnsw_.dim = dim_;
+        coarse_hnsw_.cosine_path = cosine_path;
+        coarse_hnsw_.supported_metric = true;
+        coarse_hnsw_.ready = true;
+        last_coarse_hnsw_graph_build_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - build_start).count();
+        return true;
+    } catch (const std::exception&) {
+        coarse_hnsw_ = HnswCoarseGraph{};
+        last_coarse_hnsw_graph_build_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - build_start).count();
+        return false;
+    }
 }
 
 // ============================================================================
@@ -704,6 +799,12 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
 
 std::vector<ClusterID> IvfIndex::FindNearestClusters(
     const float* query, uint32_t nprobe) const {
+    if (use_hnsw_coarse_routing_) {
+        auto result = FindNearestClustersHnsw(query, nprobe);
+        if (!result.empty() || nprobe == 0 || cluster_ids_.empty()) {
+            return result;
+        }
+    }
     if (use_two_level_coarse_routing_ &&
         nlist_ > two_level_coarse_threshold_ &&
         effective_metric_ == "ip") {
@@ -728,6 +829,13 @@ std::vector<ClusterID> IvfIndex::FindNearestClustersExact(
     last_coarse_exact_fallback_ = 0;
     last_coarse_exact_overlap_ = 0;
     last_coarse_hierarchy_build_ms_ = 0.0;
+    last_coarse_hnsw_graph_build_ms_ = 0.0;
+    last_coarse_hnsw_m_ = 0;
+    last_coarse_hnsw_ef_search_ = 0;
+    last_coarse_hnsw_returned_clusters_ = 0;
+    last_coarse_hnsw_visited_nodes_ = 0;
+    last_coarse_hnsw_distance_computations_ = 0;
+    last_coarse_hnsw_hops_ = 0;
 
     const uint32_t actual_nprobe = std::min(nprobe, nlist_);
     if (!coarse_scratch_) {
@@ -815,6 +923,85 @@ std::vector<ClusterID> IvfIndex::FindNearestClustersExact(
         result[i] = cluster_ids_[scratch.order[i]];
     }
 
+    return result;
+}
+
+std::vector<ClusterID> IvfIndex::FindNearestClustersHnsw(
+    const float* query, uint32_t nprobe) const {
+    if (nprobe == 0 || cluster_ids_.empty()) {
+        return {};
+    }
+    last_coarse_hnsw_graph_build_ms_ = 0.0;
+    last_coarse_hnsw_m_ = 0;
+    last_coarse_hnsw_ef_search_ = 0;
+    last_coarse_hnsw_returned_clusters_ = 0;
+    last_coarse_hnsw_visited_nodes_ = 0;
+    last_coarse_hnsw_distance_computations_ = 0;
+    last_coarse_hnsw_hops_ = 0;
+    if (!EnsureHnswCoarseGraph() || !coarse_hnsw_.ready || !coarse_hnsw_.index) {
+        auto result = FindNearestClustersExact(query, nprobe);
+        last_coarse_exact_fallback_ = 1;
+        return result;
+    }
+
+    const uint32_t actual_nprobe = std::min(nprobe, nlist_);
+    std::vector<float> query_buffer(static_cast<size_t>(dim_));
+    const float* query_hnsw = query;
+    if (coarse_hnsw_.cosine_path) {
+        NormalizeVector(query, query_buffer.data(), dim_);
+        query_hnsw = query_buffer.data();
+    }
+
+    std::vector<float> distances(actual_nprobe);
+    std::vector<faiss::idx_t> labels(actual_nprobe, -1);
+    faiss::SearchParametersHNSW params;
+    params.efSearch = static_cast<int>(coarse_hnsw_.ef_search);
+
+    const auto stats_before = faiss::hnsw_stats;
+    try {
+        coarse_hnsw_.index->search(1, query_hnsw, actual_nprobe,
+                                   distances.data(), labels.data(), &params);
+    } catch (const std::exception&) {
+        auto result = FindNearestClustersExact(query, nprobe);
+        last_coarse_exact_fallback_ = 1;
+        return result;
+    }
+    const auto stats_after = faiss::hnsw_stats;
+
+    uint32_t valid = 0;
+    std::vector<ClusterID> result;
+    result.reserve(actual_nprobe);
+    for (uint32_t i = 0; i < actual_nprobe; ++i) {
+        const faiss::idx_t label = labels[i];
+        if (label < 0 || label >= static_cast<faiss::idx_t>(cluster_ids_.size())) {
+            continue;
+        }
+        result.push_back(cluster_ids_[static_cast<size_t>(label)]);
+        ++valid;
+    }
+    if (valid < actual_nprobe) {
+        auto exact = FindNearestClustersExact(query, nprobe);
+        last_coarse_exact_fallback_ = 1;
+        return exact;
+    }
+
+    last_coarse_routing_mode_ = 2;
+    last_coarse_super_count_ = 0;
+    last_coarse_super_probes_ = 0;
+    last_coarse_child_candidates_scored_ = 0;
+    last_coarse_candidate_budget_ = 0;
+    last_coarse_exact_fallback_ = 0;
+    last_coarse_exact_overlap_ = 0;
+    last_coarse_hierarchy_build_ms_ = 0.0;
+    last_coarse_hnsw_graph_build_ms_ = last_coarse_hnsw_graph_build_ms_;
+    last_coarse_hnsw_m_ = coarse_hnsw_.m;
+    last_coarse_hnsw_ef_search_ = coarse_hnsw_.ef_search;
+    last_coarse_hnsw_returned_clusters_ = valid;
+    last_coarse_hnsw_distance_computations_ = static_cast<uint32_t>(
+        stats_after.ndis - stats_before.ndis);
+    last_coarse_hnsw_hops_ = static_cast<uint32_t>(
+        stats_after.nhops - stats_before.nhops);
+    last_coarse_hnsw_visited_nodes_ = last_coarse_hnsw_distance_computations_;
     return result;
 }
 

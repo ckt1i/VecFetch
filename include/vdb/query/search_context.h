@@ -64,6 +64,10 @@ struct SearchConfig {
     bool enable_rerank_batched_distance_simd = true;
     bool enable_coarse_select_simd = true;
     bool enable_coarse_select_phase2 = false;
+    bool enable_hnsw_coarse_routing = false;
+    uint32_t hnsw_coarse_m = 32;
+    uint32_t hnsw_coarse_ef_construction = 128;
+    uint32_t hnsw_coarse_ef_search = 512;
     bool enable_two_level_coarse_routing = false;
     uint32_t two_level_coarse_threshold = 4096;
     uint32_t two_level_coarse_super_count = 0;
@@ -121,7 +125,7 @@ struct SearchStats {
     double coarse_select_ms = 0;
     double coarse_score_ms = 0;
     double coarse_topn_ms = 0;
-    uint32_t coarse_routing_mode = 0;  // 0=exact, 1=two_level
+    uint32_t coarse_routing_mode = 0;  // 0=exact, 1=two_level, 2=hnsw
     uint32_t coarse_super_count = 0;
     uint32_t coarse_super_probes = 0;
     uint32_t coarse_child_candidates_scored = 0;
@@ -129,6 +133,13 @@ struct SearchStats {
     uint32_t coarse_exact_fallback = 0;
     uint32_t coarse_exact_overlap = 0;
     double coarse_hierarchy_build_ms = 0;
+    double coarse_hnsw_graph_build_ms = 0;
+    uint32_t coarse_hnsw_m = 0;
+    uint32_t coarse_hnsw_ef_search = 0;
+    uint32_t coarse_hnsw_returned_clusters = 0;
+    uint32_t coarse_hnsw_visited_nodes = 0;
+    uint32_t coarse_hnsw_distance_computations = 0;
+    uint32_t coarse_hnsw_hops = 0;
     double probe_time_ms = 0;
     double probe_prepare_ms = 0;
     double probe_prepare_rotation_ms = 0;

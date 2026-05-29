@@ -182,6 +182,10 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
 
     index_.SetUseCoarseSelectSimd(config_.enable_coarse_select_simd);
     index_.SetUseCoarseSelectPhase2(config_.enable_coarse_select_phase2);
+    index_.SetHnswCoarseRouting(config_.enable_hnsw_coarse_routing,
+                                config_.hnsw_coarse_m,
+                                config_.hnsw_coarse_ef_construction,
+                                config_.hnsw_coarse_ef_search);
     index_.SetTwoLevelCoarseRouting(config_.enable_two_level_coarse_routing,
                                     config_.two_level_coarse_threshold,
                                     config_.two_level_coarse_super_count,
@@ -214,6 +218,17 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     ctx.stats().coarse_exact_overlap = index_.last_coarse_exact_overlap();
     ctx.stats().coarse_hierarchy_build_ms =
         index_.last_coarse_hierarchy_build_ms();
+    ctx.stats().coarse_hnsw_graph_build_ms =
+        index_.last_coarse_hnsw_graph_build_ms();
+    ctx.stats().coarse_hnsw_m = index_.last_coarse_hnsw_m();
+    ctx.stats().coarse_hnsw_ef_search = index_.last_coarse_hnsw_ef_search();
+    ctx.stats().coarse_hnsw_returned_clusters =
+        index_.last_coarse_hnsw_returned_clusters();
+    ctx.stats().coarse_hnsw_visited_nodes =
+        index_.last_coarse_hnsw_visited_nodes();
+    ctx.stats().coarse_hnsw_distance_computations =
+        index_.last_coarse_hnsw_distance_computations();
+    ctx.stats().coarse_hnsw_hops = index_.last_coarse_hnsw_hops();
     ctx.stats().coarse_select_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - coarse_start).count();
 

@@ -301,6 +301,9 @@ target_include_directories(vdb_index PUBLIC
     $<BUILD_INTERFACE:${FLATBUFFERS_GENERATED_DIR}>
     $<INSTALL_INTERFACE:include>
 )
+target_include_directories(vdb_index PRIVATE
+    ${CMAKE_SOURCE_DIR}/thrid-party/faiss
+)
 set_target_properties(vdb_index PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 target_link_libraries(vdb_index PUBLIC vdb_storage vdb_rabitq vdb_simd vdb_schema vdb_io superkmeans)
 target_link_libraries(vdb_index PRIVATE vdb_faiss_adapter)
