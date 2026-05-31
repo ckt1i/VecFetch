@@ -1,18 +1,18 @@
 ## 1. Baseline 盘点与正确性校验
 
-- [ ] 1.1 核对当前 C++ DiskANN 可执行路径，并记录搜索与建索引实际使用的二进制文件。
-- [ ] 1.2 核对 COCO100k 的 base vectors、query vectors、ground-truth top-k 文件、现有 DiskANN 索引目录，以及 FlatStor payload 目录。
-- [ ] 1.3 核对 MSMARCO formal baseline 的 base vectors、query vectors、ground-truth top-k 文件、清洗后的 payload 资产，以及 FlatStor payload 目录。
-- [ ] 1.4 增加或更新共享的修正 recall helper，按平均 top-k overlap 计算 recall，并忽略无效 sentinel ID。
-- [ ] 1.5 增加结果有效性检查，包括重复 ID、top-k 行不完整、query 数量不匹配、payload 缺失、CLI 解析失败和超时。
+- [x] 1.1 核对当前 C++ DiskANN 可执行路径，并记录搜索与建索引实际使用的二进制文件。
+- [x] 1.2 核对 COCO100k 的 base vectors、query vectors、ground-truth top-k 文件、现有 DiskANN 索引目录，以及 FlatStor payload 目录。
+- [x] 1.3 核对 MSMARCO formal baseline 的 base vectors、query vectors、ground-truth top-k 文件、清洗后的 payload 资产，以及 FlatStor payload 目录。
+- [x] 1.4 增加或更新共享的修正 recall helper，按平均 top-k overlap 计算 recall，并忽略无效 sentinel ID。
+- [x] 1.5 增加结果有效性检查，包括重复 ID、top-k 行不完整、query 数量不匹配、payload 缺失、CLI 解析失败和超时。
 
 ## 2. DiskANN C++ Runner 与 FlatStor 计时
 
-- [ ] 2.1 扩展 C++ DiskANN runner，使 dataset 配置同时覆盖 `coco_100k` 和 `msmarco_passage`。
-- [ ] 2.2 让 runner 负责写出 DiskANN query `.bin` 文件、调用 C++ `search_disk_index`、解析结果 ID/距离文件，并按需保存 top-k ID 工件。
-- [ ] 2.3 增加索引 manifest 的读取或生成功能，记录 index identity、构建参数、数据路径、ground-truth 路径和 companion 文件状态。
-- [ ] 2.4 为 DiskANN top-k ID 增加 FlatStor payload 读取计时，并将 payload latency 与 search latency 分开导出。
-- [ ] 2.5 导出原始 sweep 行，字段包含 dataset、index identity、搜索参数、recall、search latency、payload latency、combined latency、tail latency、duplicate rate、status 和 invalid reason。
+- [x] 2.1 扩展 C++ DiskANN runner，使 dataset 配置同时覆盖 `coco_100k` 和 `msmarco_passage`。
+- [x] 2.2 让 runner 负责写出 DiskANN query `.bin` 文件、调用 C++ `search_disk_index`、解析结果 ID/距离文件，并按需保存 top-k ID 工件。
+- [x] 2.3 增加索引 manifest 的读取或生成功能，记录 index identity、构建参数、数据路径、ground-truth 路径和 companion 文件状态。
+- [x] 2.4 为 DiskANN top-k ID 增加 FlatStor payload 读取计时，并将 payload latency 与 search latency 分开导出。
+- [x] 2.5 导出原始 sweep 行，字段包含 dataset、index identity、搜索参数、recall、search latency、payload latency、combined latency、tail latency、duplicate rate、status 和 invalid reason。
 
 ## 3. COCO100k 首轮 Pareto Sweep
 

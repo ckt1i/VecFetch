@@ -100,6 +100,48 @@ done
 - `validation/coco100k_nlist2048_nprobe64_q1000_safein_dk_p095/`
 - `validation/coco100k_nlist2048_nprobe64_q1000_safein_dk_p097/`
 
+## SafeIn d_k 与 SafeIn epsilon 联合测试
+
+按相同口径额外测试：
+
+```bash
+./build/benchmarks/bench_vector_search \
+  --base /home/zcq/VDB/data/coco_100k/image_embeddings.fvecs \
+  --query /home/zcq/VDB/data/coco_100k/query_embeddings.fvecs \
+  --image-ids /home/zcq/VDB/data/coco_100k/image_ids.npy \
+  --assignments /home/zcq/VDB/data/coco_100k/coco_cluster_id_2048.ivecs \
+  --index-dir /home/zcq/VDB/test/data/COCO100k/index_fkmeans_2048_bits4_eps0.90 \
+  --nlist 2048 \
+  --nprobe 64 \
+  --topk 10 \
+  --bits 4 \
+  --metric cosine \
+  --crc 1 \
+  --early-stop 1 \
+  --enable-stage1-safein 1 \
+  --queries 1000 \
+  --safein-dk-percentile 0.90 \
+  --safein-dk-samples 1000 \
+  --safein-epsilon-percentile 0.99 \
+  --outdir openspec/changes/safe-boundary-error-frontier/validation/coco100k_nlist2048_nprobe64_q1000_safein_dk_p090_safein_eps_p099
+```
+
+结果：
+
+- calibrated safein_d_k：1.30768
+- calibrated safein_epsilon：0.00677991
+- safeout_epsilon：0.0632362
+- recall@1 / @5 / @10：0.9180 / 0.8988 / 0.8959
+- latency avg / p50 / p95 / p99：1.844 / 1.912 / 3.020 / 3.361 ms
+- avg probed：55.08 / 64
+- early stop rate：0.1500
+- Stage1 SafeIn / SafeOut / Uncertain：1,748 / 2,241,100 / 413,653
+- Stage1 false SafeIn / false SafeOut：992 / 41
+- Stage2 SafeIn / SafeOut / Uncertain：1,034 / 313,579 / 99,040
+- Stage2 false SafeIn / false SafeOut：223 / 0
+
+说明：设置 split epsilon 后，`bench_vector_search.cpp` 会关闭 Stage2 scatter batch classify，因此这组的 SafeOut 分布和延迟不能只归因于 SafeIn epsilon 变化。
+
 ## Baseline 对照
 
 已有最近 COCO 诊断日志位于 `/home/zcq/VDB/test/diag/bench_vector_search_coco_*.log`，但不是完全相同口径：旧日志使用另一套临时索引 `/home/zcq/VDB/test/tmp/bench_vector_search_coco_payload_idx`，查询数为 200，并启用了 split epsilon / safein_d_k override。

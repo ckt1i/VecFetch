@@ -611,43 +611,42 @@ float QuantizeQuery14BitWithMaxToFastScanLUT(
 
 #if defined(VDB_USE_AVX512)
 
-void AccumulateBlock(const uint8_t* VDB_RESTRICT packed_codes,
-                     const uint8_t* VDB_RESTRICT lut,
-                     uint32_t* VDB_RESTRICT result,
-                     Dim dim) {
-    const uint32_t M = dim >> 2;
-    const __m512i lo_mask = _mm512_set1_epi8(0x0f);
-
-    // Two-plane accumulation: [plane][lo_vec/hi_shifted/lo_vec_hi/hi_shifted_hi]
-    __m512i accu[2][4];
+VDB_FORCE_INLINE void InitAccumulators512(__m512i (&accu)[2][4]) {
     for (int p = 0; p < 2; ++p)
         for (int a = 0; a < 4; ++a)
             accu[p][a] = _mm512_setzero_si512();
+}
 
-    // Process 4 sub-quantizers per iteration (64 bytes codes, 2x64 bytes LUT)
-    for (uint32_t m = 0; m < M; m += 4) {
-        __m512i c = _mm512_loadu_si512(packed_codes);
-        __m512i lo = _mm512_and_si512(c, lo_mask);
-        __m512i hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), lo_mask);
+VDB_FORCE_INLINE void AccumulateStep16Avx512(
+    const uint8_t*& packed_codes,
+    const uint8_t*& lut,
+    __m512i (&accu)[2][4],
+    const __m512i lo_mask) {
+    __m512i c = _mm512_loadu_si512(packed_codes);
+    __m512i lo = _mm512_and_si512(c, lo_mask);
+    __m512i hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), lo_mask);
 
-        // Two LUT planes (lo byte + hi byte)
-        for (int p = 0; p < 2; ++p) {
-            __m512i lut_vec = _mm512_load_si512(lut);
+    // Two LUT planes (lo byte + hi byte)
+    for (int p = 0; p < 2; ++p) {
+        __m512i lut_vec = _mm512_load_si512(lut);
 
-            __m512i res_lo = _mm512_shuffle_epi8(lut_vec, lo);
-            __m512i res_hi = _mm512_shuffle_epi8(lut_vec, hi);
+        __m512i res_lo = _mm512_shuffle_epi8(lut_vec, lo);
+        __m512i res_hi = _mm512_shuffle_epi8(lut_vec, hi);
 
-            accu[p][0] = _mm512_add_epi16(accu[p][0], res_lo);
-            accu[p][1] = _mm512_add_epi16(accu[p][1], _mm512_srli_epi16(res_lo, 8));
+        accu[p][0] = _mm512_add_epi16(accu[p][0], res_lo);
+        accu[p][1] = _mm512_add_epi16(accu[p][1], _mm512_srli_epi16(res_lo, 8));
 
-            accu[p][2] = _mm512_add_epi16(accu[p][2], res_hi);
-            accu[p][3] = _mm512_add_epi16(accu[p][3], _mm512_srli_epi16(res_hi, 8));
+        accu[p][2] = _mm512_add_epi16(accu[p][2], res_hi);
+        accu[p][3] = _mm512_add_epi16(accu[p][3], _mm512_srli_epi16(res_hi, 8));
 
-            lut += 64;
-        }
-        packed_codes += 64;
+        lut += 64;
     }
+    packed_codes += 64;
+}
 
+VDB_FORCE_INLINE void StoreAccumulators512(
+    const __m512i (&accu)[2][4],
+    uint32_t* VDB_RESTRICT result) {
     // Reduce and combine: 32 results = 2 x 16
     __m512i res[2];    // final 32 uint32_t
     __m512i dis0[2], dis1[2];
@@ -688,45 +687,109 @@ void AccumulateBlock(const uint8_t* VDB_RESTRICT packed_codes,
     _mm512_storeu_si512(result + 16, res[1]);
 }
 
-#elif defined(VDB_USE_AVX2)
+VDB_FORCE_INLINE void AccumulateBlockAvx512Generic(const uint8_t* VDB_RESTRICT packed_codes,
+                                                   const uint8_t* VDB_RESTRICT lut,
+                                                   uint32_t* VDB_RESTRICT result,
+                                                   Dim dim) {
+    const uint32_t M = dim >> 2;
+    const __m512i lo_mask = _mm512_set1_epi8(0x0f);
+    const uint8_t* code_cursor = packed_codes;
+    const uint8_t* lut_cursor = lut;
+
+    // Two-plane accumulation: [plane][lo_vec/hi_shifted/lo_vec_hi/hi_shifted_hi]
+    __m512i accu[2][4];
+    InitAccumulators512(accu);
+
+    // Process 4 sub-quantizers per iteration (64 bytes codes, 2x64 bytes LUT)
+    for (uint32_t m = 0; m < M; m += 4) {
+        AccumulateStep16Avx512(code_cursor, lut_cursor, accu, lo_mask);
+    }
+
+    StoreAccumulators512(accu, result);
+}
+
+template <uint32_t kDimsPerChunk>
+VDB_FORCE_INLINE void AccumulateBlockAvx512Chunked(const uint8_t* VDB_RESTRICT packed_codes,
+                                                   const uint8_t* VDB_RESTRICT lut,
+                                                   uint32_t* VDB_RESTRICT result,
+                                                   Dim dim) {
+    static_assert(kDimsPerChunk == 32 || kDimsPerChunk == 64,
+                  "FastScan chunk must be 32 or 64 dimensions");
+    const uint32_t chunks = dim / kDimsPerChunk;
+    const __m512i lo_mask = _mm512_set1_epi8(0x0f);
+    const uint8_t* code_cursor = packed_codes;
+    const uint8_t* lut_cursor = lut;
+
+    __m512i accu[2][4];
+    InitAccumulators512(accu);
+
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        if constexpr (kDimsPerChunk == 32) {
+            AccumulateStep16Avx512(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep16Avx512(code_cursor, lut_cursor, accu, lo_mask);
+        } else {
+            AccumulateStep16Avx512(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep16Avx512(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep16Avx512(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep16Avx512(code_cursor, lut_cursor, accu, lo_mask);
+        }
+    }
+
+    StoreAccumulators512(accu, result);
+}
 
 void AccumulateBlock(const uint8_t* VDB_RESTRICT packed_codes,
                      const uint8_t* VDB_RESTRICT lut,
                      uint32_t* VDB_RESTRICT result,
                      Dim dim) {
-    const uint32_t M = dim >> 2;
-    const __m256i lo_mask = _mm256_set1_epi8(0x0f);
+    if ((dim & 63u) == 0) {
+        AccumulateBlockAvx512Chunked<64>(packed_codes, lut, result, dim);
+    } else if ((dim & 31u) == 0) {
+        AccumulateBlockAvx512Chunked<32>(packed_codes, lut, result, dim);
+    } else {
+        AccumulateBlockAvx512Generic(packed_codes, lut, result, dim);
+    }
+}
 
-    __m256i accu[2][4];
+#elif defined(VDB_USE_AVX2)
+
+VDB_FORCE_INLINE void InitAccumulators256(__m256i (&accu)[2][4]) {
     for (int p = 0; p < 2; ++p)
         for (int a = 0; a < 4; ++a)
             accu[p][a] = _mm256_setzero_si256();
+}
 
-    // Process 2 sub-quantizers per iteration (32 bytes codes, 2x32 bytes LUT)
-    for (uint32_t m = 0; m < M; m += 2) {
-        __m256i c = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(packed_codes));
-        __m256i lo = _mm256_and_si256(c, lo_mask);
-        __m256i hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), lo_mask);
+VDB_FORCE_INLINE void AccumulateStep8Avx2(
+    const uint8_t*& packed_codes,
+    const uint8_t*& lut,
+    __m256i (&accu)[2][4],
+    const __m256i lo_mask) {
+    __m256i c = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(packed_codes));
+    __m256i lo = _mm256_and_si256(c, lo_mask);
+    __m256i hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), lo_mask);
 
-        for (int p = 0; p < 2; ++p) {
-            __m256i lut_vec = _mm256_load_si256(
-                reinterpret_cast<const __m256i*>(lut));
+    for (int p = 0; p < 2; ++p) {
+        __m256i lut_vec = _mm256_load_si256(
+            reinterpret_cast<const __m256i*>(lut));
 
-            __m256i res_lo = _mm256_shuffle_epi8(lut_vec, lo);
-            __m256i res_hi = _mm256_shuffle_epi8(lut_vec, hi);
+        __m256i res_lo = _mm256_shuffle_epi8(lut_vec, lo);
+        __m256i res_hi = _mm256_shuffle_epi8(lut_vec, hi);
 
-            accu[p][0] = _mm256_add_epi16(accu[p][0], res_lo);
-            accu[p][1] = _mm256_add_epi16(accu[p][1], _mm256_srli_epi16(res_lo, 8));
+        accu[p][0] = _mm256_add_epi16(accu[p][0], res_lo);
+        accu[p][1] = _mm256_add_epi16(accu[p][1], _mm256_srli_epi16(res_lo, 8));
 
-            accu[p][2] = _mm256_add_epi16(accu[p][2], res_hi);
-            accu[p][3] = _mm256_add_epi16(accu[p][3], _mm256_srli_epi16(res_hi, 8));
+        accu[p][2] = _mm256_add_epi16(accu[p][2], res_hi);
+        accu[p][3] = _mm256_add_epi16(accu[p][3], _mm256_srli_epi16(res_hi, 8));
 
-            lut += 32;
-        }
-        packed_codes += 32;
+        lut += 32;
     }
+    packed_codes += 32;
+}
 
+VDB_FORCE_INLINE void StoreAccumulators256(
+    __m256i (&accu)[2][4],
+    uint32_t* VDB_RESTRICT result) {
     // Reduce: same logic as AVX-512 but stays in 256-bit
     for (int p = 0; p < 2; ++p) {
         accu[p][0] = _mm256_sub_epi16(accu[p][0],
@@ -758,6 +821,75 @@ void AccumulateBlock(const uint8_t* VDB_RESTRICT packed_codes,
     for (int v = 0; v < 16; ++v) {
         result[16 + v] = static_cast<uint32_t>(raw1[0][v]) +
                          (static_cast<uint32_t>(raw1[1][v]) << 8);
+    }
+}
+
+VDB_FORCE_INLINE void AccumulateBlockAvx2Generic(const uint8_t* VDB_RESTRICT packed_codes,
+                                                 const uint8_t* VDB_RESTRICT lut,
+                                                 uint32_t* VDB_RESTRICT result,
+                                                 Dim dim) {
+    const uint32_t M = dim >> 2;
+    const __m256i lo_mask = _mm256_set1_epi8(0x0f);
+    const uint8_t* code_cursor = packed_codes;
+    const uint8_t* lut_cursor = lut;
+
+    __m256i accu[2][4];
+    InitAccumulators256(accu);
+
+    // Process 2 sub-quantizers per iteration (32 bytes codes, 2x32 bytes LUT)
+    for (uint32_t m = 0; m < M; m += 2) {
+        AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+    }
+
+    StoreAccumulators256(accu, result);
+}
+
+template <uint32_t kDimsPerChunk>
+VDB_FORCE_INLINE void AccumulateBlockAvx2Chunked(const uint8_t* VDB_RESTRICT packed_codes,
+                                                 const uint8_t* VDB_RESTRICT lut,
+                                                 uint32_t* VDB_RESTRICT result,
+                                                 Dim dim) {
+    static_assert(kDimsPerChunk == 32 || kDimsPerChunk == 64,
+                  "FastScan chunk must be 32 or 64 dimensions");
+    const uint32_t chunks = dim / kDimsPerChunk;
+    const __m256i lo_mask = _mm256_set1_epi8(0x0f);
+    const uint8_t* code_cursor = packed_codes;
+    const uint8_t* lut_cursor = lut;
+
+    __m256i accu[2][4];
+    InitAccumulators256(accu);
+
+    for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+        if constexpr (kDimsPerChunk == 32) {
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+        } else {
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+            AccumulateStep8Avx2(code_cursor, lut_cursor, accu, lo_mask);
+        }
+    }
+
+    StoreAccumulators256(accu, result);
+}
+
+void AccumulateBlock(const uint8_t* VDB_RESTRICT packed_codes,
+                     const uint8_t* VDB_RESTRICT lut,
+                     uint32_t* VDB_RESTRICT result,
+                     Dim dim) {
+    if ((dim & 63u) == 0) {
+        AccumulateBlockAvx2Chunked<64>(packed_codes, lut, result, dim);
+    } else if ((dim & 31u) == 0) {
+        AccumulateBlockAvx2Chunked<32>(packed_codes, lut, result, dim);
+    } else {
+        AccumulateBlockAvx2Generic(packed_codes, lut, result, dim);
     }
 }
 

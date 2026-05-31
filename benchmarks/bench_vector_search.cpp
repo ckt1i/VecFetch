@@ -13,6 +13,7 @@
 ///       [--outdir ./results]
 ///       [--centroids /path/to/centroids.fvecs] [--assignments /path/to/assign.ivecs]
 ///       [--epsilon-sampling-mode legacy_per_cluster|global_pair]
+///       [--safein-dk-samples-input /path/to/samples.npy]
 ///       [--pad-to-pow2 1] [--index-dir /path/to/existing/index]
 ///       [--tmp-dir /tmp/bench_vs] [--keep-index]
 
@@ -149,6 +150,8 @@ int main(int argc, char* argv[]) {
     float safeout_epsilon_percentile = GetFloatArg(argc, argv, "--safeout-epsilon-percentile", -1.0f);
     uint32_t safein_dk_samples =
         static_cast<uint32_t>(GetIntArg(argc, argv, "--safein-dk-samples", 0));
+    std::string safein_dk_samples_input =
+        GetArg(argc, argv, "--safein-dk-samples-input", "");
     bool enable_stage1_safein =
         GetIntArg(argc, argv, "--enable-stage1-safein", 1) != 0;
     std::string centroids_path   = GetArg(argc, argv, "--centroids", "");
@@ -558,11 +561,32 @@ int main(int argc, char* argv[]) {
                        index.rotation(), bits, nullptr, &all_codes);
 
         if (safein_dk_percentile >= 0.0f) {
-            const uint32_t dk_queries = (safein_dk_samples > 0) ? safein_dk_samples : Q;
-            runtime_safein_dk = CalibrateRabitqSafeInDk(
-                qry.data.data(), Q, dim, top_k, dk_queries,
-                safein_dk_percentile, cluster_members_for_stats, all_codes,
-                index.centroids(), index.rotation(), bits, seed);
+            if (!safein_dk_samples_input.empty()) {
+                auto samples_or = io::LoadNpyFloat32(safein_dk_samples_input);
+                if (!samples_or.ok()) {
+                    std::fprintf(stderr,
+                                 "Failed to load safein d_k samples from %s: %s\n",
+                                 safein_dk_samples_input.c_str(),
+                                 samples_or.status().ToString().c_str());
+                    return 1;
+                }
+                const auto& samples = samples_or.value().data;
+                if (samples.empty()) {
+                    std::fprintf(stderr, "safein d_k samples input is empty: %s\n",
+                                 safein_dk_samples_input.c_str());
+                    return 1;
+                }
+                runtime_safein_dk = SelectSafeInDkFromSamples(
+                    samples, safein_dk_percentile);
+                Log("  loaded safein_d_k samples=%zu from %s\n",
+                    samples.size(), safein_dk_samples_input.c_str());
+            } else {
+                const uint32_t dk_queries = (safein_dk_samples > 0) ? safein_dk_samples : Q;
+                runtime_safein_dk = CalibrateRabitqSafeInDk(
+                    qry.data.data(), Q, dim, top_k, dk_queries,
+                    safein_dk_percentile, cluster_members_for_stats, all_codes,
+                    index.centroids(), index.rotation(), bits, seed);
+            }
         }
         if (safein_epsilon_percentile >= 0.0f) {
             runtime_safein_eps = CalibrateSplitEpsilon(
@@ -844,6 +868,7 @@ int main(int argc, char* argv[]) {
         jf << "  \"metric\": \"" << metric << "\",\n";
         jf << "  \"crc\": " << (use_crc ? "true" : "false") << ",\n";
         jf << "  \"safein_dk_percentile\": " << safein_dk_percentile << ",\n";
+        jf << "  \"safein_dk_samples_input\": \"" << safein_dk_samples_input << "\",\n";
         jf << "  \"safein_d_k\": " << runtime_safein_dk << ",\n";
         jf << "  \"safein_epsilon_percentile\": " << safein_epsilon_percentile << ",\n";
         jf << "  \"safein_epsilon\": " << runtime_safein_eps << ",\n";

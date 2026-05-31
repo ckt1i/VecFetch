@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include "vdb/rabitq/rabitq_encoder.h"
@@ -12,6 +15,24 @@
 #include "vdb/storage/pack_codes.h"
 
 namespace {
+
+struct FreeByteBuffer {
+    void operator()(uint8_t* ptr) const {
+        std::free(ptr);
+    }
+};
+
+using AlignedByteBuffer = std::unique_ptr<uint8_t, FreeByteBuffer>;
+
+AlignedByteBuffer MakeAlignedByteBuffer(size_t size, size_t alignment = 64) {
+    const size_t aligned_size = ((size + alignment - 1) / alignment) * alignment;
+    auto* ptr = static_cast<uint8_t*>(std::aligned_alloc(alignment, aligned_size));
+    if (ptr == nullptr) {
+        throw std::bad_alloc();
+    }
+    std::memset(ptr, 0, aligned_size);
+    return AlignedByteBuffer(ptr);
+}
 
 std::vector<float> MakeInput(uint32_t dim, float offset = 0.0f) {
     std::vector<float> out(dim);
@@ -162,6 +183,46 @@ uint32_t ScalarFastScanAccuForVector(const uint8_t* packed_block,
     return raw;
 }
 
+void ExpectFastScanPipelineMatchesScalarReference(uint32_t dim) {
+    constexpr uint32_t num_codes = 32;
+
+    std::vector<int16_t> quant_query(dim, 0);
+    for (uint32_t i = 0; i < dim; ++i) {
+        const int sign = (i % 4 == 0 || i % 9 == 0) ? -1 : 1;
+        quant_query[i] = static_cast<int16_t>(
+            sign * static_cast<int>((i * 53u + 11u) % 2048u));
+    }
+
+    std::vector<vdb::rabitq::RaBitQCode> codes(num_codes);
+    const uint32_t words = (dim + 63u) / 64u;
+    for (uint32_t v = 0; v < num_codes; ++v) {
+        codes[v].code.assign(words, 0ULL);
+        for (uint32_t d = 0; d < dim; ++d) {
+            const uint8_t bit = static_cast<uint8_t>(((v * 7u + d * 3u) & 1u));
+            if (bit) {
+                codes[v].code[d / 64u] |= (1ULL << (d % 64u));
+            }
+        }
+    }
+
+    std::vector<uint8_t> packed(vdb::storage::FastScanPackedSize(dim), 0);
+    vdb::storage::PackSignBitsForFastScan(
+        codes.data(), num_codes, dim, packed.data());
+
+    const size_t lut_size = static_cast<size_t>(dim) * 8u;
+    auto lut = MakeAlignedByteBuffer(lut_size);
+    vdb::simd::BuildFastScanLUT(quant_query.data(), lut.get(), dim);
+
+    alignas(64) uint32_t actual[32] = {0};
+    vdb::simd::AccumulateBlock(packed.data(), lut.get(), actual, dim);
+
+    for (uint32_t v = 0; v < num_codes; ++v) {
+        const uint32_t expected =
+            ScalarFastScanAccuForVector(packed.data(), lut.get(), v, dim);
+        EXPECT_EQ(actual[v], expected) << "dim=" << dim << " vector=" << v;
+    }
+}
+
 void ExpectVecNear(const std::vector<float>& a,
                    const std::vector<float>& b,
                    float tol) {
@@ -259,54 +320,21 @@ TEST(PrepareQuerySimdTest, BuildFastScanLUTMatchesReference) {
         }
 
         const size_t lut_size = static_cast<size_t>(dim) * 8u;
-        std::vector<uint8_t> actual(lut_size, 0), expected(lut_size, 0);
+        auto actual = MakeAlignedByteBuffer(lut_size);
+        auto expected = MakeAlignedByteBuffer(lut_size);
 
         const int32_t actual_shift =
-            vdb::simd::BuildFastScanLUT(quant_query.data(), actual.data(), dim);
+            vdb::simd::BuildFastScanLUT(quant_query.data(), actual.get(), dim);
         const int32_t expected_shift =
-            BuildFastScanLUTReference(quant_query.data(), expected.data(), dim);
+            BuildFastScanLUTReference(quant_query.data(), expected.get(), dim);
 
         EXPECT_EQ(actual_shift, expected_shift);
-        EXPECT_EQ(actual, expected);
+        EXPECT_EQ(std::memcmp(actual.get(), expected.get(), lut_size), 0);
     }
 }
 
 TEST(PrepareQuerySimdTest, FastScanPipelineMatchesScalarReference) {
-    constexpr uint32_t dim = 64;
-    constexpr uint32_t num_codes = 32;
-
-    std::vector<int16_t> quant_query(dim, 0);
-    for (uint32_t i = 0; i < dim; ++i) {
-        const int sign = (i % 4 == 0 || i % 9 == 0) ? -1 : 1;
-        quant_query[i] = static_cast<int16_t>(
-            sign * static_cast<int>((i * 53u + 11u) % 2048u));
-    }
-
-    std::vector<vdb::rabitq::RaBitQCode> codes(num_codes);
-    const uint32_t words = (dim + 63u) / 64u;
-    for (uint32_t v = 0; v < num_codes; ++v) {
-        codes[v].code.assign(words, 0ULL);
-        for (uint32_t d = 0; d < dim; ++d) {
-            const uint8_t bit = static_cast<uint8_t>(((v * 7u + d * 3u) & 1u));
-            if (bit) {
-                codes[v].code[d / 64u] |= (1ULL << (d % 64u));
-            }
-        }
-    }
-
-    std::vector<uint8_t> packed(vdb::storage::FastScanPackedSize(dim), 0);
-    vdb::storage::PackSignBitsForFastScan(
-        codes.data(), num_codes, dim, packed.data());
-
-    std::vector<uint8_t> lut(static_cast<size_t>(dim) * 8u, 0);
-    vdb::simd::BuildFastScanLUT(quant_query.data(), lut.data(), dim);
-
-    alignas(64) uint32_t actual[32] = {0};
-    vdb::simd::AccumulateBlock(packed.data(), lut.data(), actual, dim);
-
-    for (uint32_t v = 0; v < num_codes; ++v) {
-        const uint32_t expected =
-            ScalarFastScanAccuForVector(packed.data(), lut.data(), v, dim);
-        EXPECT_EQ(actual[v], expected) << "vector=" << v;
+    for (uint32_t dim : {16u, 32u, 64u, 96u, 512u, 544u, 768u, 1024u, 1056u, 1536u}) {
+        ExpectFastScanPipelineMatchesScalarReference(dim);
     }
 }
