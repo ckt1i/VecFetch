@@ -1,0 +1,18 @@
+{
+  "rows_seen": 3154940,
+  "static_T_safein": 135,
+  "static_T_false_safein": 73,
+  "static_T_false_rate": 0.5407407407407407,
+  "static_false_modes": {
+    "static_T_above_query_Rq": 73
+  },
+  "static_false_posgap": 73,
+  "static_false_nonpos": 0,
+  "oracle_Rq_safein": 166,
+  "oracle_Rq_false_safein": 0,
+  "oracle_Rq_false_rate": 0.0,
+  "oracle_false_posgap": 0,
+  "oracle_false_nonpos": 0,
+  "oracle_safein_delta_vs_static": 31,
+  "oracle_false_delta_vs_static": -73
+}

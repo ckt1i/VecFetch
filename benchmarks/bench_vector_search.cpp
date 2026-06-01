@@ -27,6 +27,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <random>
@@ -166,6 +168,8 @@ int main(int argc, char* argv[]) {
         GetArg(argc, argv, "--safein-dk-samples-input", "");
     std::string safein_dk_samples_output =
         GetArg(argc, argv, "--safein-dk-samples-output", "");
+    std::string per_query_stats_output =
+        GetArg(argc, argv, "--per-query-stats-output", "");
     SafeInDkSpace requested_safein_dk_space = SafeInDkSpace::ExactL2;
     const std::string safein_dk_space_arg =
         GetArg(argc, argv, "--safein-dk-space", "exact_l2");
@@ -199,6 +203,7 @@ int main(int argc, char* argv[]) {
             "[--safein-dk-space exact_l2|rabitq_s2] "
             "[--safein-dk-samples-input path] "
             "[--safein-dk-samples-output path] "
+            "[--per-query-stats-output path] "
             "[--pad-to-pow2 1] "
             "[--enable-stage1-safein 0|1] "
             "[--index-dir <path>] [--tmp-dir <path>] [--keep-index]\n");
@@ -310,6 +315,7 @@ int main(int argc, char* argv[]) {
     // GT loading
     std::vector<std::vector<int64_t>> gt_ids;
     std::vector<std::vector<uint32_t>> gt_row_ids;
+    std::vector<float> exact_kth_l2(Q, std::numeric_limits<float>::quiet_NaN());
     uint32_t gt_k = 0;
 
     if (!gt_path.empty() && fs::exists(gt_path)) {
@@ -432,6 +438,9 @@ int main(int argc, char* argv[]) {
                     : image_ids[dists[i].second];
             for (uint32_t i = 0; i < std::min(gt_k, N); ++i)
                 gt_row_ids[qi][i] = dists[i].second;
+            if (top_k > 0 && top_k <= dists.size()) {
+                exact_kth_l2[qi] = dists[top_k - 1].first;
+            }
         }
         Log("  Brute-force GT computed (k=%u).\n", gt_k);
     }
@@ -771,6 +780,16 @@ int main(int argc, char* argv[]) {
     uint64_t safeout_frontier_updates = 0;
     const uint32_t probed_clusters_per_query =
         std::min<uint32_t>(nprobe, index.nlist());
+    std::ofstream per_query_stats;
+    if (!per_query_stats_output.empty()) {
+        per_query_stats.open(per_query_stats_output);
+        per_query_stats
+            << "query_id,exact_kth_l2,T_minus_Rq,s1_safein,s1_false_safein,"
+            << "s2_safein,s2_false_safein,total_safein,total_false_safein,"
+            << "s1_safeout,s1_false_safeout,s2_safeout,s2_false_safeout,"
+            << "s1_uncertain,s2_uncertain,final_uncertain,latency_ms,probed_clusters\n";
+        per_query_stats << std::fixed << std::setprecision(9);
+    }
 
     for (uint32_t qi = 0; qi < Q; ++qi) {
         SearchConfig query_cfg = search_cfg;
@@ -811,6 +830,31 @@ int main(int argc, char* argv[]) {
             st.total_safeout_frontier_estimates_merged;
         safeout_frontier_updates += st.total_safeout_frontier_updates;
         total_probed_clusters += probed_clusters_per_query;
+
+        if (per_query_stats.is_open()) {
+            const uint64_t query_safein = st.total_safe_in + st.s2_safe_in;
+            const uint64_t query_false_safein =
+                st.s1_false_safe_in + st.s2_false_safe_in;
+            per_query_stats
+                << qi << ','
+                << exact_kth_l2[qi] << ','
+                << (runtime_safein_dk - exact_kth_l2[qi]) << ','
+                << st.total_safe_in << ','
+                << st.s1_false_safe_in << ','
+                << st.s2_safe_in << ','
+                << st.s2_false_safe_in << ','
+                << query_safein << ','
+                << query_false_safein << ','
+                << st.total_safe_out << ','
+                << st.s1_false_safe_out << ','
+                << st.s2_safe_out << ','
+                << st.s2_false_safe_out << ','
+                << st.s1_uncertain_raw << ','
+                << st.s2_uncertain << ','
+                << st.total_uncertain << ','
+                << latencies[qi] << ','
+                << probed_clusters_per_query << '\n';
+        }
 
         if ((qi + 1) % (Q / std::max(Q / 4u, 1u)) == 0 || qi + 1 == Q) {
             Log("  Progress: %u/%u\n", qi + 1, Q);

@@ -1,8 +1,0 @@
-run_id,phase,dataset,system,backend,config,protocol,status,start_time,end_time,output_dir,summary_csv,notes
-R001,prepare,coco_100k,-,-,split=v1,-,todo,,,,,
-R002,embed,coco_100k,clip_siglip,-,model=siglip-base-patch16-224,offline,todo,,,,,
-R003,gt,coco_100k,exact_knn,-,topk=20,offline,todo,,,,,
-R004,vector_search,coco_100k,faiss_ivfpq_rerank,-,"nlist=2048;nprobe=64;candidate_budget=200",warm,todo,,,,,
-R005,e2e,coco_100k,boundfetch,flatstor,"nlist=2048;nprobe=512;alpha=0.02;bits=4",warm_coupled,todo,,,,,
-R006,payload_microbench,coco_100k,-,lance,"topk=10;id_source=fixed_sample",warm,todo,,,,,
-R007,build_cost,coco_100k,diskann,-,"R=64;L_build=100",offline,todo,,,,,

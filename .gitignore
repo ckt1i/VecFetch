@@ -49,6 +49,7 @@ _deps/
 
 # Test outputs
 Testing/
+safeIn_dk_review_logs/validation_p090/dk_space_compare_candidates_exact.csv
 # Added by code-review-graph
 .code-review-graph/
 

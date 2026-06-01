@@ -1,5 +1,0 @@
-encoder_id,role,modality,model_family,model_name_or_path,source_type,source_page,framework,checkpoint_version,embedding_dim,metric,pooling,normalization,query_instruction,doc_instruction,batch_size,precision,device,max_seq_len_or_frames,output_dtype,status,notes
-enc_text_main_v1,main,text,bge_or_e5,TBD,official_model_card,TBD,huggingface_or_local,TBD,TBD,cosine,cls_or_mean,unit_norm,TBD,TBD,TBD,fp16_or_bf16,cuda,TBD,float32,planned,
-enc_image_main_v1,main,image,clip_or_siglip,TBD,official_model_card,TBD,huggingface_or_local,TBD,512,cosine,global_pool,unit_norm,none,none,TBD,fp16_or_bf16,cuda,224_or_384,float32,planned,
-enc_audio_appendix_v1,appendix,audio,clap,TBD,official_model_card,TBD,huggingface_or_local,TBD,TBD,cosine,global_pool,unit_norm,caption_as_query,audio_as_doc,TBD,fp16_or_bf16,cuda,30s,float32,optional,
-enc_video_appendix_v1,appendix,video,frame_pooling_encoder,TBD,official_model_card,TBD,huggingface_or_local,TBD,TBD,cosine,temporal_pool,unit_norm,text_as_query,video_frames_as_doc,TBD,fp16_or_bf16,cuda,TBD,float32,optional,

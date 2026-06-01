@@ -398,6 +398,7 @@ int main(int argc, char* argv[]) {
     const uint32_t nprobe = static_cast<uint32_t>(GetIntArg(argc, argv, "--nprobe", 64));
     const uint32_t q_limit = static_cast<uint32_t>(GetIntArg(argc, argv, "--queries", 200));
     const float percentile = GetFloatArg(argc, argv, "--percentile", 0.99f);
+    const bool write_candidates = GetIntArg(argc, argv, "--write-candidates", 0) != 0;
     uint8_t bits = static_cast<uint8_t>(GetIntArg(argc, argv, "--bits", 0));
 
     if (dataset_dir.empty() || index_dir.empty()) {
@@ -405,7 +406,8 @@ int main(int argc, char* argv[]) {
                      "Usage: bench_dk_space_compare --dataset <dir> --index-dir <dir> "
                      "[--base path] [--query path] [--centroids path] [--assignments path] "
                      "[--gt-file path] [--queries 200] [--topk 10] [--nprobe 64] "
-                     "[--percentile 0.99] [--bits 4] [--outdir ./dk_space_compare]\n");
+                     "[--percentile 0.99] [--bits 4] [--write-candidates 0|1] "
+                     "[--outdir ./dk_space_compare]\n");
         return 1;
     }
 
@@ -545,6 +547,17 @@ int main(int argc, char* argv[]) {
               qry.data.data(), Q, base.data.data(), N, dim, Q, top_k, percentile, 42);
     Log("d_k_exact=%.9f index_d_k=%.9f\n", d_k_exact, index_d_k);
 
+    std::ofstream candidate_csv;
+    if (write_candidates) {
+        candidate_csv.open(outdir + "/dk_space_compare_candidates_exact.csv");
+        candidate_csv
+            << "query_id,vector_row,cluster_id,cluster_rank,is_true_topk,"
+            << "exact_kth_l2,T_minus_Rq,exact_dist,est_s2,margin_s2,"
+            << "upper_bound_s2,static_safein_exact_dk,oracle_safein_exact_Rq,"
+            << "static_false_mode\n";
+        candidate_csv << std::fixed << std::setprecision(9);
+    }
+
     std::vector<std::vector<uint32_t>> cluster_members(index.nlist());
     for (uint32_t row = 0; row < assignments.size(); ++row) {
         const uint32_t cid = assignments[row];
@@ -606,12 +619,44 @@ int main(int argc, char* argv[]) {
                 const float est_s2 = estimator.EstimateDistanceMultiBit(pq, code);
                 const float margin_s1 = margin_factor * code.norm;
                 const float margin_s2 = margin_s1 / margin_s2_divisor;
+                const float upper_bound_s2 = est_s2 + margin_s2;
                 s2_dists.push_back(est_s2);
                 if (est_s2 < d_k_exact) ++qs.count_s2_lt_dk_exact;
-                const bool safein_exact = est_s2 < d_k_exact - margin_s2;
+                const bool safein_exact = upper_bound_s2 < d_k_exact;
                 if (safein_exact) {
                     ++qs.count_safein_current_exact_dk;
                     if (truth_available && !is_true) ++qs.false_safein_exact_dk;
+                }
+                if (candidate_csv.is_open()) {
+                    const float exact_dist = simd::L2Sqr(
+                        q_vec, base.data.data() + static_cast<size_t>(row) * dim, dim);
+                    const float exact_kth = qs.exact_kth_l2;
+                    const bool oracle_safein =
+                        exact_dk_mode != "index" && upper_bound_s2 < exact_kth;
+                    const char* false_mode = "";
+                    if (safein_exact && truth_available && !is_true) {
+                        if (exact_dist > d_k_exact) {
+                            false_mode = "bound_violation_exact_gt_T";
+                        } else if (exact_dk_mode != "index" && exact_dist > exact_kth) {
+                            false_mode = "static_T_above_query_Rq";
+                        } else {
+                            false_mode = "gt_tie_or_id_mismatch";
+                        }
+                    }
+                    candidate_csv << qi << ','
+                                  << row << ','
+                                  << cid << ','
+                                  << (rank + 1) << ','
+                                  << (is_true ? 1 : 0) << ','
+                                  << exact_kth << ','
+                                  << (d_k_exact - exact_kth) << ','
+                                  << exact_dist << ','
+                                  << est_s2 << ','
+                                  << margin_s2 << ','
+                                  << upper_bound_s2 << ','
+                                  << (safein_exact ? 1 : 0) << ','
+                                  << (oracle_safein ? 1 : 0) << ','
+                                  << false_mode << '\n';
                 }
             }
         }
