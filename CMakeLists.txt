@@ -60,7 +60,6 @@ endif()
 # =============================================================================
 include(FetchContent)
 find_package(Threads REQUIRED)
-find_package(GSL REQUIRED)
 
 # SuperKMeans — fast clustering library (header-only INTERFACE)
 set(SKMEANS_COMPILE_TESTS OFF CACHE BOOL "" FORCE)
@@ -307,9 +306,6 @@ target_include_directories(vdb_index PRIVATE
 set_target_properties(vdb_index PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 target_link_libraries(vdb_index PUBLIC vdb_storage vdb_rabitq vdb_simd vdb_schema vdb_io superkmeans)
 target_link_libraries(vdb_index PRIVATE vdb_faiss_adapter)
-# IvfBuilder uses CrcCalibrator for offline CRC score precomputation.
-# GSL dependency stays PRIVATE within vdb_crc, not exposed to vdb_index consumers.
-target_link_libraries(vdb_index PRIVATE vdb_crc)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(vdb_index PRIVATE OpenMP::OpenMP_CXX)
 endif()
@@ -317,24 +313,6 @@ if(VDB_USE_MKL)
     target_link_libraries(vdb_index PRIVATE mkl)
 endif()
 vdb_enable_target_avx512(vdb_index)
-
-# =============================================================================
-# VDB CRC Library (ConANN CRC calibration — offline only, depends on GSL)
-# Separated from vdb_index so online query path does not link GSL.
-# =============================================================================
-add_library(vdb_crc STATIC
-    src/index/crc_calibrator.cpp
-)
-target_include_directories(vdb_crc PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-)
-target_link_libraries(vdb_crc PUBLIC vdb_simd vdb_common vdb_rabitq)
-target_link_libraries(vdb_crc PRIVATE GSL::gsl GSL::gslcblas)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(vdb_crc PRIVATE OpenMP::OpenMP_CXX)
-endif()
-vdb_enable_target_avx512(vdb_crc)
 
 # =============================================================================
 # VDB Query Library (Phase 7)
@@ -518,14 +496,6 @@ if(VDB_BUILD_TESTS)
     target_link_libraries(test_conann PRIVATE vdb_index GTest::gtest GTest::gtest_main)
     add_test(NAME test_conann COMMAND test_conann)
 
-    add_executable(test_crc_stopper tests/index/crc_stopper_test.cpp)
-    target_link_libraries(test_crc_stopper PRIVATE vdb_common GTest::gtest GTest::gtest_main)
-    add_test(NAME test_crc_stopper COMMAND test_crc_stopper)
-
-    add_executable(test_crc_calibrator tests/index/crc_calibrator_test.cpp)
-    target_link_libraries(test_crc_calibrator PRIVATE vdb_crc GTest::gtest GTest::gtest_main)
-    add_test(NAME test_crc_calibrator COMMAND test_crc_calibrator)
-
     add_executable(test_rabitq_bench_calibration
         tests/benchmarks/rabitq_bench_calibration_test.cpp
         benchmarks/rabitq_bench_calibration.cpp)
@@ -578,10 +548,6 @@ if(VDB_BUILD_TESTS)
     add_executable(test_overlap_scheduler tests/query/overlap_scheduler_test.cpp)
     target_link_libraries(test_overlap_scheduler PRIVATE vdb_query GTest::gtest GTest::gtest_main)
     add_test(NAME test_overlap_scheduler COMMAND test_overlap_scheduler)
-
-    add_executable(test_early_stop tests/query/early_stop_test.cpp)
-    target_link_libraries(test_early_stop PRIVATE vdb_query GTest::gtest GTest::gtest_main)
-    add_test(NAME test_early_stop COMMAND test_early_stop)
 
     # -------------------------------------------------------------------------
     # IO tests (Phase 8)

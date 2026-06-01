@@ -95,7 +95,7 @@ struct ProbeStats {
 /// Usage:
 ///   float margin_factor = 2.0f * pq.norm_qc * conann.epsilon();
 ///   float safeout_frontier_upper =
-///       est_heap_full ? max(entry.distance + entry.error_bound in est_heap)
+///       safeout_heap_full ? kth_smallest(entry.distance + entry.error_bound)
 ///                     : infinity;
 ///   prober.Probe(pc, pq, safeout_frontier_upper, sink, stats);
 class ClusterProber {
@@ -116,8 +116,8 @@ class ClusterProber {
     /// @param pc             Parsed cluster (Region 1 + Region 2)
     /// @param view           Lightweight prepared query view for this cluster
     /// @param safeout_frontier_upper  Conservative top-k upper frontier:
-    ///                         (est_heap.size() >= top_k)
-    ///                           ? max(entry.distance + entry.error_bound in est_heap)
+    ///                         (safeout_frontier_heap.size() >= top_k)
+    ///                           ? kth_smallest(d_hat + e)
     ///                           : +infinity
     /// @param sink           Receives non-SafeOut candidates
     /// @param stats          Accumulated classification statistics

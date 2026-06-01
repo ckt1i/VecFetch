@@ -155,10 +155,6 @@ int main(int argc, char* argv[]) {
         CopyIfExists(fs::path(src_dir) / "data.dat", fs::path(dst_dir) / "data.dat");
         CopyIfExists(fs::path(src_dir) / "build_metadata.json",
                      fs::path(dst_dir) / "build_metadata.json");
-        CopyIfExists(fs::path(src_dir) / "crc_scores.bin",
-                     fs::path(dst_dir) / "crc_scores.bin");
-        CopyIfExists(fs::path(src_dir) / "crc_calibration_params.bin",
-                     fs::path(dst_dir) / "crc_calibration_params.bin");
     } catch (const std::exception& e) {
         std::cerr << "copy sidecar files failed: " << e.what() << "\n";
         return 13;

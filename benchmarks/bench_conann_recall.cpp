@@ -202,13 +202,12 @@ int main(int argc, char* argv[]) {
     Log("  d_k = %.4f\n\n", d_k);
 
     // ================================================================
-    // Phase 5: Per-query search with exact distances + early stop
+    // Phase 5: Per-query search with exact distances and fixed nprobe
     // ================================================================
-    Log("[Phase 5] Searching (nprobe=%u, early_stop with d_k)...\n", nprobe);
+    Log("[Phase 5] Searching (nprobe=%u, fixed probe)...\n", nprobe);
 
     struct QueryResult {
         uint32_t clusters_probed;
-        bool early_stopped;
         std::vector<uint32_t> result_ids;  // top-K indices
     };
 
@@ -243,7 +242,6 @@ int main(int argc, char* argv[]) {
         };
 
         uint32_t probed = 0;
-        bool early_stopped = false;
 
         for (uint32_t p = 0; p < nprobe; ++p) {
             uint32_t cluster_id = centroid_dists[p].second;
@@ -258,18 +256,11 @@ int main(int argc, char* argv[]) {
             }
 
             probed++;
-
-            // Early stop: top-K full AND worst distance < d_k
-            if (topk_heap.size() >= top_k && topk_heap.front().first < d_k) {
-                early_stopped = true;
-                break;
-            }
         }
 
         // Extract sorted results
         std::sort_heap(topk_heap.begin(), topk_heap.end());
         results[qi].clusters_probed = probed;
-        results[qi].early_stopped = early_stopped;
         results[qi].result_ids.reserve(topk_heap.size());
         for (auto& [dist, idx] : topk_heap) {
             results[qi].result_ids.push_back(idx);
@@ -285,14 +276,12 @@ int main(int argc, char* argv[]) {
 
     double sum_r1 = 0, sum_r5 = 0, sum_r10 = 0;
     double sum_probes = 0;
-    uint32_t early_count = 0;
 
     for (uint32_t qi = 0; qi < Q; ++qi) {
         sum_r1  += ComputeRecallAtK(results[qi].result_ids, gt_topk[qi], 1);
         sum_r5  += ComputeRecallAtK(results[qi].result_ids, gt_topk[qi], 5);
         sum_r10 += ComputeRecallAtK(results[qi].result_ids, gt_topk[qi], top_k);
         sum_probes += results[qi].clusters_probed;
-        if (results[qi].early_stopped) early_count++;
     }
 
     Log("╔══════════════════════════════════════════════════╗\n");
@@ -306,25 +295,22 @@ int main(int argc, char* argv[]) {
     Log("║  recall@10 = %.4f                              ║\n", sum_r10 / Q);
     Log("╠══════════════════════════════════════════════════╣\n");
     Log("║  avg probes     = %.2f / %u                    ║\n", sum_probes / Q, nprobe);
-    Log("║  early stop     = %.1f%%                        ║\n",
-        100.0 * early_count / Q);
     Log("╚══════════════════════════════════════════════════╝\n");
 
     // Per-query sample (every 20th)
     Log("\n--- Per-Query Sample (every 20th) ---\n");
-    Log("%-6s  %-8s  %-8s  %-8s  %-7s  %-12s\n",
-        "Query", "R@1", "R@5", "R@10", "Probes", "EarlyStop");
-    Log("------  --------  --------  --------  -------  ------------\n");
+    Log("%-6s  %-8s  %-8s  %-8s  %-7s\n",
+        "Query", "R@1", "R@5", "R@10", "Probes");
+    Log("------  --------  --------  --------  -------\n");
 
     uint32_t stride = std::max(Q / 50, 1u);
     for (uint32_t qi = 0; qi < Q; qi += stride) {
         double r1  = ComputeRecallAtK(results[qi].result_ids, gt_topk[qi], 1);
         double r5  = ComputeRecallAtK(results[qi].result_ids, gt_topk[qi], 5);
         double r10 = ComputeRecallAtK(results[qi].result_ids, gt_topk[qi], top_k);
-        Log("%-6u  %-8.4f  %-8.4f  %-8.4f  %-7u  %-12s\n",
+        Log("%-6u  %-8.4f  %-8.4f  %-8.4f  %-7u\n",
             qi, r1, r5, r10,
-            results[qi].clusters_probed,
-            results[qi].early_stopped ? "yes" : "no");
+            results[qi].clusters_probed);
     }
 
     return 0;

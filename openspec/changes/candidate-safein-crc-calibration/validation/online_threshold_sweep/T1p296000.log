@@ -1,0 +1,315 @@
+=== Vector Search Benchmark (bits=4) ===
+Base:   /home/zcq/VDB/data/coco_100k/image_embeddings.fvecs
+Query:  /home/zcq/VDB/data/coco_100k/query_embeddings.fvecs
+GT:     (brute-force)
+nlist=2048  nprobe=64  top_k=10  bits=4  metric=cosine  coarse_builder=auto  crc=1  early_stop=1
+
+[Phase A] Loading data...
+  N=100000, Q=1000, dim=512
+  Loaded image ids: 100000
+  No GT file — computing brute-force L2...
+  Brute-force GT computed (k=100).
+
+[Phase B] Skipped (using pre-built index: /home/zcq/VDB/test/data/COCO100k/index_fkmeans_2048_bits4_eps0.90)
+
+[Phase C] Opening index...
+  eps_ip=0.063236  d_k=1.255089  nlist=2048  used_hadamard=1
+  loaded candidate SafeIn CRC threshold=1.296000 beta=0.000000 from openspec/changes/candidate-safein-crc-calibration/validation/online_threshold_sweep/artifacts/T1p296000.json
+  override safein_threshold=1.296000 source=candidate_crc safein_eps=0.063236 safeout_eps=0.063236
+  active SafeIn threshold source=candidate_crc threshold=1.296000
+
+[Phase C.5] CRC calibration...
+  Loaded 2000 query scores (nlist=2048, top_k=10)
+  lamhat=0.696762  kreg=1  reg_lambda=0.000000
+  fnr=0.1056  avg_probed=1766.3  test_size=800
+
+[Phase D] Querying 1000 vectors...
+  Progress: 4/1000
+  Progress: 8/1000
+  Progress: 12/1000
+  Progress: 16/1000
+  Progress: 20/1000
+  Progress: 24/1000
+  Progress: 28/1000
+  Progress: 32/1000
+  Progress: 36/1000
+  Progress: 40/1000
+  Progress: 44/1000
+  Progress: 48/1000
+  Progress: 52/1000
+  Progress: 56/1000
+  Progress: 60/1000
+  Progress: 64/1000
+  Progress: 68/1000
+  Progress: 72/1000
+  Progress: 76/1000
+  Progress: 80/1000
+  Progress: 84/1000
+  Progress: 88/1000
+  Progress: 92/1000
+  Progress: 96/1000
+  Progress: 100/1000
+  Progress: 104/1000
+  Progress: 108/1000
+  Progress: 112/1000
+  Progress: 116/1000
+  Progress: 120/1000
+  Progress: 124/1000
+  Progress: 128/1000
+  Progress: 132/1000
+  Progress: 136/1000
+  Progress: 140/1000
+  Progress: 144/1000
+  Progress: 148/1000
+  Progress: 152/1000
+  Progress: 156/1000
+  Progress: 160/1000
+  Progress: 164/1000
+  Progress: 168/1000
+  Progress: 172/1000
+  Progress: 176/1000
+  Progress: 180/1000
+  Progress: 184/1000
+  Progress: 188/1000
+  Progress: 192/1000
+  Progress: 196/1000
+  Progress: 200/1000
+  Progress: 204/1000
+  Progress: 208/1000
+  Progress: 212/1000
+  Progress: 216/1000
+  Progress: 220/1000
+  Progress: 224/1000
+  Progress: 228/1000
+  Progress: 232/1000
+  Progress: 236/1000
+  Progress: 240/1000
+  Progress: 244/1000
+  Progress: 248/1000
+  Progress: 252/1000
+  Progress: 256/1000
+  Progress: 260/1000
+  Progress: 264/1000
+  Progress: 268/1000
+  Progress: 272/1000
+  Progress: 276/1000
+  Progress: 280/1000
+  Progress: 284/1000
+  Progress: 288/1000
+  Progress: 292/1000
+  Progress: 296/1000
+  Progress: 300/1000
+  Progress: 304/1000
+  Progress: 308/1000
+  Progress: 312/1000
+  Progress: 316/1000
+  Progress: 320/1000
+  Progress: 324/1000
+  Progress: 328/1000
+  Progress: 332/1000
+  Progress: 336/1000
+  Progress: 340/1000
+  Progress: 344/1000
+  Progress: 348/1000
+  Progress: 352/1000
+  Progress: 356/1000
+  Progress: 360/1000
+  Progress: 364/1000
+  Progress: 368/1000
+  Progress: 372/1000
+  Progress: 376/1000
+  Progress: 380/1000
+  Progress: 384/1000
+  Progress: 388/1000
+  Progress: 392/1000
+  Progress: 396/1000
+  Progress: 400/1000
+  Progress: 404/1000
+  Progress: 408/1000
+  Progress: 412/1000
+  Progress: 416/1000
+  Progress: 420/1000
+  Progress: 424/1000
+  Progress: 428/1000
+  Progress: 432/1000
+  Progress: 436/1000
+  Progress: 440/1000
+  Progress: 444/1000
+  Progress: 448/1000
+  Progress: 452/1000
+  Progress: 456/1000
+  Progress: 460/1000
+  Progress: 464/1000
+  Progress: 468/1000
+  Progress: 472/1000
+  Progress: 476/1000
+  Progress: 480/1000
+  Progress: 484/1000
+  Progress: 488/1000
+  Progress: 492/1000
+  Progress: 496/1000
+  Progress: 500/1000
+  Progress: 504/1000
+  Progress: 508/1000
+  Progress: 512/1000
+  Progress: 516/1000
+  Progress: 520/1000
+  Progress: 524/1000
+  Progress: 528/1000
+  Progress: 532/1000
+  Progress: 536/1000
+  Progress: 540/1000
+  Progress: 544/1000
+  Progress: 548/1000
+  Progress: 552/1000
+  Progress: 556/1000
+  Progress: 560/1000
+  Progress: 564/1000
+  Progress: 568/1000
+  Progress: 572/1000
+  Progress: 576/1000
+  Progress: 580/1000
+  Progress: 584/1000
+  Progress: 588/1000
+  Progress: 592/1000
+  Progress: 596/1000
+  Progress: 600/1000
+  Progress: 604/1000
+  Progress: 608/1000
+  Progress: 612/1000
+  Progress: 616/1000
+  Progress: 620/1000
+  Progress: 624/1000
+  Progress: 628/1000
+  Progress: 632/1000
+  Progress: 636/1000
+  Progress: 640/1000
+  Progress: 644/1000
+  Progress: 648/1000
+  Progress: 652/1000
+  Progress: 656/1000
+  Progress: 660/1000
+  Progress: 664/1000
+  Progress: 668/1000
+  Progress: 672/1000
+  Progress: 676/1000
+  Progress: 680/1000
+  Progress: 684/1000
+  Progress: 688/1000
+  Progress: 692/1000
+  Progress: 696/1000
+  Progress: 700/1000
+  Progress: 704/1000
+  Progress: 708/1000
+  Progress: 712/1000
+  Progress: 716/1000
+  Progress: 720/1000
+  Progress: 724/1000
+  Progress: 728/1000
+  Progress: 732/1000
+  Progress: 736/1000
+  Progress: 740/1000
+  Progress: 744/1000
+  Progress: 748/1000
+  Progress: 752/1000
+  Progress: 756/1000
+  Progress: 760/1000
+  Progress: 764/1000
+  Progress: 768/1000
+  Progress: 772/1000
+  Progress: 776/1000
+  Progress: 780/1000
+  Progress: 784/1000
+  Progress: 788/1000
+  Progress: 792/1000
+  Progress: 796/1000
+  Progress: 800/1000
+  Progress: 804/1000
+  Progress: 808/1000
+  Progress: 812/1000
+  Progress: 816/1000
+  Progress: 820/1000
+  Progress: 824/1000
+  Progress: 828/1000
+  Progress: 832/1000
+  Progress: 836/1000
+  Progress: 840/1000
+  Progress: 844/1000
+  Progress: 848/1000
+  Progress: 852/1000
+  Progress: 856/1000
+  Progress: 860/1000
+  Progress: 864/1000
+  Progress: 868/1000
+  Progress: 872/1000
+  Progress: 876/1000
+  Progress: 880/1000
+  Progress: 884/1000
+  Progress: 888/1000
+  Progress: 892/1000
+  Progress: 896/1000
+  Progress: 900/1000
+  Progress: 904/1000
+  Progress: 908/1000
+  Progress: 912/1000
+  Progress: 916/1000
+  Progress: 920/1000
+  Progress: 924/1000
+  Progress: 928/1000
+  Progress: 932/1000
+  Progress: 936/1000
+  Progress: 940/1000
+  Progress: 944/1000
+  Progress: 948/1000
+  Progress: 952/1000
+  Progress: 956/1000
+  Progress: 960/1000
+  Progress: 964/1000
+  Progress: 968/1000
+  Progress: 972/1000
+  Progress: 976/1000
+  Progress: 980/1000
+  Progress: 984/1000
+  Progress: 988/1000
+  Progress: 992/1000
+  Progress: 996/1000
+  Progress: 1000/1000
+
+========================================
+RESULTS (bits=4)
+========================================
+  recall@1  = 0.9340
+  recall@5  = 0.9134
+  recall@10 = 0.9108
+
+  latency avg = 1.830 ms
+  latency p50 = 1.865 ms
+  latency p95 = 2.976 ms
+  latency p99 = 3.395 ms
+
+  build_time      = 0.0 ms
+  avg_probed      = 56.70 / 64 clusters
+  early_stop_rate = 0.1240
+
+  --- Stage 1 (FastScan) ---
+    SafeIn    = 54 (0.00%)
+    SafeOut   = 2339669 (85.50%)
+    Uncertain = 396815 (14.50%)
+    False SafeIn  = 22 (40.7407% of S1 SafeIn)
+    False SafeOut = 49 (0.0021% of S1 SafeOut)
+
+  --- Stage 2 (4-bit ExRaBitQ) ---
+    SafeIn    = 722 (0.18%)
+    SafeOut   = 300043 (75.61%)
+    Uncertain = 96050 (24.21%)
+    False SafeIn  = 132 (18.2825% of S2 SafeIn)
+    False SafeOut = 0 (0.0000% of S2 SafeOut)
+    Final Uncertain = 96050
+
+  CRC stats:
+    lamhat     = 0.696762
+========================================
+
+JSON results written to: openspec/changes/candidate-safein-crc-calibration/validation/online_threshold_sweep/T1p296000/results.json
+
+Done.

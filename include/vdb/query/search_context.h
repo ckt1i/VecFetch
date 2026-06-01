@@ -5,7 +5,6 @@
 #include <vector>
 
 #include "vdb/common/types.h"
-#include "vdb/index/crc_stopper.h"
 #include "vdb/query/result_collector.h"
 #include "vdb/rabitq/rabitq_estimator.h"
 
@@ -34,12 +33,8 @@ struct SearchConfig {
     bool use_sqpoll = false;
     SubmissionMode submission_mode = SubmissionMode::Shared;
 
-    // Early stop: skip remaining clusters when TopK quality exceeds d_k
-    bool early_stop = true;
-
     // Phase 8: Async cluster prefetch
     uint32_t prefetch_depth = 16;      // Initial cluster block prefetch count
-    uint32_t initial_prefetch = 4;     // CRC mode: initial cluster prefetch count
     uint32_t refill_threshold = 2;     // Refill when inflight_clusters drops below
     uint32_t refill_count = 2;         // Number of clusters to refill per check
     CluReadMode clu_read_mode = CluReadMode::Window;
@@ -47,9 +42,9 @@ struct SearchConfig {
     bool enable_fine_grained_timing = true;
     bool enable_hotpath_detailed_timing = false;
 
-    // CRC early stop parameters (nullptr = use legacy d_k early stop)
-    const index::CalibrationResults* crc_params = nullptr;
-    bool crc_no_break = false;  // experiment mode: evaluate CRC but never break
+    // When enabled, Dynamic SafeOut maintains a kth upper-bound frontier for
+    // estimate-driven SafeOut pruning.
+    bool enable_dynamic_safeout = true;
 
     // Submit batching: submit when pending vec requests reach N.
     // `0` preserves the legacy "submit on pressure/final drain" behavior.
@@ -101,7 +96,6 @@ struct SearchStats {
     uint32_t total_submit_calls = 0;
     uint32_t total_submit_window_flushes = 0;
     uint32_t total_submit_window_tail_flushes = 0;
-    uint32_t total_submit_stop_flushes = 0;
     uint32_t total_submit_window_requests = 0;
     uint32_t vec_only_read_requests = 0;
     uint32_t all_read_requests = 0;
@@ -109,9 +103,9 @@ struct SearchStats {
     uint32_t fixed_vec_buffer_hits = 0;
     uint32_t fixed_vec_buffer_misses = 0;
     uint32_t total_candidate_batches = 0;
-    uint32_t total_crc_estimates_buffered = 0;
-    uint32_t total_crc_estimates_merged = 0;
-    uint32_t total_crc_would_stop = 0;
+    uint32_t total_safeout_frontier_estimates_buffered = 0;
+    uint32_t total_safeout_frontier_estimates_merged = 0;
+    uint32_t total_safeout_frontier_updates = 0;
     uint32_t total_stage2_block_lookups = 0;
     uint32_t total_stage2_block_reuses = 0;
     uint32_t duplicate_candidates = 0;
@@ -119,9 +113,6 @@ struct SearchStats {
     uint32_t unique_fetch_candidates = 0;
     uint32_t buffered_candidates = 0;
     uint32_t reranked_candidates = 0;
-    bool early_stopped = false;
-    uint32_t clusters_skipped = 0;
-    uint32_t crc_clusters_probed = 0;
     double coarse_select_ms = 0;
     double coarse_score_ms = 0;
     double coarse_topn_ms = 0;
@@ -202,9 +193,8 @@ struct SearchStats {
     double rerank_vec_alloc_ms = 0;         // Vector slab growth / allocation
     double rerank_vec_copy_ms = 0;          // Copy vector bytes into rerank storage
     double remaining_payload_fetch_ms = 0;  // Final missing payload fetch
-    double crc_decision_ms = 0;             // Time spent inside CrcStopper::ShouldStop
-    double crc_buffer_ms = 0;               // Time spent buffering CRC estimates
-    double crc_merge_ms = 0;                // Time spent merging CRC estimates into est_heap
+    double safeout_frontier_buffer_ms = 0;  // Time spent buffering dynamic SafeOut estimates
+    double safeout_frontier_merge_ms = 0;   // Time spent updating kth upper-bound frontier
 };
 
 class SearchContext {

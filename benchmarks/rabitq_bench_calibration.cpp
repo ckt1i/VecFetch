@@ -2,9 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <numeric>
 #include <random>
-#include <unordered_set>
 
 #include "vdb/io/vecs_reader.h"
 #include "vdb/rabitq/rabitq_estimator.h"
@@ -188,6 +188,41 @@ void EncodeAllCodes(const std::vector<float>& base_data,
     }
 }
 
+std::vector<float> GenerateExactSafeInDkSamples(
+    const float* queries,
+    uint32_t q,
+    const float* database,
+    uint32_t n,
+    Dim dim,
+    uint32_t top_k,
+    uint32_t sample_queries,
+    uint64_t seed,
+    SafeInDkSamplingMode sampling_mode) {
+    std::vector<float> query_kths;
+    if (queries == nullptr || database == nullptr || q == 0 || n == 0 ||
+        top_k == 0 || sample_queries == 0) {
+        return query_kths;
+    }
+
+    const auto sampled = (sampling_mode == SafeInDkSamplingMode::WithReplacement)
+        ? SampleIndicesWithReplacement(q, sample_queries, seed)
+        : SampleIndices(q, sample_queries, seed);
+    query_kths.reserve(sampled.size());
+
+    std::vector<float> dists(n);
+    for (uint32_t qi : sampled) {
+        const float* query = queries + static_cast<size_t>(qi) * dim;
+        for (uint32_t row = 0; row < n; ++row) {
+            dists[row] = simd::L2Sqr(
+                query, database + static_cast<size_t>(row) * dim, dim);
+        }
+        const uint32_t kth = std::min<uint32_t>(top_k - 1, n - 1);
+        std::nth_element(dists.begin(), dists.begin() + kth, dists.end());
+        query_kths.push_back(dists[kth]);
+    }
+    return query_kths;
+}
+
 std::vector<float> GenerateRabitqSafeInDkSamples(
     const float* queries,
     uint32_t q,
@@ -258,6 +293,22 @@ float SelectSafeInDkFromSamples(const std::vector<float>& samples,
     return ConannPercentile(samples, percentile);
 }
 
+float CalibrateExactSafeInDk(
+    const float* queries,
+    uint32_t q,
+    const float* database,
+    uint32_t n,
+    Dim dim,
+    uint32_t top_k,
+    uint32_t sample_queries,
+    float percentile,
+    uint64_t seed) {
+    auto samples = GenerateExactSafeInDkSamples(
+        queries, q, database, n, dim, top_k, sample_queries, seed,
+        SafeInDkSamplingMode::Unique);
+    return SelectSafeInDkFromSamples(samples, percentile);
+}
+
 float CalibrateRabitqSafeInDk(
     const float* queries,
     uint32_t q,
@@ -279,6 +330,16 @@ float CalibrateRabitqSafeInDk(
         centroids, rotation, bits, seed, SafeInDkSamplingMode::Unique, index,
         search_scope, nprobe);
     return SelectSafeInDkFromSamples(samples, percentile);
+}
+
+const char* SafeInThresholdSourceName(SafeInThresholdSource source) {
+    switch (source) {
+        case SafeInThresholdSource::ExactL2:
+            return "exact_l2";
+        case SafeInThresholdSource::RabitqS2Kth:
+            return "rabitq_s2_kth";
+    }
+    return "unknown";
 }
 
 float CalibrateSplitEpsilon(

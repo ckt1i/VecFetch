@@ -111,8 +111,9 @@ class OverlapScheduler {
     uint32_t PendingDataRequestCount() const;
 
     // AsyncIOSink: ProbeResultSink implementation that submits io_uring reads
-    // and maintains est_heap_. Defined in overlap_scheduler.cpp; declared here
-    // so ProbeCluster can instantiate it without exposing internals.
+    // and maintains query-level estimate frontiers. Defined in
+    // overlap_scheduler.cpp; declared here so ProbeCluster can instantiate it
+    // without exposing internals.
     class AsyncIOSink;
 
     index::IvfIndex& index_;
@@ -201,8 +202,6 @@ class OverlapScheduler {
     uint32_t aligned_vec_bytes_ = 0;
     int data_fd_registered_index_ = -1;
 
-    // CRC early stop state (reset per Search() call)
-    index::CrcStopper crc_stopper_;
     struct EstimateHeapEntry {
         float distance = 0.0f;
         float error_bound = 0.0f;
@@ -212,10 +211,24 @@ class OverlapScheduler {
         }
     };
 
-    std::vector<EstimateHeapEntry> est_heap_;
-    float est_heap_upper_frontier_ = 0.0f;
+    // Dynamic SafeOut state (reset per Search() call). This heap is ordered by
+    // candidate upper bound U = d_hat + e, so its top is kth_smallest(U).
+    struct SafeOutFrontierEntry {
+        float distance = 0.0f;
+        float error_bound = 0.0f;
+        float upper_bound = 0.0f;
+
+        bool operator<(const SafeOutFrontierEntry& other) const {
+            return upper_bound < other.upper_bound;
+        }
+    };
+
+    std::vector<SafeOutFrontierEntry> safeout_frontier_heap_;
     uint32_t est_top_k_ = 0;
-    bool use_crc_ = false;
+    bool use_dynamic_safeout_ = true;
+
+    bool AddSafeOutFrontierEstimate(const EstimateHeapEntry& estimate);
+    float SafeOutFrontierUpper() const;
 
     // Stage 2 ExRaBitQ re-classification
     float margin_s2_divisor_ = 1.0f;  // 2^(bits-1), precomputed

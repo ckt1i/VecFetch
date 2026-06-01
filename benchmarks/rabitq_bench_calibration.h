@@ -31,6 +31,11 @@ struct EpsilonCalibrationStats {
     uint32_t attempted_pairs = 0;
 };
 
+enum class SafeInThresholdSource {
+    ExactL2,
+    RabitqS2Kth,
+};
+
 StatusOr<std::vector<uint32_t>> LoadAssignments(const std::string& path,
                                                 uint32_t expected_rows);
 
@@ -55,6 +60,17 @@ void EncodeAllCodes(const std::vector<float>& base_data,
                     const std::vector<uint32_t>* cluster_subset,
                     std::vector<std::vector<rabitq::RaBitQCode>>* all_codes);
 
+std::vector<float> GenerateExactSafeInDkSamples(
+    const float* queries,
+    uint32_t q,
+    const float* database,
+    uint32_t n,
+    Dim dim,
+    uint32_t top_k,
+    uint32_t sample_queries,
+    uint64_t seed,
+    SafeInDkSamplingMode sampling_mode);
+
 std::vector<float> GenerateRabitqSafeInDkSamples(
     const float* queries,
     uint32_t q,
@@ -75,6 +91,17 @@ std::vector<float> GenerateRabitqSafeInDkSamples(
 
 float SelectSafeInDkFromSamples(const std::vector<float>& samples,
                                 float percentile);
+
+float CalibrateExactSafeInDk(
+    const float* queries,
+    uint32_t q,
+    const float* database,
+    uint32_t n,
+    Dim dim,
+    uint32_t top_k,
+    uint32_t sample_queries,
+    float percentile,
+    uint64_t seed);
 
 float CalibrateRabitqSafeInDk(
     const float* queries,
@@ -112,6 +139,8 @@ float CalibrateSplitEpsilon(
     EpsilonCalibrationStats* stats = nullptr);
 
 const char* EpsilonSamplingModeName(EpsilonSamplingMode mode);
+
+const char* SafeInThresholdSourceName(SafeInThresholdSource source);
 
 StatusOr<EpsilonSamplingMode> ParseEpsilonSamplingModeArg(
     const std::string& value);

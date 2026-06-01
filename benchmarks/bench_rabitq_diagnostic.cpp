@@ -105,8 +105,12 @@ struct EstimateHeapEntry {
     float error_bound = 0.0f;
     uint32_t row = 0;
 
+    float upper_bound() const {
+        return distance + error_bound;
+    }
+
     bool operator<(const EstimateHeapEntry& other) const {
-        return distance < other.distance;
+        return upper_bound() < other.upper_bound();
     }
 };
 
@@ -424,14 +428,6 @@ static void WriteSummaryJson(const std::string& path,
     f << "\n}\n";
 }
 
-static float RecomputeMaxError(const std::vector<EstimateHeapEntry>& heap) {
-    float max_error = 0.0f;
-    for (const EstimateHeapEntry& entry : heap) {
-        max_error = std::max(max_error, entry.error_bound);
-    }
-    return max_error;
-}
-
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -605,7 +601,7 @@ int main(int argc, char* argv[]) {
         << "margin_s1,margin_s2_current,dynamic_d_k_before_cluster,s1_class,s2_class,final_class,is_true_topk\n";
 
     std::ofstream kth(outdir + "/kth_convergence.csv");
-    kth << "query_id,probed_clusters,est_kth\n";
+    kth << "query_id,probed_clusters,safeout_frontier_upper\n";
 
     SummaryStats stats;
     stats.abs_err_s1.reserve(static_cast<size_t>(Q) * nprobe * 1024u);
@@ -623,9 +619,8 @@ int main(int argc, char* argv[]) {
         if (qi % 10 == 0) Log("query %u/%u\n", qi, Q);
         const float* q_vec = qry.data.data() + static_cast<size_t>(qi) * dim;
         const std::vector<ClusterID> probed = index.FindNearestClusters(q_vec, nprobe);
-        std::vector<EstimateHeapEntry> est_heap;
-        est_heap.reserve(top_k + 1);
-        float max_error_in_est_heap = 0.0f;
+        std::vector<EstimateHeapEntry> safeout_frontier_heap;
+        safeout_frontier_heap.reserve(top_k + 1);
 
         for (uint32_t rank = 0; rank < probed.size(); ++rank) {
             const uint32_t cid = probed[rank];
@@ -635,8 +630,8 @@ int main(int argc, char* argv[]) {
             const auto& members = cluster_members[cid];
             const float margin_factor = 2.0f * pq.norm_qc * eps_ip;
             const float safeout_frontier_upper =
-                (est_heap.size() >= top_k)
-                    ? est_heap.front().distance + max_error_in_est_heap
+                (safeout_frontier_heap.size() >= top_k)
+                    ? safeout_frontier_heap.front().upper_bound()
                     : std::numeric_limits<float>::infinity();
 
             for (size_t local_idx = 0; local_idx < members.size(); ++local_idx) {
@@ -721,26 +716,33 @@ int main(int argc, char* argv[]) {
                                << (m.is_true_topk ? 1 : 0) << '\n';
 
                 if (m.final_class != ResultClass::SafeOut) {
+                    const float frontier_dist =
+                        m.stage2_evaluated ? m.est_dist_s2 : m.est_dist_s1;
+                    const float frontier_error =
+                        m.stage2_evaluated ? m.margin_s2 : m.margin_s1;
                     const EstimateHeapEntry estimate{
-                        m.est_dist_s1, m.margin_s1, row};
-                    if (est_heap.size() < top_k) {
-                        est_heap.push_back(estimate);
-                        std::push_heap(est_heap.begin(), est_heap.end());
-                        max_error_in_est_heap =
-                            std::max(max_error_in_est_heap, estimate.error_bound);
-                    } else if (estimate.distance < est_heap.front().distance) {
-                        std::pop_heap(est_heap.begin(), est_heap.end());
-                        est_heap.back() = estimate;
-                        std::push_heap(est_heap.begin(), est_heap.end());
-                        max_error_in_est_heap = RecomputeMaxError(est_heap);
+                        frontier_dist, frontier_error, row};
+                    if (safeout_frontier_heap.size() < top_k) {
+                        safeout_frontier_heap.push_back(estimate);
+                        std::push_heap(safeout_frontier_heap.begin(),
+                                       safeout_frontier_heap.end());
+                    } else if (estimate.upper_bound() <
+                               safeout_frontier_heap.front().upper_bound()) {
+                        std::pop_heap(safeout_frontier_heap.begin(),
+                                      safeout_frontier_heap.end());
+                        safeout_frontier_heap.back() = estimate;
+                        std::push_heap(safeout_frontier_heap.begin(),
+                                       safeout_frontier_heap.end());
                     }
                 }
             }
 
-            const float est_kth = est_heap.size() >= top_k
-                ? est_heap.front().distance
+            const float safeout_frontier_after_cluster =
+                safeout_frontier_heap.size() >= top_k
+                ? safeout_frontier_heap.front().upper_bound()
                 : std::numeric_limits<float>::infinity();
-            kth << qi << ',' << (rank + 1) << ',' << est_kth << '\n';
+            kth << qi << ',' << (rank + 1) << ','
+                << safeout_frontier_after_cluster << '\n';
         }
     }
 

@@ -1,0 +1,139 @@
+{
+  "safein_threshold_source": "candidate_crc",
+  "selected_beta": 0.0500000007,
+  "selected_threshold": 1.23257244,
+  "calibration_queries": 500,
+  "validation_queries": 500,
+  "sampled_queries": 1000,
+  "candidate_domain": "nprobe",
+  "nprobe": 64,
+  "top_k": 10,
+  "bits": 4,
+  "epsilon": 0.0632361621,
+  "seed": 42,
+  "results": [
+    {
+      "beta": 0.0500000007,
+      "threshold": 1.23257244,
+      "found_nonempty_threshold": true,
+      "calibration_stage1": {
+        "total": 1546057,
+        "safein": 4,
+        "false_safein": 1,
+        "uncertain": 1546053,
+        "false_safein_rate": 0.25,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 1
+      },
+      "calibration_final": {
+        "total": 1546057,
+        "safein": 40,
+        "false_safein": 2,
+        "uncertain": 1546017,
+        "false_safein_rate": 0.05,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 0.109090909
+      },
+      "validation_stage1": {
+        "total": 1552855,
+        "safein": 0,
+        "false_safein": 0,
+        "uncertain": 1552855,
+        "false_safein_rate": 0,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 0
+      },
+      "validation_final": {
+        "total": 1552855,
+        "safein": 12,
+        "false_safein": 0,
+        "uncertain": 1552843,
+        "false_safein_rate": 0,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 0
+      }
+    },
+    {
+      "beta": 0.100000001,
+      "threshold": 1.23628426,
+      "found_nonempty_threshold": true,
+      "calibration_stage1": {
+        "total": 1546057,
+        "safein": 4,
+        "false_safein": 1,
+        "uncertain": 1546053,
+        "false_safein_rate": 0.25,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 1
+      },
+      "calibration_final": {
+        "total": 1546057,
+        "safein": 44,
+        "false_safein": 4,
+        "uncertain": 1546013,
+        "false_safein_rate": 0.0909090909,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 0.157894737
+      },
+      "validation_stage1": {
+        "total": 1552855,
+        "safein": 0,
+        "false_safein": 0,
+        "uncertain": 1552855,
+        "false_safein_rate": 0,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 0
+      },
+      "validation_final": {
+        "total": 1552855,
+        "safein": 19,
+        "false_safein": 0,
+        "uncertain": 1552836,
+        "false_safein_rate": 0,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 0
+      }
+    },
+    {
+      "beta": 0.200000003,
+      "threshold": 1.24107027,
+      "found_nonempty_threshold": true,
+      "calibration_stage1": {
+        "total": 1546057,
+        "safein": 4,
+        "false_safein": 1,
+        "uncertain": 1546053,
+        "false_safein_rate": 0.25,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 1
+      },
+      "calibration_final": {
+        "total": 1546057,
+        "safein": 62,
+        "false_safein": 12,
+        "uncertain": 1545995,
+        "false_safein_rate": 0.193548387,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 0.294117647
+      },
+      "validation_stage1": {
+        "total": 1552855,
+        "safein": 0,
+        "false_safein": 0,
+        "uncertain": 1552855,
+        "false_safein_rate": 0,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 0
+      },
+      "validation_final": {
+        "total": 1552855,
+        "safein": 22,
+        "false_safein": 0,
+        "uncertain": 1552833,
+        "false_safein_rate": 0,
+        "false_safein_rate_ci_low": 0,
+        "false_safein_rate_ci_high": 0
+      }
+    }
+  ]
+}

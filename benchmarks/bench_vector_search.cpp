@@ -9,11 +9,13 @@
 /// Usage:
 ///   bench_vector_search --base /path/to/base.fvecs --query /path/to/query.fvecs
 ///       [--gt /path/to/gt.ivecs] [--nlist 256] [--nprobe 32] [--topk 10]
-///       [--bits 4] [--metric l2|cosine|ip] [--crc 1] [--early-stop 1]
+///       [--bits 4] [--metric l2|cosine|ip] [--dynamic-safeout 1]
 ///       [--outdir ./results]
 ///       [--centroids /path/to/centroids.fvecs] [--assignments /path/to/assign.ivecs]
 ///       [--epsilon-sampling-mode legacy_per_cluster|global_pair]
 ///       [--safein-dk-samples-input /path/to/samples.npy]
+///       [--safein-dk-samples-output /path/to/samples.npy]
+///       [--safein-dk-space exact_l2|rabitq_s2]
 ///       [--pad-to-pow2 1] [--index-dir /path/to/existing/index]
 ///       [--tmp-dir /tmp/bench_vs] [--keep-index]
 
@@ -25,16 +27,15 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <limits>
 #include <numeric>
 #include <string>
 #include <random>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "vdb/common/types.h"
-#include "vdb/index/crc_calibrator.h"
 #include "vdb/index/ivf_builder.h"
 #include "vdb/index/ivf_index.h"
 #include "vdb/io/npy_reader.h"
@@ -111,6 +112,21 @@ static void Log(const char* fmt, ...) {
     std::vprintf(fmt, ap); va_end(ap);
     std::fflush(stdout);
 }
+static bool ParseSafeInDkSpaceArg(const std::string& value,
+                                  SafeInDkSpace* out) {
+    if (value == "exact_l2") {
+        *out = SafeInDkSpace::ExactL2;
+        return true;
+    }
+    if (value == "rabitq_s2") {
+        *out = SafeInDkSpace::RabitqS2;
+        return true;
+    }
+    return false;
+}
+static const char* SafeInDkSpaceName(SafeInDkSpace space) {
+    return space == SafeInDkSpace::RabitqS2 ? "rabitq_s2" : "exact_l2";
+}
 
 // ============================================================================
 // Main
@@ -124,11 +140,7 @@ int main(int argc, char* argv[]) {
     uint32_t nlist   = static_cast<uint32_t>(GetIntArg(argc, argv, "--nlist", 256));
     uint32_t nprobe  = static_cast<uint32_t>(GetIntArg(argc, argv, "--nprobe", 32));
     uint32_t top_k   = static_cast<uint32_t>(GetIntArg(argc, argv, "--topk", 10));
-    bool use_crc     = GetIntArg(argc, argv, "--crc", 1) != 0;
-    float crc_alpha  = GetFloatArg(argc, argv, "--crc-alpha", 0.1f);
-    float crc_calib  = GetFloatArg(argc, argv, "--crc-calib", 0.5f);
-    float crc_tune   = GetFloatArg(argc, argv, "--crc-tune", 0.1f);
-    bool early_stop  = GetIntArg(argc, argv, "--early-stop", 1) != 0;
+    bool dynamic_safeout = GetIntArg(argc, argv, "--dynamic-safeout", 1) != 0;
     uint64_t seed    = static_cast<uint64_t>(GetIntArg(argc, argv, "--seed", 42));
     std::string outdir = GetArg(argc, argv, "--outdir", "");
     int q_limit      = GetIntArg(argc, argv, "--queries", 0);
@@ -152,6 +164,18 @@ int main(int argc, char* argv[]) {
         static_cast<uint32_t>(GetIntArg(argc, argv, "--safein-dk-samples", 0));
     std::string safein_dk_samples_input =
         GetArg(argc, argv, "--safein-dk-samples-input", "");
+    std::string safein_dk_samples_output =
+        GetArg(argc, argv, "--safein-dk-samples-output", "");
+    SafeInDkSpace requested_safein_dk_space = SafeInDkSpace::ExactL2;
+    const std::string safein_dk_space_arg =
+        GetArg(argc, argv, "--safein-dk-space", "exact_l2");
+    if (!ParseSafeInDkSpaceArg(safein_dk_space_arg,
+                               &requested_safein_dk_space)) {
+        std::fprintf(stderr,
+                     "Invalid --safein-dk-space: %s (expected exact_l2 or rabitq_s2)\n",
+                     safein_dk_space_arg.c_str());
+        return 1;
+    }
     bool enable_stage1_safein =
         GetIntArg(argc, argv, "--enable-stage1-safein", 1) != 0;
     std::string centroids_path   = GetArg(argc, argv, "--centroids", "");
@@ -166,11 +190,15 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
             "Usage: bench_vector_search --base <path> --query <path> "
             "[--gt <path>] [--nlist N] [--nprobe N] [--topk K] "
-            "[--crc 0|1] [--early-stop 0|1] [--bits N] [--metric l2|cosine|ip] "
+            "[--dynamic-safeout 0|1] "
+            "[--bits N] [--metric l2|cosine|ip] "
             "[--coarse-builder auto|superkmeans|hierarchical_superkmeans|faiss_kmeans] "
             "[--outdir dir] "
             "[--centroids <path>] [--assignments <path>] [--image-ids <path>] "
             "[--epsilon-sampling-mode legacy_per_cluster|global_pair] "
+            "[--safein-dk-space exact_l2|rabitq_s2] "
+            "[--safein-dk-samples-input path] "
+            "[--safein-dk-samples-output path] "
             "[--pad-to-pow2 1] "
             "[--enable-stage1-safein 0|1] "
             "[--index-dir <path>] [--tmp-dir <path>] [--keep-index]\n");
@@ -181,8 +209,9 @@ int main(int argc, char* argv[]) {
     Log("Base:   %s\n", base_path.c_str());
     Log("Query:  %s\n", query_path.c_str());
     Log("GT:     %s\n", gt_path.empty() ? "(brute-force)" : gt_path.c_str());
-    Log("nlist=%u  nprobe=%u  top_k=%u  bits=%u  metric=%s  coarse_builder=%s  crc=%d  early_stop=%d\n",
-        nlist, nprobe, top_k, bits, metric.c_str(), coarse_builder.c_str(), use_crc, early_stop);
+    Log("nlist=%u  nprobe=%u  top_k=%u  bits=%u  metric=%s  coarse_builder=%s  dynamic_safeout=%d\n",
+        nlist, nprobe, top_k, bits, metric.c_str(), coarse_builder.c_str(),
+        dynamic_safeout);
     const bool split_safein_safeout_eps =
         safein_epsilon_percentile >= 0.0f || safeout_epsilon_percentile >= 0.0f;
 
@@ -454,7 +483,7 @@ int main(int argc, char* argv[]) {
         cfg.calibration_topk = top_k;
         cfg.calibration_percentile = 0.99f;
         if (safein_dk_percentile >= 0.0f) {
-            cfg.safein_dk_space = SafeInDkSpace::RabitqS2;
+            cfg.safein_dk_space = requested_safein_dk_space;
             cfg.safein_dk_percentile = safein_dk_percentile;
             cfg.safein_dk_calibration_samples =
                 (safein_dk_samples > 0) ? safein_dk_samples : Q;
@@ -465,7 +494,6 @@ int main(int argc, char* argv[]) {
         if (assignments_path.empty()) {
             cfg.save_assignments_path = index_dir + "/assignments.ivecs";
         }
-        cfg.crc_top_k = top_k;
         cfg.calibration_queries = qry.data.data();
         cfg.num_calibration_queries = Q;
         // Store vector index as INT64 payload for recall computation
@@ -502,7 +530,7 @@ int main(int argc, char* argv[]) {
     }
 
     // ================================================================
-    // Phase C: Open Index + CRC Calibration
+    // Phase C: Open Index + SafeIn Threshold Calibration
     // ================================================================
     Log("\n[Phase C] Opening index...\n");
     IvfIndex index;
@@ -520,6 +548,13 @@ int main(int argc, char* argv[]) {
     float runtime_safein_dk = index.conann().safein_d_k();
     float runtime_safein_eps = index.conann().epsilon();
     float runtime_safeout_eps = index.conann().epsilon();
+    SafeInThresholdSource safein_threshold_source =
+        (index.safein_dk_space() == SafeInDkSpace::RabitqS2)
+            ? SafeInThresholdSource::RabitqS2Kth
+            : SafeInThresholdSource::ExactL2;
+    uint32_t safein_dk_samples_count = 0;
+    std::string safein_dk_samples_written;
+    bool override_conann = false;
     EpsilonCalibrationStats safein_epsilon_stats;
     EpsilonCalibrationStats safeout_epsilon_stats;
     std::vector<std::vector<uint32_t>> cluster_members_for_stats;
@@ -551,16 +586,29 @@ int main(int argc, char* argv[]) {
     if (safein_dk_percentile >= 0.0f ||
         safein_epsilon_percentile >= 0.0f ||
         safeout_epsilon_percentile >= 0.0f) {
-        if (!have_cluster_members_for_stats) {
-            std::fprintf(stderr,
-                "Experimental safein/safeout sweep requires --assignments or a freshly built index.\n");
-            return 1;
-        }
+        const bool generating_rabitq_dk =
+            safein_dk_percentile >= 0.0f &&
+            safein_dk_samples_input.empty() &&
+            requested_safein_dk_space == SafeInDkSpace::RabitqS2;
+        const bool needs_rabitq_codes =
+            safein_epsilon_percentile >= 0.0f ||
+            safeout_epsilon_percentile >= 0.0f ||
+            generating_rabitq_dk;
+
         std::vector<std::vector<rabitq::RaBitQCode>> all_codes;
-        EncodeAllCodes(base.data, N, dim, cluster_members_for_stats, index.centroids(),
-                       index.rotation(), bits, nullptr, &all_codes);
+        if (needs_rabitq_codes) {
+            if (!have_cluster_members_for_stats) {
+                std::fprintf(stderr,
+                    "Experimental safein/safeout sweep requires --assignments or a freshly built index.\n");
+                return 1;
+            }
+            EncodeAllCodes(base.data, N, dim, cluster_members_for_stats,
+                           index.centroids(), index.rotation(), bits, nullptr,
+                           &all_codes);
+        }
 
         if (safein_dk_percentile >= 0.0f) {
+            std::vector<float> samples;
             if (!safein_dk_samples_input.empty()) {
                 auto samples_or = io::LoadNpyFloat32(safein_dk_samples_input);
                 if (!samples_or.ok()) {
@@ -570,25 +618,59 @@ int main(int argc, char* argv[]) {
                                  samples_or.status().ToString().c_str());
                     return 1;
                 }
-                const auto& samples = samples_or.value().data;
-                if (samples.empty()) {
-                    std::fprintf(stderr, "safein d_k samples input is empty: %s\n",
-                                 safein_dk_samples_input.c_str());
-                    return 1;
-                }
-                runtime_safein_dk = SelectSafeInDkFromSamples(
-                    samples, safein_dk_percentile);
+                samples = samples_or.value().data;
                 Log("  loaded safein_d_k samples=%zu from %s\n",
                     samples.size(), safein_dk_samples_input.c_str());
             } else {
-                const uint32_t dk_queries = (safein_dk_samples > 0) ? safein_dk_samples : Q;
-                runtime_safein_dk = CalibrateRabitqSafeInDk(
-                    qry.data.data(), Q, dim, top_k, dk_queries,
-                    safein_dk_percentile, cluster_members_for_stats, all_codes,
-                    index.centroids(), index.rotation(), bits, seed);
+                const uint32_t dk_queries =
+                    (safein_dk_samples > 0) ? safein_dk_samples : Q;
+                if (requested_safein_dk_space == SafeInDkSpace::ExactL2) {
+                    samples = GenerateExactSafeInDkSamples(
+                        qry.data.data(), Q, base.data.data(), N, dim, top_k,
+                        dk_queries, seed, SafeInDkSamplingMode::Unique);
+                } else {
+                    samples = GenerateRabitqSafeInDkSamples(
+                        qry.data.data(), Q, dim, top_k, dk_queries,
+                        cluster_members_for_stats, all_codes, index.centroids(),
+                        index.rotation(), bits, seed, SafeInDkSamplingMode::Unique);
+                }
             }
+            if (samples.empty()) {
+                std::fprintf(stderr,
+                             "safein d_k sample generation/input produced no valid samples\n");
+                return 1;
+            }
+            safein_dk_samples_count = static_cast<uint32_t>(samples.size());
+            if (!safein_dk_samples_output.empty()) {
+                auto s = io::SaveNpyFloat32Vector(safein_dk_samples_output, samples);
+                if (!s.ok()) {
+                    std::fprintf(stderr,
+                                 "Failed to write safein d_k samples to %s: %s\n",
+                                 safein_dk_samples_output.c_str(),
+                                 s.ToString().c_str());
+                    return 1;
+                }
+                safein_dk_samples_written = safein_dk_samples_output;
+                Log("  safein_d_k samples written: %s\n",
+                    safein_dk_samples_output.c_str());
+            }
+            runtime_safein_dk = SelectSafeInDkFromSamples(
+                samples, safein_dk_percentile);
+            safein_threshold_source =
+                (requested_safein_dk_space == SafeInDkSpace::RabitqS2)
+                    ? SafeInThresholdSource::RabitqS2Kth
+                    : SafeInThresholdSource::ExactL2;
+            Log("  SafeIn d_k selected: space=%s percentile=%.4f samples=%u value=%.6f\n",
+                SafeInDkSpaceName(requested_safein_dk_space),
+                safein_dk_percentile, safein_dk_samples_count,
+                runtime_safein_dk);
         }
         if (safein_epsilon_percentile >= 0.0f) {
+            if (all_codes.empty()) {
+                std::fprintf(stderr,
+                             "SafeIn epsilon calibration requires encoded RabitQ codes.\n");
+                return 1;
+            }
             runtime_safein_eps = CalibrateSplitEpsilon(
                 all_codes, cluster_members_for_stats, base.data.data(), index.centroids(),
                 index.rotation(), dim, epsilon_samples, safein_epsilon_percentile,
@@ -596,47 +678,29 @@ int main(int argc, char* argv[]) {
                 &safein_epsilon_stats);
         }
         if (safeout_epsilon_percentile >= 0.0f) {
+            if (all_codes.empty()) {
+                std::fprintf(stderr,
+                             "SafeOut epsilon calibration requires encoded RabitQ codes.\n");
+                return 1;
+            }
             runtime_safeout_eps = CalibrateSplitEpsilon(
                 all_codes, cluster_members_for_stats, base.data.data(), index.centroids(),
                 index.rotation(), dim, epsilon_samples, safeout_epsilon_percentile,
                 seed, runtime_safein_dk, bits, nullptr, epsilon_sampling_mode,
                 &safeout_epsilon_stats);
         }
-        index.OverrideConANN(runtime_safeout_eps, index.conann().legacy_d_k(),
-                             runtime_safein_dk, true);
-        Log("  override safein_d_k=%.6f safein_eps=%.6f safeout_eps=%.6f\n",
-            runtime_safein_dk, runtime_safein_eps, runtime_safeout_eps);
+        override_conann = true;
     }
 
-    CalibrationResults calib_results;
-    if (use_crc) {
-        Log("\n[Phase C.5] CRC calibration...\n");
-        std::string scores_path = index_dir + "/crc_scores.bin";
-        std::vector<QueryScores> crc_scores;
-        uint32_t scores_nlist, scores_top_k;
-        auto s = CrcCalibrator::ReadScores(scores_path, crc_scores,
-                                           scores_nlist, scores_top_k);
-        if (s.ok()) {
-            Log("  Loaded %zu query scores (nlist=%u, top_k=%u)\n",
-                crc_scores.size(), scores_nlist, scores_top_k);
-            CrcCalibrator::Config crc_cfg;
-            crc_cfg.alpha = crc_alpha;
-            crc_cfg.top_k = scores_top_k;
-            crc_cfg.calib_ratio = crc_calib;
-            crc_cfg.tune_ratio = crc_tune;
-            crc_cfg.seed = seed;
-            auto [cr, er] = CrcCalibrator::Calibrate(crc_cfg, crc_scores, index.nlist());
-            calib_results = cr;
-            Log("  lamhat=%.6f  kreg=%u  reg_lambda=%.6f\n",
-                calib_results.lamhat, calib_results.kreg,
-                calib_results.reg_lambda);
-            Log("  fnr=%.4f  avg_probed=%.1f  test_size=%u\n",
-                er.actual_fnr, er.avg_probed, er.test_size);
-        } else {
-            Log("  No crc_scores.bin (disabling CRC)\n");
-            use_crc = false;
-        }
+    if (override_conann) {
+        index.OverrideConANN(runtime_safeout_eps, index.conann().legacy_d_k(),
+                             runtime_safein_dk, true);
+        Log("  override safein_threshold=%.6f source=%s safein_eps=%.6f safeout_eps=%.6f\n",
+            runtime_safein_dk, SafeInThresholdSourceName(safein_threshold_source),
+            runtime_safein_eps, runtime_safeout_eps);
     }
+    Log("  active SafeIn threshold source=%s threshold=%.6f\n",
+        SafeInThresholdSourceName(safein_threshold_source), runtime_safein_dk);
 
     // ================================================================
     // Phase D: Query
@@ -646,11 +710,9 @@ int main(int argc, char* argv[]) {
     SearchConfig search_cfg;
     search_cfg.top_k = top_k;
     search_cfg.nprobe = nprobe;
-    search_cfg.early_stop = early_stop;
+    search_cfg.enable_dynamic_safeout = dynamic_safeout;
     search_cfg.prefetch_depth = 16;
     search_cfg.io_queue_depth = 64;
-    search_cfg.crc_params = use_crc ? &calib_results : nullptr;
-    search_cfg.initial_prefetch = 16;
     search_cfg.refill_threshold = 4;
     search_cfg.refill_count = 8;
     search_cfg.enable_stage1_safein = enable_stage1_safein;
@@ -704,7 +766,11 @@ int main(int argc, char* argv[]) {
     uint64_t s2_false_safein = 0, s2_false_safeout = 0;
     uint64_t final_uncertain = 0;
     uint64_t total_probed_clusters = 0;
-    uint32_t early_stop_count = 0;
+    uint64_t safeout_frontier_estimates_buffered = 0;
+    uint64_t safeout_frontier_estimates_merged = 0;
+    uint64_t safeout_frontier_updates = 0;
+    const uint32_t probed_clusters_per_query =
+        std::min<uint32_t>(nprobe, index.nlist());
 
     for (uint32_t qi = 0; qi < Q; ++qi) {
         SearchConfig query_cfg = search_cfg;
@@ -739,10 +805,12 @@ int main(int argc, char* argv[]) {
         s2_false_safein += st.s2_false_safe_in;
         s2_false_safeout += st.s2_false_safe_out;
         final_uncertain += st.total_uncertain;
-        total_probed_clusters += st.crc_clusters_probed > 0
-            ? st.crc_clusters_probed
-            : (static_cast<uint32_t>(nprobe) - st.clusters_skipped);
-        if (st.early_stopped) early_stop_count++;
+        safeout_frontier_estimates_buffered +=
+            st.total_safeout_frontier_estimates_buffered;
+        safeout_frontier_estimates_merged +=
+            st.total_safeout_frontier_estimates_merged;
+        safeout_frontier_updates += st.total_safeout_frontier_updates;
+        total_probed_clusters += probed_clusters_per_query;
 
         if ((qi + 1) % (Q / std::max(Q / 4u, 1u)) == 0 || qi + 1 == Q) {
             Log("  Progress: %u/%u\n", qi + 1, Q);
@@ -792,7 +860,6 @@ int main(int argc, char* argv[]) {
     double p99 = sorted_lat[static_cast<size_t>(Q * 0.99)];
 
     double avg_probed = static_cast<double>(total_probed_clusters) / Q;
-    double early_stop_rate = static_cast<double>(early_stop_count) / Q;
 
     uint64_t s1_total = s1_safein + s1_safeout + s1_uncertain;
     auto pct = [](uint64_t num, uint64_t den) -> double {
@@ -818,7 +885,12 @@ int main(int argc, char* argv[]) {
     Log("\n");
     Log("  build_time      = %.1f ms\n", build_time_ms);
     Log("  avg_probed      = %.2f / %u clusters\n", avg_probed, nprobe);
-    Log("  early_stop_rate = %.4f\n", early_stop_rate);
+    Log("  safeout_frontier_estimates_buffered = %lu\n",
+        safeout_frontier_estimates_buffered);
+    Log("  safeout_frontier_estimates_merged   = %lu\n",
+        safeout_frontier_estimates_merged);
+    Log("  safeout_frontier_updates            = %lu\n",
+        safeout_frontier_updates);
 
     // Stage 1 Uncertain is the raw FastScan population that flows into Stage 2.
     // Stage 2 Uncertain is the unresolved remainder after ExRaBitQ re-classification.
@@ -844,10 +916,6 @@ int main(int argc, char* argv[]) {
         Log("    Final Uncertain = %lu\n", final_uncertain);
     }
 
-    if (use_crc) {
-        Log("\n  CRC stats:\n");
-        Log("    lamhat     = %.6f\n", calib_results.lamhat);
-    }
     Log("========================================\n");
 
     // JSON output
@@ -866,14 +934,23 @@ int main(int argc, char* argv[]) {
         jf << "  \"top_k\": " << top_k << ",\n";
         jf << "  \"bits\": " << static_cast<int>(bits) << ",\n";
         jf << "  \"metric\": \"" << metric << "\",\n";
-        jf << "  \"crc\": " << (use_crc ? "true" : "false") << ",\n";
+        jf << "  \"dynamic_safeout_enabled\": "
+           << (dynamic_safeout ? "true" : "false") << ",\n";
         jf << "  \"safein_dk_percentile\": " << safein_dk_percentile << ",\n";
+        jf << "  \"safein_dk_space\": \""
+           << SafeInDkSpaceName(requested_safein_dk_space) << "\",\n";
         jf << "  \"safein_dk_samples_input\": \"" << safein_dk_samples_input << "\",\n";
+        jf << "  \"safein_dk_samples_output\": \""
+           << safein_dk_samples_written << "\",\n";
+        jf << "  \"safein_dk_samples_count\": "
+           << safein_dk_samples_count << ",\n";
         jf << "  \"safein_d_k\": " << runtime_safein_dk << ",\n";
         jf << "  \"safein_epsilon_percentile\": " << safein_epsilon_percentile << ",\n";
         jf << "  \"safein_epsilon\": " << runtime_safein_eps << ",\n";
         jf << "  \"safeout_epsilon_percentile\": " << safeout_epsilon_percentile << ",\n";
         jf << "  \"safeout_epsilon\": " << runtime_safeout_eps << ",\n";
+        jf << "  \"safein_threshold_source\": \""
+           << SafeInThresholdSourceName(safein_threshold_source) << "\",\n";
         jf << "  \"epsilon_sampling_mode\": \""
            << EpsilonSamplingModeName(epsilon_sampling_mode) << "\",\n";
         jf << "  \"epsilon_requested_samples\": " << epsilon_samples << ",\n";
@@ -896,7 +973,12 @@ int main(int argc, char* argv[]) {
         jf << "  \"latency_p99_ms\": " << p99 << ",\n";
         jf << "  \"build_time_ms\": " << build_time_ms << ",\n";
         jf << "  \"avg_probed\": " << avg_probed << ",\n";
-        jf << "  \"early_stop_rate\": " << early_stop_rate << ",\n";
+        jf << "  \"safeout_frontier_estimates_buffered\": "
+           << safeout_frontier_estimates_buffered << ",\n";
+        jf << "  \"safeout_frontier_estimates_merged\": "
+           << safeout_frontier_estimates_merged << ",\n";
+        jf << "  \"safeout_frontier_updates\": "
+           << safeout_frontier_updates << ",\n";
         jf << "  \"s1_safein\": " << s1_safein << ",\n";
         jf << "  \"s1_safeout\": " << s1_safeout << ",\n";
         jf << "  \"s1_uncertain\": " << s1_uncertain << ",\n";
@@ -906,7 +988,8 @@ int main(int argc, char* argv[]) {
         jf << "  \"s2_safeout\": " << s2_safeout << ",\n";
         jf << "  \"s2_uncertain\": " << s2_uncertain << ",\n";
         jf << "  \"s2_false_safein\": " << s2_false_safein << ",\n";
-        jf << "  \"s2_false_safeout\": " << s2_false_safeout << "\n";
+        jf << "  \"s2_false_safeout\": " << s2_false_safeout << ",\n";
+        jf << "  \"final_uncertain\": " << final_uncertain << "\n";
         jf << "}\n";
         jf.close();
         Log("\nJSON results written to: %s\n", json_path.c_str());

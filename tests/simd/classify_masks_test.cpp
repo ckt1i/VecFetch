@@ -39,6 +39,20 @@ uint32_t ReferenceStage2SafeInMask(const float* ip_raw,
     return safein & ~safeout;
 }
 
+vdb::ResultClass ReferenceClassifyAdaptive(float est_dist,
+                                           float safein_margin,
+                                           float safeout_margin,
+                                           float safein_dk,
+                                           float safeout_frontier_upper) {
+    if (est_dist > safeout_frontier_upper + safeout_margin) {
+        return vdb::ResultClass::SafeOut;
+    }
+    if (est_dist < safein_dk - safein_margin) {
+        return vdb::ResultClass::SafeIn;
+    }
+    return vdb::ResultClass::Uncertain;
+}
+
 }  // namespace
 
 TEST(FastScanStage1EvaluateTest, MatchesLegacyDequantizeAndMasks) {
@@ -181,4 +195,73 @@ TEST(Stage2ClassifyMaskTest, MatchesReferenceOneSidedMargins) {
     EXPECT_EQ(masks.safein, expected_safein);
     EXPECT_EQ(masks.safeout, (1u << 4) | (1u << 6));
     EXPECT_EQ(masks.uncertain, active_mask & ~masks.safein & ~masks.safeout);
+}
+
+TEST(Stage2ClassifyMaskTest, SharedMarginMatchesScalarClassifyAdaptive) {
+    alignas(32) float ip_raw[8] = {
+        -0.20f, -0.75f, -1.25f, -1.80f, -2.30f, -2.80f, -3.10f, -3.60f};
+    alignas(32) float xipnorm[8] = {
+        1.00f, 0.95f, 1.10f, 1.00f, 0.90f, 1.05f, 1.00f, 0.85f};
+    alignas(32) float norm_oc[8] = {
+        0.80f, 1.00f, 1.10f, 1.25f, 1.40f, 1.55f, 1.70f, 1.85f};
+    alignas(32) float margin_s1[8] = {
+        1.00f, 1.50f, 2.00f, 2.50f, 3.00f, 3.50f, 4.00f, 4.50f};
+
+    const uint32_t active_mask = 0xBDu;
+    const float norm_qc = 1.25f;
+    const float norm_qc_sq = norm_qc * norm_qc;
+    const float inv_margin_s2_divisor = 0.25f;
+    const float safein_dk = 4.0f;
+    const float safeout_frontier_upper = 7.0f;
+
+    const vdb::simd::Stage2ClassifyMasks masks = vdb::simd::Stage2ClassifyBatch(
+        ip_raw, xipnorm, norm_oc, margin_s1, active_mask,
+        norm_qc, norm_qc_sq, inv_margin_s2_divisor,
+        safein_dk, safeout_frontier_upper);
+
+    uint32_t expected_safein = 0;
+    uint32_t expected_safeout = 0;
+    uint32_t expected_uncertain = 0;
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+        const uint32_t bit = 1u << lane;
+        if ((active_mask & bit) == 0) continue;
+        const float ip_est = ip_raw[lane] * xipnorm[lane];
+        float est_dist = norm_oc[lane] * norm_oc[lane] + norm_qc_sq -
+                         2.0f * norm_oc[lane] * norm_qc * ip_est;
+        est_dist = std::max(est_dist, 0.0f);
+        const float margin = margin_s1[lane] * inv_margin_s2_divisor;
+        const vdb::ResultClass rc =
+            ReferenceClassifyAdaptive(est_dist, margin, margin, safein_dk,
+                                      safeout_frontier_upper);
+        if (rc == vdb::ResultClass::SafeIn) {
+            expected_safein |= bit;
+        } else if (rc == vdb::ResultClass::SafeOut) {
+            expected_safeout |= bit;
+        } else {
+            expected_uncertain |= bit;
+        }
+    }
+
+    EXPECT_EQ(masks.safein, expected_safein);
+    EXPECT_EQ(masks.safeout, expected_safeout);
+    EXPECT_EQ(masks.uncertain, expected_uncertain);
+}
+
+TEST(Stage2ClassifyMaskTest, SplitMarginScalarUsesSafeOutMargin) {
+    const float safein_dk = 10.0f;
+    const float safeout_frontier_upper = 8.0f;
+    const float est_dist = 9.2f;
+
+    EXPECT_EQ(ReferenceClassifyAdaptive(est_dist,
+                                        /*safein_margin=*/100.0f,
+                                        /*safeout_margin=*/1.0f,
+                                        safein_dk,
+                                        safeout_frontier_upper),
+              vdb::ResultClass::SafeOut);
+    EXPECT_NE(ReferenceClassifyAdaptive(est_dist,
+                                        /*safein_margin=*/100.0f,
+                                        /*safeout_margin=*/100.0f,
+                                        safein_dk,
+                                        safeout_frontier_upper),
+              vdb::ResultClass::SafeOut);
 }

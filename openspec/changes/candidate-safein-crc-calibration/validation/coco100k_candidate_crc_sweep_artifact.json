@@ -1,0 +1,139 @@
+{
+  "safein_threshold_source": "candidate_crc",
+  "selected_beta": 0.800000012,
+  "selected_threshold": 1.34500122,
+  "calibration_queries": 500,
+  "validation_queries": 500,
+  "sampled_queries": 1000,
+  "candidate_domain": "nprobe",
+  "nprobe": 64,
+  "top_k": 10,
+  "bits": 4,
+  "epsilon": 0.0632361621,
+  "seed": 42,
+  "results": [
+    {
+      "beta": 0.800000012,
+      "threshold": 1.34500122,
+      "found_nonempty_threshold": true,
+      "calibration_stage1": {
+        "total": 1546057,
+        "safein": 1511,
+        "false_safein": 1182,
+        "uncertain": 1544546,
+        "false_safein_rate": 0.782263402,
+        "false_safein_rate_ci_low": 0.68226333,
+        "false_safein_rate_ci_high": 0.839137645
+      },
+      "calibration_final": {
+        "total": 1546057,
+        "safein": 10955,
+        "false_safein": 8764,
+        "uncertain": 1535102,
+        "false_safein_rate": 0.8,
+        "false_safein_rate_ci_low": 0.74440966,
+        "false_safein_rate_ci_high": 0.838628218
+      },
+      "validation_stage1": {
+        "total": 1552855,
+        "safein": 752,
+        "false_safein": 489,
+        "uncertain": 1552103,
+        "false_safein_rate": 0.650265957,
+        "false_safein_rate_ci_low": 0.553043478,
+        "false_safein_rate_ci_high": 0.724885845
+      },
+      "validation_final": {
+        "total": 1552855,
+        "safein": 8182,
+        "false_safein": 5905,
+        "uncertain": 1544673,
+        "false_safein_rate": 0.721706184,
+        "false_safein_rate_ci_low": 0.655723159,
+        "false_safein_rate_ci_high": 0.759538784
+      }
+    },
+    {
+      "beta": 0.899999976,
+      "threshold": 1.37502456,
+      "found_nonempty_threshold": true,
+      "calibration_stage1": {
+        "total": 1546057,
+        "safein": 6207,
+        "false_safein": 5360,
+        "uncertain": 1539850,
+        "false_safein_rate": 0.863541163,
+        "false_safein_rate_ci_low": 0.823694685,
+        "false_safein_rate_ci_high": 0.889932382
+      },
+      "calibration_final": {
+        "total": 1546057,
+        "safein": 34368,
+        "false_safein": 30931,
+        "uncertain": 1511689,
+        "false_safein_rate": 0.899994181,
+        "false_safein_rate_ci_low": 0.875200238,
+        "false_safein_rate_ci_high": 0.915019217
+      },
+      "validation_stage1": {
+        "total": 1552855,
+        "safein": 4352,
+        "false_safein": 3555,
+        "uncertain": 1548503,
+        "false_safein_rate": 0.816865809,
+        "false_safein_rate_ci_low": 0.782384824,
+        "false_safein_rate_ci_high": 0.843187661
+      },
+      "validation_final": {
+        "total": 1552855,
+        "safein": 30517,
+        "false_safein": 26872,
+        "uncertain": 1522338,
+        "false_safein_rate": 0.880558377,
+        "false_safein_rate_ci_low": 0.855719657,
+        "false_safein_rate_ci_high": 0.895788905
+      }
+    },
+    {
+      "beta": 0.949999988,
+      "threshold": 1.40494204,
+      "found_nonempty_threshold": true,
+      "calibration_stage1": {
+        "total": 1546057,
+        "safein": 20588,
+        "false_safein": 18907,
+        "uncertain": 1525469,
+        "false_safein_rate": 0.918350495,
+        "false_safein_rate_ci_low": 0.902401572,
+        "false_safein_rate_ci_high": 0.930183705
+      },
+      "calibration_final": {
+        "total": 1546057,
+        "safein": 87379,
+        "false_safein": 83010,
+        "uncertain": 1458678,
+        "false_safein_rate": 0.949999428,
+        "false_safein_rate_ci_low": 0.942813712,
+        "false_safein_rate_ci_high": 0.955335547
+      },
+      "validation_stage1": {
+        "total": 1552855,
+        "safein": 17658,
+        "false_safein": 15986,
+        "uncertain": 1535197,
+        "false_safein_rate": 0.90531204,
+        "false_safein_rate_ci_low": 0.889252949,
+        "false_safein_rate_ci_high": 0.917617549
+      },
+      "validation_final": {
+        "total": 1552855,
+        "safein": 83298,
+        "false_safein": 78855,
+        "uncertain": 1469557,
+        "false_safein_rate": 0.946661384,
+        "false_safein_rate_ci_low": 0.937246597,
+        "false_safein_rate_ci_high": 0.951987205
+      }
+    }
+  ]
+}

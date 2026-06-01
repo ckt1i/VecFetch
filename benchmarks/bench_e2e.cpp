@@ -5,7 +5,6 @@
 ///
 /// Usage:
 ///   bench_e2e [--dataset /path/to/coco_1k]
-///             [--crc 1] [--crc-alpha 0.1] [--crc-calib 0.5] [--crc-tune 0.1]
 ///
 /// Output:
 ///   /home/zcq/VDB/test/{dataset}_{timestamp}/
@@ -36,8 +35,6 @@
 
 #include "vdb/common/distance.h"
 #include "vdb/common/types.h"
-#include "vdb/index/crc_calibrator.h"
-#include "vdb/index/crc_stopper.h"
 #include "vdb/index/ivf_builder.h"
 #include "vdb/index/ivf_index.h"
 #include "vdb/io/jsonl_reader.h"
@@ -86,21 +83,6 @@ static float GetFloatArg(int argc, char* argv[], const char* name, float default
         if (std::strcmp(argv[i], name) == 0) return std::strtof(argv[i + 1], nullptr);
     }
     return default_val;
-}
-
-static std::vector<uint64_t> ParseUint64List(const std::string& value) {
-    std::vector<uint64_t> out;
-    if (value.empty()) {
-        return out;
-    }
-    std::istringstream ss(value);
-    std::string token;
-    while (std::getline(ss, token, ',')) {
-        if (!token.empty()) {
-            out.push_back(std::stoull(token));
-        }
-    }
-    return out;
 }
 
 // ============================================================================
@@ -161,14 +143,6 @@ static std::string NormalizePath(const std::string& path) {
         return path;
     }
     return normalized.lexically_normal().string();
-}
-
-static std::string CrcParamsSidecarPath(const std::string& index_dir) {
-    return index_dir + "/crc_calibration_params.bin";
-}
-
-static std::string CrcRunCalibrationPath(const std::string& output_dir) {
-    return output_dir + "/crc_calibration.json";
 }
 
 static double FileSizeBytesOrZero(const std::string& path) {
@@ -248,74 +222,10 @@ static StatusOr<std::vector<std::vector<int64_t>>> LoadExternalGroundTruth(
     return gt_topk;
 }
 
-static bool ParseCrcSolverArg(const std::string& arg,
-                              CrcCalibrator::Solver* solver) {
-    if (solver == nullptr) return false;
-    if (arg == "brent") {
-        *solver = CrcCalibrator::Solver::Brent;
-        return true;
-    }
-    if (arg == "discrete_threshold") {
-        *solver = CrcCalibrator::Solver::DiscreteThreshold;
-        return true;
-    }
-    return false;
-}
-
-static bool ParseCrcSplitModeArg(const std::string& arg, bool* use_stratified) {
-    if (use_stratified == nullptr) return false;
-    if (arg == "random") {
-        *use_stratified = false;
-        return true;
-    }
-    if (arg == "stratified") {
-        *use_stratified = true;
-        return true;
-    }
-    return false;
-}
-
 static const char* ExRaBitQStorageFormatName(uint32_t clu_file_version) {
     if (clu_file_version >= 11) return "compact_blocked";
     if (clu_file_version >= 10) return "packed_sign";
     return "legacy_byte_sign";
-}
-
-static Status ReadCalibrationResults(const std::string& path,
-                                     CalibrationResults* results) {
-    if (results == nullptr) {
-        return Status::InvalidArgument("results must not be null");
-    }
-
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) {
-        return Status::IOError("Failed to open CRC calibration sidecar: " +
-                               path);
-    }
-
-    uint32_t magic = 0;
-    uint32_t version = 0;
-    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    f.read(reinterpret_cast<char*>(&version), sizeof(version));
-    if (!f.good()) {
-        return Status::IOError("Failed to read CRC calibration sidecar header: " +
-                               path);
-    }
-    if (magic != 0x43524350u) {
-        return Status::InvalidArgument(
-            "CRC calibration sidecar has invalid magic: " + path);
-    }
-    if (version != 1) {
-        return Status::InvalidArgument(
-            "CRC calibration sidecar has unsupported version: " + path);
-    }
-
-    f.read(reinterpret_cast<char*>(results), sizeof(*results));
-    if (!f.good()) {
-        return Status::IOError(
-            "Failed to read CRC calibration sidecar payload: " + path);
-    }
-    return Status::OK();
 }
 
 // ============================================================================
@@ -528,7 +438,6 @@ struct QueryResult {
     uint32_t submit_calls = 0;
     uint32_t submit_window_flushes = 0;
     uint32_t submit_window_tail_flushes = 0;
-    uint32_t submit_stop_flushes = 0;
     uint32_t vec_only_read_requests = 0;
     uint32_t all_read_requests = 0;
     uint32_t payload_read_requests = 0;
@@ -536,17 +445,14 @@ struct QueryResult {
     uint32_t fixed_vec_buffer_misses = 0;
     double submit_window_requests = 0;
     double candidate_batches_per_cluster = 0;
-    double crc_estimates_buffered_per_cluster = 0;
-    double crc_estimates_merged_per_cluster = 0;
+    double safeout_frontier_estimates_buffered_per_cluster = 0;
+    double safeout_frontier_estimates_merged_per_cluster = 0;
+    double safeout_frontier_updates_per_cluster = 0;
     double stage2_block_lookups = 0;
     double stage2_block_reuses = 0;
-    double crc_decision_ms = 0;
-    double crc_buffer_ms = 0;
-    double crc_merge_ms = 0;
-    double crc_online_ms = 0;
-    uint32_t crc_would_stop = 0;
-    bool early_stopped;
-    uint32_t clusters_skipped;
+    double safeout_frontier_buffer_ms = 0;
+    double safeout_frontier_merge_ms = 0;
+    double safeout_frontier_online_ms = 0;
     uint32_t probed_clusters = 0;
     uint32_t total_probed;
     uint32_t safe_in;
@@ -649,7 +555,6 @@ struct RoundMetrics {
     double avg_submit_calls = 0;
     double avg_submit_window_flushes = 0;
     double avg_submit_window_tail_flushes = 0;
-    double avg_submit_stop_flushes = 0;
     double avg_submit_window_requests = 0;
     double avg_vec_only_read_requests = 0;
     double avg_all_read_requests = 0;
@@ -668,15 +573,14 @@ struct RoundMetrics {
     double avg_deduplicated_candidates = 0;
     double avg_unique_fetch_candidates = 0;
     double avg_candidate_batches_per_cluster = 0;
-    double avg_crc_estimates_buffered_per_cluster = 0;
-    double avg_crc_estimates_merged_per_cluster = 0;
+    double avg_safeout_frontier_estimates_buffered_per_cluster = 0;
+    double avg_safeout_frontier_estimates_merged_per_cluster = 0;
+    double avg_safeout_frontier_updates_per_cluster = 0;
     double avg_stage2_block_lookups = 0;
     double avg_stage2_block_reuses = 0;
-    double avg_crc_decision_ms = 0;
-    double avg_crc_buffer_ms = 0;
-    double avg_crc_merge_ms = 0;
-    double avg_crc_online_ms = 0;
-    double avg_crc_would_stop = 0;
+    double avg_safeout_frontier_buffer_ms = 0;
+    double avg_safeout_frontier_merge_ms = 0;
+    double avg_safeout_frontier_online_ms = 0;
     double avg_candidates_buffered = 0;
     double avg_candidates_reranked = 0;
     double avg_safein_payload_prefetched = 0;
@@ -684,8 +588,6 @@ struct RoundMetrics {
     double avg_false_safeout = 0;
     double avg_false_safein_upper = 0;
     uint64_t total_final_safein = 0;   // absolute count: S1 SafeIn + S2 SafeIn
-    double early_pct = 0;
-    double avg_skipped = 0;
     double overlap_ratio = 0;
     double preload_time_ms = 0;
     double preload_bytes = 0;
@@ -844,7 +746,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.submit_window_flushes = results.stats().total_submit_window_flushes;
         qr.submit_window_tail_flushes =
             results.stats().total_submit_window_tail_flushes;
-        qr.submit_stop_flushes = results.stats().total_submit_stop_flushes;
         qr.vec_only_read_requests = results.stats().vec_only_read_requests;
         qr.all_read_requests = results.stats().all_read_requests;
         qr.payload_read_requests = results.stats().payload_read_requests;
@@ -852,32 +753,31 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.fixed_vec_buffer_misses = results.stats().fixed_vec_buffer_misses;
         qr.submit_window_requests =
             static_cast<double>(results.stats().total_submit_window_requests);
-        qr.crc_decision_ms = results.stats().crc_decision_ms;
-        qr.crc_buffer_ms = results.stats().crc_buffer_ms;
-        qr.crc_merge_ms = results.stats().crc_merge_ms;
-        qr.crc_online_ms = qr.crc_decision_ms + qr.crc_buffer_ms + qr.crc_merge_ms;
-        qr.crc_would_stop = results.stats().total_crc_would_stop;
+        qr.safeout_frontier_buffer_ms = results.stats().safeout_frontier_buffer_ms;
+        qr.safeout_frontier_merge_ms = results.stats().safeout_frontier_merge_ms;
+        qr.safeout_frontier_online_ms =
+            qr.safeout_frontier_buffer_ms + qr.safeout_frontier_merge_ms;
         qr.stage2_block_lookups = static_cast<double>(results.stats().total_stage2_block_lookups);
         qr.stage2_block_reuses = static_cast<double>(results.stats().total_stage2_block_reuses);
-        const uint32_t probed_clusters_u32 =
-            (results.stats().crc_clusters_probed > 0)
-                ? results.stats().crc_clusters_probed
-                : (search_cfg.nprobe - results.stats().clusters_skipped);
+        const uint32_t probed_clusters_u32 = search_cfg.nprobe;
         qr.probed_clusters = probed_clusters_u32;
         const double probed_clusters = static_cast<double>(probed_clusters_u32);
         if (probed_clusters > 0.0) {
             qr.candidate_batches_per_cluster =
                 static_cast<double>(results.stats().total_candidate_batches) /
                 probed_clusters;
-            qr.crc_estimates_buffered_per_cluster =
-                static_cast<double>(results.stats().total_crc_estimates_buffered) /
+            qr.safeout_frontier_estimates_buffered_per_cluster =
+                static_cast<double>(
+                    results.stats().total_safeout_frontier_estimates_buffered) /
                 probed_clusters;
-            qr.crc_estimates_merged_per_cluster =
-                static_cast<double>(results.stats().total_crc_estimates_merged) /
+            qr.safeout_frontier_estimates_merged_per_cluster =
+                static_cast<double>(
+                    results.stats().total_safeout_frontier_estimates_merged) /
+                probed_clusters;
+            qr.safeout_frontier_updates_per_cluster =
+                static_cast<double>(results.stats().total_safeout_frontier_updates) /
                 probed_clusters;
         }
-        qr.early_stopped = results.stats().early_stopped;
-        qr.clusters_skipped = results.stats().clusters_skipped;
         qr.total_probed = results.stats().total_probed;
         qr.safe_in = results.stats().total_safe_in;
         qr.safe_out = results.stats().total_safe_out;
@@ -1010,7 +910,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_submit_calls = 0;
     double sum_submit_window_flushes = 0;
     double sum_submit_window_tail_flushes = 0;
-    double sum_submit_stop_flushes = 0;
     double sum_submit_window_requests = 0;
     double sum_vec_only_read_requests = 0;
     double sum_all_read_requests = 0;
@@ -1018,19 +917,16 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_fixed_vec_buffer_hits = 0;
     double sum_fixed_vec_buffer_misses = 0;
     double sum_candidate_batches_per_cluster = 0;
-    double sum_crc_estimates_buffered_per_cluster = 0;
-    double sum_crc_estimates_merged_per_cluster = 0;
+    double sum_safeout_frontier_estimates_buffered_per_cluster = 0;
+    double sum_safeout_frontier_estimates_merged_per_cluster = 0;
+    double sum_safeout_frontier_updates_per_cluster = 0;
     double sum_stage2_block_lookups = 0;
     double sum_stage2_block_reuses = 0;
-    double sum_crc_decision = 0;
-    double sum_crc_buffer = 0;
-    double sum_crc_merge = 0;
-    double sum_crc_online = 0;
-    double sum_crc_would_stop = 0;
+    double sum_safeout_frontier_buffer = 0;
+    double sum_safeout_frontier_merge = 0;
+    double sum_safeout_frontier_online = 0;
     double sum_candidates_buffered = 0, sum_candidates_reranked = 0;
     double sum_safein_payload_prefetched = 0, sum_remaining_payload_fetches = 0;
-    uint32_t early_count = 0;
-    double sum_skipped = 0;
     for (uint32_t qi = 0; qi < Q; ++qi) {
         sum_probed_clusters += qresults[qi].probed_clusters;
         sum_probed += qresults[qi].total_probed;
@@ -1125,7 +1021,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_submit_window_flushes += qresults[qi].submit_window_flushes;
         sum_submit_window_tail_flushes +=
             qresults[qi].submit_window_tail_flushes;
-        sum_submit_stop_flushes += qresults[qi].submit_stop_flushes;
         sum_submit_window_requests += qresults[qi].submit_window_requests;
         sum_vec_only_read_requests += qresults[qi].vec_only_read_requests;
         sum_all_read_requests += qresults[qi].all_read_requests;
@@ -1133,26 +1028,22 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_fixed_vec_buffer_hits += qresults[qi].fixed_vec_buffer_hits;
         sum_fixed_vec_buffer_misses += qresults[qi].fixed_vec_buffer_misses;
         sum_candidate_batches_per_cluster += qresults[qi].candidate_batches_per_cluster;
-        sum_crc_estimates_buffered_per_cluster +=
-            qresults[qi].crc_estimates_buffered_per_cluster;
-        sum_crc_estimates_merged_per_cluster +=
-            qresults[qi].crc_estimates_merged_per_cluster;
+        sum_safeout_frontier_estimates_buffered_per_cluster +=
+            qresults[qi].safeout_frontier_estimates_buffered_per_cluster;
+        sum_safeout_frontier_estimates_merged_per_cluster +=
+            qresults[qi].safeout_frontier_estimates_merged_per_cluster;
+        sum_safeout_frontier_updates_per_cluster +=
+            qresults[qi].safeout_frontier_updates_per_cluster;
         sum_stage2_block_lookups += qresults[qi].stage2_block_lookups;
         sum_stage2_block_reuses += qresults[qi].stage2_block_reuses;
-        sum_crc_decision += qresults[qi].crc_decision_ms;
-        sum_crc_buffer += qresults[qi].crc_buffer_ms;
-        sum_crc_merge += qresults[qi].crc_merge_ms;
-        sum_crc_online += qresults[qi].crc_online_ms;
-        sum_crc_would_stop += qresults[qi].crc_would_stop;
+        sum_safeout_frontier_buffer += qresults[qi].safeout_frontier_buffer_ms;
+        sum_safeout_frontier_merge += qresults[qi].safeout_frontier_merge_ms;
+        sum_safeout_frontier_online += qresults[qi].safeout_frontier_online_ms;
         sum_candidates_buffered += qresults[qi].num_candidates_buffered;
         sum_candidates_reranked += qresults[qi].num_candidates_reranked;
         sum_safein_payload_prefetched += qresults[qi].num_safein_payload_prefetched;
         sum_remaining_payload_fetches += qresults[qi].num_remaining_payload_fetches;
         sum_total += qresults[qi].query_time_ms;
-        if (qresults[qi].early_stopped) {
-            early_count++;
-            sum_skipped += qresults[qi].clusters_skipped;
-        }
     }
 
     m.avg_io_wait = sum_io_wait / Q;
@@ -1234,7 +1125,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_submit_calls = sum_submit_calls / Q;
     m.avg_submit_window_flushes = sum_submit_window_flushes / Q;
     m.avg_submit_window_tail_flushes = sum_submit_window_tail_flushes / Q;
-    m.avg_submit_stop_flushes = sum_submit_stop_flushes / Q;
     m.avg_submit_window_requests = sum_submit_window_requests / Q;
     m.avg_vec_only_read_requests = sum_vec_only_read_requests / Q;
     m.avg_all_read_requests = sum_all_read_requests / Q;
@@ -1242,17 +1132,17 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_fixed_vec_buffer_hits = sum_fixed_vec_buffer_hits / Q;
     m.avg_fixed_vec_buffer_misses = sum_fixed_vec_buffer_misses / Q;
     m.avg_candidate_batches_per_cluster = sum_candidate_batches_per_cluster / Q;
-    m.avg_crc_estimates_buffered_per_cluster =
-        sum_crc_estimates_buffered_per_cluster / Q;
-    m.avg_crc_estimates_merged_per_cluster =
-        sum_crc_estimates_merged_per_cluster / Q;
+    m.avg_safeout_frontier_estimates_buffered_per_cluster =
+        sum_safeout_frontier_estimates_buffered_per_cluster / Q;
+    m.avg_safeout_frontier_estimates_merged_per_cluster =
+        sum_safeout_frontier_estimates_merged_per_cluster / Q;
+    m.avg_safeout_frontier_updates_per_cluster =
+        sum_safeout_frontier_updates_per_cluster / Q;
     m.avg_stage2_block_lookups = sum_stage2_block_lookups / Q;
     m.avg_stage2_block_reuses = sum_stage2_block_reuses / Q;
-    m.avg_crc_decision_ms = sum_crc_decision / Q;
-    m.avg_crc_buffer_ms = sum_crc_buffer / Q;
-    m.avg_crc_merge_ms = sum_crc_merge / Q;
-    m.avg_crc_online_ms = sum_crc_online / Q;
-    m.avg_crc_would_stop = sum_crc_would_stop / Q;
+    m.avg_safeout_frontier_buffer_ms = sum_safeout_frontier_buffer / Q;
+    m.avg_safeout_frontier_merge_ms = sum_safeout_frontier_merge / Q;
+    m.avg_safeout_frontier_online_ms = sum_safeout_frontier_online / Q;
     m.avg_probed_clusters = sum_probed_clusters / Q;
     m.avg_probed = sum_probed / Q;
     m.avg_safe_in = sum_si / Q;
@@ -1271,8 +1161,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_false_safeout = sum_false_so / Q;
     m.avg_false_safein_upper = sum_false_si / Q;
     m.total_final_safein = static_cast<uint64_t>(sum_si + sum_s2_si);
-    m.early_pct = static_cast<double>(early_count) / Q;
-    m.avg_skipped = early_count > 0 ? sum_skipped / early_count : 0;
     m.overlap_ratio = (sum_total > 0) ? 1.0 - sum_io_wait / sum_total : 0.0;
     m.preload_time_ms = index.segment().resident_preload_time_ms();
     m.preload_bytes = static_cast<double>(index.segment().resident_preload_bytes());
@@ -1331,21 +1219,23 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     Log("  %s: uring_prep=%.3f ms  uring_submit=%.3f ms  parse_cluster=%.3f ms  fetch_missing=%.3f ms\n",
         label, m.avg_uring_prep, m.avg_uring_submit, m.avg_parse_cluster, m.avg_fetch_missing);
     Log("  %s: submit_calls=%.1f\n", label, m.avg_submit_calls);
-    Log("  %s: submit_window_flushes=%.1f  submit_window_tail_flushes=%.1f  submit_stop_flushes=%.1f  submit_window_requests=%.1f\n",
+    Log("  %s: submit_window_flushes=%.1f  submit_window_tail_flushes=%.1f  submit_window_requests=%.1f\n",
         label, m.avg_submit_window_flushes,
         m.avg_submit_window_tail_flushes,
-        m.avg_submit_stop_flushes,
         m.avg_submit_window_requests);
     Log("  %s: avg_probed_clusters=%.1f\n", label, m.avg_probed_clusters);
-    Log("  %s: candidate_batches_per_cluster=%.2f  crc_buffered_per_cluster=%.2f  crc_merged_per_cluster=%.2f\n",
-        label, m.avg_candidate_batches_per_cluster,
-        m.avg_crc_estimates_buffered_per_cluster,
-        m.avg_crc_estimates_merged_per_cluster);
+    Log("  %s: candidate_batches_per_cluster=%.2f\n",
+        label, m.avg_candidate_batches_per_cluster);
+    Log("  %s: safeout_frontier_buffered_per_cluster=%.2f  safeout_frontier_merged_per_cluster=%.2f  safeout_frontier_updates_per_cluster=%.2f\n",
+        label, m.avg_safeout_frontier_estimates_buffered_per_cluster,
+        m.avg_safeout_frontier_estimates_merged_per_cluster,
+        m.avg_safeout_frontier_updates_per_cluster);
     Log("  %s: stage2_block_lookups=%.1f  stage2_block_reuses=%.1f\n",
         label, m.avg_stage2_block_lookups, m.avg_stage2_block_reuses);
-    Log("  %s: crc_decision=%.6f ms  crc_buffer=%.6f ms  crc_merge=%.6f ms  crc_online=%.6f ms  crc_would_stop=%.1f\n",
-        label, m.avg_crc_decision_ms, m.avg_crc_buffer_ms,
-        m.avg_crc_merge_ms, m.avg_crc_online_ms, m.avg_crc_would_stop);
+    Log("  %s: safeout_frontier_buffer=%.6f ms  safeout_frontier_merge=%.6f ms  safeout_frontier_online=%.6f ms\n",
+        label, m.avg_safeout_frontier_buffer_ms,
+        m.avg_safeout_frontier_merge_ms,
+        m.avg_safeout_frontier_online_ms);
     Log("  %s: safe_in=%.1f  safe_out=%.1f  uncertain=%.1f\n", label,
         m.avg_safe_in, m.avg_safe_out, m.avg_uncertain);
     Log("  %s: s2_safe_in=%.1f  s2_safe_out=%.1f  s2_uncertain=%.1f\n", label,
@@ -1359,8 +1249,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     Log("  %s: false_safeout=%.2f  false_safein_upper=%.1f  total_safein=%lu\n",
         label, m.avg_false_safeout, m.avg_false_safein_upper,
         static_cast<unsigned long>(m.total_final_safein));
-    Log("  %s: early_stop=%.1f%%  avg_skipped=%.1f  overlap=%.4f\n", label,
-        m.early_pct * 100, m.avg_skipped, m.overlap_ratio);
+    Log("  %s: overlap=%.4f\n", label, m.overlap_ratio);
 
     return {std::move(qresults), m};
 }
@@ -1413,7 +1302,7 @@ int main(int argc, char* argv[]) {
     int arg_nlist      = GetIntArg(argc, argv, "--nlist", 32);
     int arg_nprobe     = GetIntArg(argc, argv, "--nprobe", 32);
     int arg_topk       = GetIntArg(argc, argv, "--topk", 10);
-    int arg_early_stop = GetIntArg(argc, argv, "--early-stop", 1);
+    int arg_dynamic_safeout = GetIntArg(argc, argv, "--dynamic-safeout", 1);
     int arg_bits       = GetIntArg(argc, argv, "--bits", 1);
     int arg_block_size = GetIntArg(argc, argv, "--block-size", 64);
     float arg_c_factor = GetFloatArg(argc, argv, "--c-factor", 5.75f);
@@ -1569,6 +1458,12 @@ int main(int argc, char* argv[]) {
     if (external_gt_requested && skip_gt) {
         Log("  External GT provided but recall is disabled (--query-only/--skip-gt); GT will be loaded only if needed.\n");
     }
+    if (arg_dynamic_safeout != 0 && arg_dynamic_safeout != 1) {
+        std::fprintf(stderr,
+                     "Invalid --dynamic-safeout: %d (expected 0 or 1)\n",
+                     arg_dynamic_safeout);
+        return 1;
+    }
 
     // nprobe sweep: --nprobe-sweep 50,100,150,200 (mutually exclusive with --nprobe)
     std::string arg_nprobe_sweep_str = GetStringArg(argc, argv, "--nprobe-sweep", "");
@@ -1608,61 +1503,10 @@ int main(int argc, char* argv[]) {
     // Pre-built index directory (skip Phase C build if specified)
     std::string arg_index_dir = GetStringArg(argc, argv, "--index-dir", "");
 
-    int arg_crc_enable = GetIntArg(argc, argv, "--crc", 1);
-    if (arg_crc_enable != 0 && arg_crc_enable != 1) {
-        std::fprintf(stderr,
-                     "Invalid --crc: %d (expected 0 or 1)\n",
-                     arg_crc_enable);
-        return 1;
-    }
-    int arg_crc_load_sidecar = GetIntArg(argc, argv, "--crc-load-sidecar", 0);
-    if (arg_crc_load_sidecar != 0 && arg_crc_load_sidecar != 1) {
-        std::fprintf(stderr,
-                     "Invalid --crc-load-sidecar: %d (expected 0 or 1)\n",
-                     arg_crc_load_sidecar);
-        return 1;
-    }
-    int arg_crc_no_break = GetIntArg(argc, argv, "--crc-no-break", 0);
-    if (arg_crc_no_break != 0 && arg_crc_no_break != 1) {
-        std::fprintf(stderr,
-                     "Invalid --crc-no-break: %d (expected 0 or 1)\n",
-                     arg_crc_no_break);
-        return 1;
-    }
-
-    // CRC parameters
-    float arg_crc_alpha = GetFloatArg(argc, argv, "--crc-alpha", 0.1f);
-    float arg_crc_calib = GetFloatArg(argc, argv, "--crc-calib", 0.7f);
-    float arg_crc_tune  = GetFloatArg(argc, argv, "--crc-tune", 0.2f);
-    std::string arg_crc_solver_str =
-        GetStringArg(argc, argv, "--crc-solver", "brent");
-    CrcCalibrator::Solver arg_crc_solver = CrcCalibrator::Solver::Brent;
-    if (!ParseCrcSolverArg(arg_crc_solver_str, &arg_crc_solver)) {
-        std::fprintf(stderr,
-                     "Invalid --crc-solver: %s (expected brent or discrete_threshold)\n",
-                     arg_crc_solver_str.c_str());
-        return 1;
-    }
-    bool arg_crc_use_stratified_split = false;
-    if (!ParseCrcSplitModeArg(
-            GetStringArg(argc, argv, "--crc-split-mode", "random"),
-            &arg_crc_use_stratified_split)) {
-        std::fprintf(stderr,
-                     "Invalid --crc-split-mode: %s (expected random or stratified)\n",
-                     GetStringArg(argc, argv, "--crc-split-mode", "random").c_str());
-        return 1;
-    }
-    uint32_t arg_crc_split_buckets = static_cast<uint32_t>(
-        GetIntArg(argc, argv, "--crc-split-buckets", 4));
-    if (arg_crc_split_buckets < 2) {
-        arg_crc_split_buckets = 2;
-    }
-    auto arg_crc_robust_seeds =
-        ParseUint64List(GetStringArg(argc, argv, "--crc-robust-seeds", ""));
-
     float arg_override_eps_ip = GetFloatArg(argc, argv, "--override-eps-ip", -1.0f);
     float arg_override_d_k = GetFloatArg(argc, argv, "--override-d-k", -1.0f);
-    int arg_crc_samples = GetIntArg(argc, argv, "--crc-samples", 1000);
+    int arg_calibration_samples =
+        GetIntArg(argc, argv, "--calibration-samples", 1000);
     float arg_safein_dk_percentile =
         GetFloatArg(argc, argv, "--safein-dk-percentile", -1.0f);
     int arg_safein_dk_samples =
@@ -1736,26 +1580,7 @@ int main(int argc, char* argv[]) {
 
     Log("=== VDB E2E Benchmark ===\n");
     Log("Dataset: %s\n", data_dir.c_str());
-    Log("CRC mode: %s\n", arg_crc_enable ? "ON" : "OFF");
-    if (arg_crc_enable) {
-        Log("CRC alpha: %.2f\n", arg_crc_alpha);
-        Log("CRC solver: %s\n", CrcCalibrator::SolverName(arg_crc_solver));
-        Log("CRC samples: %d\n", arg_crc_samples);
-        Log("CRC split mode: %s\n",
-            arg_crc_use_stratified_split ? "stratified" : "random");
-        if (arg_crc_use_stratified_split) {
-            Log("CRC split buckets: %u\n", arg_crc_split_buckets);
-        }
-        if (!arg_crc_robust_seeds.empty()) {
-            std::ostringstream ss;
-            for (size_t i = 0; i < arg_crc_robust_seeds.size(); ++i) {
-                if (i) ss << ",";
-                ss << arg_crc_robust_seeds[i];
-            }
-            Log("CRC robust seeds: %s\n", ss.str().c_str());
-        }
-        Log("CRC no-break: %s\n", arg_crc_no_break ? "ON" : "OFF");
-    }
+    Log("Calibration samples: %d\n", arg_calibration_samples);
     // ================================================================
     // Phase A: Load Data
     // ================================================================
@@ -1935,7 +1760,8 @@ int main(int argc, char* argv[]) {
         cfg.rabitq = {static_cast<uint8_t>(arg_bits),
                       static_cast<uint32_t>(arg_block_size), arg_c_factor};
         cfg.nprobe = static_cast<uint32_t>(std::max(1, arg_nprobe));
-        cfg.calibration_samples = std::min(static_cast<uint32_t>(arg_crc_samples), N);
+        cfg.calibration_samples =
+            std::min(static_cast<uint32_t>(arg_calibration_samples), N);
         cfg.epsilon_samples = static_cast<uint32_t>(arg_epsilon_samples);
         cfg.epsilon_percentile = arg_epsilon_percentile;
         cfg.assignment_factor = static_cast<uint32_t>(arg_assignment_factor);
@@ -1960,7 +1786,6 @@ int main(int argc, char* argv[]) {
         cfg.save_centroids_path = arg_save_centroids;
         cfg.save_assignments_path = arg_save_assignments;
         cfg.save_secondary_assignments_path = arg_save_secondary_assignments;
-        cfg.crc_top_k = GT_K;  // always precompute CRC scores at build time
         cfg.pad_non_power_of_two_to_pow2 = (arg_pad_to_pow2 != 0);
         cfg.use_blocked_hadamard_permuted =
             (arg_blocked_hadamard_permuted != 0);
@@ -2008,7 +1833,7 @@ int main(int argc, char* argv[]) {
     }
 
     // ================================================================
-    // Phase C.5: Open Index + CRC Calibration (from disk)
+    // Phase C.5: Open Index
     // ================================================================
     IvfIndex index;
     s = index.Open(index_dir, arg_direct_io);
@@ -2241,21 +2066,6 @@ int main(int argc, char* argv[]) {
             arg_safein_dk_nprobe);
     }
 
-    CalibrationResults calib_results;
-    std::vector<std::tuple<uint64_t, CalibrationResults, CrcCalibrator::EvalResults>> crc_trials;
-    std::vector<uint64_t> crc_seed_plan;
-    uint64_t crc_selected_seed = static_cast<uint64_t>(arg_seed);
-    double crc_actual_fnr_mean = 0.0;
-    double crc_actual_fnr_std = 0.0;
-    double crc_avg_probed_mean = 0.0;
-    double crc_avg_probed_std = 0.0;
-    double crc_recall10_mean = 0.0;
-    double crc_recall10_std = 0.0;
-    bool crc_loaded = false;
-    bool crc_sidecar_loaded = false;
-    CrcCalibrator::EvalResults crc_eval_results;
-    bool crc_eval_available = false;
-    std::string crc_params_source = "disabled";
     if ((arg_use_resident_clusters != 0) ||
         arg_clu_read_mode == "full_preload") {
         if (!index.segment().resident_preload_enabled()) {
@@ -2263,7 +2073,7 @@ int main(int argc, char* argv[]) {
             auto preload_status = index.segment().PreloadAllClusters();
             if (!preload_status.ok()) {
                 std::fprintf(stderr,
-                             "Failed to preload resident clusters before CRC preparation: %s\n",
+                             "Failed to preload resident clusters: %s\n",
                              preload_status.ToString().c_str());
                 return 1;
             }
@@ -2272,159 +2082,6 @@ int main(int argc, char* argv[]) {
                 static_cast<unsigned long long>(
                     index.segment().resident_preload_bytes()));
         }
-    }
-    if (arg_crc_enable) {
-        Log("\n[Phase C.5] Preparing CRC parameters...\n");
-        auto t_crc_start = std::chrono::steady_clock::now();
-        if (arg_crc_load_sidecar != 0) {
-            const std::string params_path = CrcParamsSidecarPath(index_dir);
-            s = ReadCalibrationResults(params_path, &calib_results);
-            if (!s.ok()) {
-                std::fprintf(stderr,
-                             "CRC legacy sidecar requested but failed to load %s: %s\n",
-                             params_path.c_str(), s.ToString().c_str());
-                return 1;
-            }
-            crc_loaded = true;
-            crc_sidecar_loaded = true;
-            crc_params_source = "sidecar_legacy";
-            double crc_time_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t_crc_start).count();
-            Log("  CRC parameters loaded from legacy sidecar (%.1f ms, sidecar=%s)\n",
-                crc_time_ms, params_path.c_str());
-            Log("  d_min=%.6f  d_max=%.6f  lamhat=%.6f\n",
-                calib_results.d_min, calib_results.d_max, calib_results.lamhat);
-            Log("  kreg=%u  reg_lambda=%.6f\n",
-                calib_results.kreg, calib_results.reg_lambda);
-        } else {
-            std::string scores_path = index_dir + "/crc_scores.bin";
-            std::vector<QueryScores> crc_scores;
-            uint32_t scores_nlist = 0, scores_top_k = 0;
-            s = CrcCalibrator::ReadScores(scores_path, crc_scores,
-                                          scores_nlist, scores_top_k);
-            if (!s.ok()) {
-                std::fprintf(stderr,
-                             "CRC enabled but failed to load precomputed scores from %s: %s\n",
-                             scores_path.c_str(), s.ToString().c_str());
-                return 1;
-            }
-
-            Log("  Loaded %zu queries from %s (nlist=%u, top_k=%u)\n",
-                crc_scores.size(), scores_path.c_str(), scores_nlist, scores_top_k);
-
-            crc_seed_plan = arg_crc_robust_seeds.empty()
-                ? std::vector<uint64_t>{static_cast<uint64_t>(arg_seed)}
-                : arg_crc_robust_seeds;
-
-            double sum_fnr = 0.0;
-            double sum_probed = 0.0;
-            double sum_recall10 = 0.0;
-
-            for (uint64_t seed : crc_seed_plan) {
-                CrcCalibrator::Config crc_cfg;
-                crc_cfg.alpha = arg_crc_alpha;
-                crc_cfg.top_k = scores_top_k;
-                crc_cfg.calib_ratio = arg_crc_calib;
-                crc_cfg.tune_ratio = arg_crc_tune;
-                crc_cfg.seed = seed;
-                crc_cfg.solver = arg_crc_solver;
-                crc_cfg.use_stratified_split = arg_crc_use_stratified_split;
-                crc_cfg.split_buckets = arg_crc_split_buckets;
-
-                Log("  CRC calibrating with seed=%llu...\n",
-                    static_cast<unsigned long long>(seed));
-                auto t_seed_start = std::chrono::steady_clock::now();
-                auto [cal, eval] = CrcCalibrator::Calibrate(
-                    crc_cfg, crc_scores, scores_nlist);
-                double seed_time_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t_seed_start).count();
-                crc_trials.emplace_back(seed, cal, eval);
-                crc_loaded = true;
-                crc_eval_available = crc_eval_available || eval.test_size > 0;
-
-                sum_fnr += eval.actual_fnr;
-                sum_probed += eval.avg_probed;
-                sum_recall10 += eval.recall_at_10;
-
-                Log("  CRC seed=%llu result (%.1f ms): lamhat=%.6f  FNR=%.4f  avg_probed=%.1f  recall@10=%.4f  test=%u\n",
-                    static_cast<unsigned long long>(seed),
-                    seed_time_ms, cal.lamhat, eval.actual_fnr,
-                    eval.avg_probed, eval.recall_at_10, eval.test_size);
-            }
-
-            crc_actual_fnr_mean = sum_fnr / crc_seed_plan.size();
-            crc_avg_probed_mean = sum_probed / crc_seed_plan.size();
-            crc_recall10_mean = sum_recall10 / crc_seed_plan.size();
-
-            if (crc_trials.size() == 1) {
-                crc_eval_results = std::get<2>(crc_trials[0]);
-                calib_results = std::get<1>(crc_trials[0]);
-                crc_selected_seed = std::get<0>(crc_trials[0]);
-                crc_params_source = "runtime_calibrated";
-            } else {
-                // pick by best recall@10 first, then minimum avg_probed.
-                size_t best_idx = 0;
-                for (size_t i = 1; i < crc_trials.size(); ++i) {
-                    const auto& cur_eval = std::get<2>(crc_trials[i]);
-                    const auto& best_eval = std::get<2>(crc_trials[best_idx]);
-                    if (cur_eval.recall_at_10 > best_eval.recall_at_10 + 1e-9f ||
-                        (std::fabs(cur_eval.recall_at_10 - best_eval.recall_at_10) <= 1e-9f &&
-                         cur_eval.avg_probed < best_eval.avg_probed)) {
-                        best_idx = i;
-                    }
-                }
-                crc_eval_results = std::get<2>(crc_trials[best_idx]);
-                calib_results = std::get<1>(crc_trials[best_idx]);
-                crc_selected_seed = std::get<0>(crc_trials[best_idx]);
-                crc_params_source = "runtime_calibrated_robust";
-                uint64_t best_seed = std::get<0>(crc_trials[best_idx]);
-                Log("  CRC robust selection picks seed=%llu as final params\n",
-                    static_cast<unsigned long long>(best_seed));
-            }
-
-            if (!crc_seed_plan.empty()) {
-                double ss_fnr = 0.0;
-                double ss_probed = 0.0;
-                double ss_recall10 = 0.0;
-                for (const auto& rec : crc_trials) {
-                    const auto& e = std::get<2>(rec);
-                    ss_fnr += (e.actual_fnr - crc_actual_fnr_mean) *
-                              (e.actual_fnr - crc_actual_fnr_mean);
-                    ss_probed += (e.avg_probed - crc_avg_probed_mean) *
-                                 (e.avg_probed - crc_avg_probed_mean);
-                    ss_recall10 +=
-                        (e.recall_at_10 - crc_recall10_mean) *
-                        (e.recall_at_10 - crc_recall10_mean);
-                }
-                double inv = 1.0 / static_cast<double>(crc_trials.size());
-                crc_actual_fnr_std = std::sqrt(ss_fnr * inv);
-                crc_avg_probed_std = std::sqrt(ss_probed * inv);
-                crc_recall10_std = std::sqrt(ss_recall10 * inv);
-            }
-
-            double crc_time_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t_crc_start).count();
-            Log("  CRC parameters runtime-calibrated (%.1f ms, source=%s)\n",
-                crc_time_ms, crc_params_source.c_str());
-            Log("  Robust aggregation: seed_count=%zu, actual_fnr_mean=%.4f±%.4f, avg_probed_mean=%.1f±%.1f, recall@10_mean=%.4f±%.4f\n",
-                crc_seed_plan.size(), crc_actual_fnr_mean, crc_actual_fnr_std,
-                crc_avg_probed_mean, crc_avg_probed_std,
-                crc_recall10_mean, crc_recall10_std);
-            Log("  d_min=%.6f  d_max=%.6f  lamhat=%.6f\n",
-                calib_results.d_min, calib_results.d_max, calib_results.lamhat);
-            Log("  kreg=%u  reg_lambda=%.6f\n",
-                calib_results.kreg, calib_results.reg_lambda);
-            Log("  eval: FNR=%.4f  avg_probed=%.1f  test_size=%u\n",
-                crc_eval_results.actual_fnr, crc_eval_results.avg_probed, crc_eval_results.test_size);
-            Log("  eval: recall@1=%.4f  @5=%.4f  @10=%.4f\n",
-                crc_eval_results.recall_at_1, crc_eval_results.recall_at_5, crc_eval_results.recall_at_10);
-            Log("  solver: %s  candidates=%u  objective_evals=%u  profile_build=%.3f ms  solver_ms=%.3f ms\n",
-                CrcCalibrator::SolverName(crc_eval_results.solver_used),
-                crc_eval_results.candidate_count, crc_eval_results.objective_evals,
-                crc_eval_results.profile_build_ms, crc_eval_results.solver_ms);
-        }
-    } else {
-        Log("\n[Phase C.5] Skipped CRC parameter preparation (--crc 0)\n");
     }
 
     // ================================================================
@@ -2482,7 +2139,7 @@ int main(int argc, char* argv[]) {
     SearchConfig search_cfg;
     search_cfg.top_k = GT_K;
     search_cfg.nprobe = static_cast<uint32_t>(arg_nprobe);
-    search_cfg.early_stop = (arg_early_stop != 0);
+    search_cfg.enable_dynamic_safeout = (arg_dynamic_safeout != 0);
     search_cfg.prefetch_depth = static_cast<uint32_t>(
         GetIntArg(argc, argv, "--prefetch-depth", 16));
     search_cfg.io_queue_depth = static_cast<uint32_t>(arg_io_queue_depth);
@@ -2503,10 +2160,6 @@ int main(int argc, char* argv[]) {
     search_cfg.enable_fine_grained_timing = (arg_fine_grained_timing != 0);
     search_cfg.enable_hotpath_detailed_timing =
         (arg_hotpath_detailed_timing != 0);
-    search_cfg.crc_params = crc_loaded ? &calib_results : nullptr;
-    search_cfg.crc_no_break = (arg_crc_no_break != 0);
-    search_cfg.initial_prefetch = static_cast<uint32_t>(
-        GetIntArg(argc, argv, "--initial-prefetch", 16));
     search_cfg.refill_threshold = static_cast<uint32_t>(
         GetIntArg(argc, argv, "--refill-threshold", 4));
     search_cfg.refill_count = static_cast<uint32_t>(
@@ -2666,9 +2319,9 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Single round: CRC early stop + dynamic SafeOut
+    // Single round: fixed nprobe + dynamic SafeOut
     auto [qresults, metrics] = RunQueryRound(
-        arg_cold ? "HOT" : "CRC", index, cluster_reader, data_reader.get(), search_cfg,
+        arg_cold ? "HOT" : "FIXED", index, cluster_reader, data_reader.get(), search_cfg,
         qry_emb.data.data(), Q, dim, qry_ids_vec, gt_topk, gt_dists, !skip_gt);
 
     // ================================================================
@@ -2763,6 +2416,8 @@ int main(int argc, char* argv[]) {
         metrics.avg_io_wait, metrics.avg_cpu, metrics.avg_coarse_select,
         metrics.avg_coarse_score, metrics.avg_coarse_topn, metrics.avg_probe);
     Log("  avg_probed_clusters=%.1f\n", metrics.avg_probed_clusters);
+    Log("  dynamic_safeout_enabled=%d\n",
+        search_cfg.enable_dynamic_safeout ? 1 : 0);
     Log("  fine_grained_timing=%d\n", search_cfg.enable_fine_grained_timing ? 1 : 0);
     Log("  hotpath_detailed_timing=%d\n",
         search_cfg.enable_hotpath_detailed_timing ? 1 : 0);
@@ -2816,8 +2471,7 @@ int main(int argc, char* argv[]) {
     Log("  false_safeout=%.2f  false_safein_upper=%.1f  total_safein=%lu\n",
         metrics.avg_false_safeout, metrics.avg_false_safein_upper,
         static_cast<unsigned long>(metrics.total_final_safein));
-    Log("  early_stop=%.1f%%  avg_skipped=%.1f  overlap=%.4f\n",
-        metrics.early_pct * 100, metrics.avg_skipped, metrics.overlap_ratio);
+    Log("  overlap=%.4f\n", metrics.overlap_ratio);
 
     // ================================================================
     // Phase F: Output JSON
@@ -2882,7 +2536,8 @@ int main(int argc, char* argv[]) {
         f << "  \"search_config\": {\n";
         f << "    " << JInt("top_k", search_cfg.top_k) << ",\n";
         f << "    " << JInt("nprobe", search_cfg.nprobe) << ",\n";
-        f << "    " << JBool("early_stop", search_cfg.early_stop) << ",\n";
+        f << "    " << JBool("dynamic_safeout_enabled",
+                             search_cfg.enable_dynamic_safeout) << ",\n";
         f << "    " << JInt("prefetch_depth", search_cfg.prefetch_depth) << ",\n";
         f << "    " << JInt("io_queue_depth", search_cfg.io_queue_depth) << ",\n";
         f << "    " << JInt("fixed_vec_buffer_count", search_cfg.fixed_vec_buffer_count) << ",\n";
@@ -2922,25 +2577,6 @@ int main(int argc, char* argv[]) {
                                  : (search_cfg.enable_fine_grained_timing
                                         ? "fine_grained_diagnostic"
                                         : "low_overhead_coarse_split")) << "\n";
-        f << "  },\n";
-        f << "  \"crc_config\": {\n";
-        f << "    " << JBool("enabled", arg_crc_enable != 0) << ",\n";
-        f << "    " << JBool("load_sidecar_legacy", arg_crc_load_sidecar != 0) << ",\n";
-        f << "    " << JBool("no_break", arg_crc_no_break != 0) << ",\n";
-        f << "    " << JStr("solver", CrcCalibrator::SolverName(arg_crc_solver)) << ",\n";
-        f << "    " << JStr("split_mode", arg_crc_use_stratified_split ? "stratified" : "random") << ",\n";
-        f << "    " << JNum("split_buckets", arg_crc_split_buckets) << ",\n";
-        f << "    " << JNum("alpha", arg_crc_alpha) << ",\n";
-        f << "    " << JNum("calib_ratio", arg_crc_calib) << ",\n";
-        f << "    " << JNum("tune_ratio", arg_crc_tune) << ",\n";
-        f << "    " << JNum("seed_count", crc_seed_plan.size()) << ",\n";
-        f << "    \"seed_list\": [";
-        for (size_t i = 0; i < crc_seed_plan.size(); ++i) {
-            if (i > 0) f << ",";
-            f << crc_seed_plan[i];
-        }
-        f << "],\n";
-        f << "    " << JInt("seed", arg_seed) << "\n";
         f << "  },\n";
         f << "  \"runtime_index\": {\n";
         f << "    " << JNum("loaded_eps_ip", loaded_eps_ip) << ",\n";
@@ -3158,7 +2794,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_submit_calls", metrics.avg_submit_calls) << ",\n";
         f << "    " << JNum("avg_submit_window_flushes", metrics.avg_submit_window_flushes) << ",\n";
         f << "    " << JNum("avg_submit_window_tail_flushes", metrics.avg_submit_window_tail_flushes) << ",\n";
-        f << "    " << JNum("avg_submit_stop_flushes", metrics.avg_submit_stop_flushes) << ",\n";
         f << "    " << JNum("avg_submit_window_requests", metrics.avg_submit_window_requests) << ",\n";
         f << "    " << JNum("avg_vec_only_read_requests", metrics.avg_vec_only_read_requests) << ",\n";
         f << "    " << JNum("avg_all_read_requests", metrics.avg_all_read_requests) << ",\n";
@@ -3167,21 +2802,18 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_fixed_vec_buffer_misses", metrics.avg_fixed_vec_buffer_misses) << ",\n";
         f << "    " << JNum("avg_probed_clusters", metrics.avg_probed_clusters) << ",\n";
         f << "    " << JNum("avg_candidate_batches_per_cluster", metrics.avg_candidate_batches_per_cluster) << ",\n";
-        f << "    " << JNum("avg_crc_estimates_buffered_per_cluster", metrics.avg_crc_estimates_buffered_per_cluster) << ",\n";
-        f << "    " << JNum("avg_crc_estimates_merged_per_cluster", metrics.avg_crc_estimates_merged_per_cluster) << ",\n";
+        f << "    " << JNum("avg_safeout_frontier_estimates_buffered_per_cluster", metrics.avg_safeout_frontier_estimates_buffered_per_cluster) << ",\n";
+        f << "    " << JNum("avg_safeout_frontier_estimates_merged_per_cluster", metrics.avg_safeout_frontier_estimates_merged_per_cluster) << ",\n";
+        f << "    " << JNum("avg_safeout_frontier_updates_per_cluster", metrics.avg_safeout_frontier_updates_per_cluster) << ",\n";
         f << "    " << JNum("avg_stage2_block_lookups", metrics.avg_stage2_block_lookups) << ",\n";
         f << "    " << JNum("avg_stage2_block_reuses", metrics.avg_stage2_block_reuses) << ",\n";
-        f << "    " << JNum("avg_crc_decision_ms", metrics.avg_crc_decision_ms) << ",\n";
-        f << "    " << JNum("avg_crc_buffer_ms", metrics.avg_crc_buffer_ms) << ",\n";
-        f << "    " << JNum("avg_crc_merge_ms", metrics.avg_crc_merge_ms) << ",\n";
-        f << "    " << JNum("avg_crc_online_ms", metrics.avg_crc_online_ms) << ",\n";
-        f << "    " << JNum("avg_crc_would_stop", metrics.avg_crc_would_stop) << ",\n";
+        f << "    " << JNum("avg_safeout_frontier_buffer_ms", metrics.avg_safeout_frontier_buffer_ms) << ",\n";
+        f << "    " << JNum("avg_safeout_frontier_merge_ms", metrics.avg_safeout_frontier_merge_ms) << ",\n";
+        f << "    " << JNum("avg_safeout_frontier_online_ms", metrics.avg_safeout_frontier_online_ms) << ",\n";
         f << "    " << JNum("avg_candidates_buffered", metrics.avg_candidates_buffered) << ",\n";
         f << "    " << JNum("avg_candidates_reranked", metrics.avg_candidates_reranked) << ",\n";
         f << "    " << JNum("avg_safein_payload_prefetched", metrics.avg_safein_payload_prefetched) << ",\n";
         f << "    " << JNum("avg_remaining_payload_fetches", metrics.avg_remaining_payload_fetches) << ",\n";
-        f << "    " << JNum("early_stopped_pct", metrics.early_pct) << ",\n";
-        f << "    " << JNum("avg_clusters_skipped", metrics.avg_skipped) << ",\n";
         f << "    " << JNum("overlap_ratio", metrics.overlap_ratio) << "\n";
         f << "  },\n";
 
@@ -3282,109 +2914,21 @@ int main(int argc, char* argv[]) {
             f << "      " << JInt("submit_calls", qr.submit_calls) << ",\n";
             f << "      " << JInt("submit_window_flushes", qr.submit_window_flushes) << ",\n";
             f << "      " << JInt("submit_window_tail_flushes", qr.submit_window_tail_flushes) << ",\n";
-            f << "      " << JInt("submit_stop_flushes", qr.submit_stop_flushes) << ",\n";
             f << "      " << JInt("vec_only_read_requests", qr.vec_only_read_requests) << ",\n";
             f << "      " << JInt("all_read_requests", qr.all_read_requests) << ",\n";
             f << "      " << JInt("payload_read_requests", qr.payload_read_requests) << ",\n";
             f << "      " << JInt("fixed_vec_buffer_hits", qr.fixed_vec_buffer_hits) << ",\n";
             f << "      " << JInt("fixed_vec_buffer_misses", qr.fixed_vec_buffer_misses) << ",\n";
             f << "      " << JNum("submit_window_requests", qr.submit_window_requests) << ",\n";
-            f << "      " << JNum("crc_decision_ms", qr.crc_decision_ms) << ",\n";
-            f << "      " << JNum("crc_buffer_ms", qr.crc_buffer_ms) << ",\n";
-            f << "      " << JNum("crc_merge_ms", qr.crc_merge_ms) << ",\n";
-            f << "      " << JNum("crc_online_ms", qr.crc_online_ms) << ",\n";
-            f << "      " << JInt("crc_would_stop", qr.crc_would_stop) << ",\n";
+            f << "      " << JNum("safeout_frontier_buffer_ms", qr.safeout_frontier_buffer_ms) << ",\n";
+            f << "      " << JNum("safeout_frontier_merge_ms", qr.safeout_frontier_merge_ms) << ",\n";
+            f << "      " << JNum("safeout_frontier_online_ms", qr.safeout_frontier_online_ms) << ",\n";
             f << "      " << JNum("stage2_block_lookups", qr.stage2_block_lookups) << ",\n";
             f << "      " << JNum("stage2_block_reuses", qr.stage2_block_reuses) << ",\n";
-            f << "      " << JInt("probed_clusters", qr.probed_clusters) << ",\n";
-            f << "      " << JBool("early_stopped", qr.early_stopped) << ",\n";
-            f << "      " << JInt("clusters_skipped", qr.clusters_skipped) << "\n";
+            f << "      " << JInt("probed_clusters", qr.probed_clusters) << "\n";
             f << "    }";
         }
-        f << "\n  ],\n";
-
-        // CRC calibration
-        f << "  \"crc_calibration\": {\n";
-        f << "    " << JBool("loaded", crc_loaded) << ",\n";
-        f << "    " << JBool("loaded_from_sidecar", crc_sidecar_loaded) << ",\n";
-        f << "    " << JStr("params_source", crc_params_source) << ",\n";
-        f << "    " << JStr("split_mode", arg_crc_use_stratified_split ? "stratified" : "random") << ",\n";
-        f << "    " << JNum("seed_count", crc_trials.empty() ? 0 : crc_trials.size()) << ",\n";
-        f << "    " << JNum("crc_seed_mean_actual_fnr", crc_actual_fnr_mean) << ",\n";
-        f << "    " << JNum("crc_seed_std_actual_fnr", crc_actual_fnr_std) << ",\n";
-        f << "    " << JNum("crc_seed_mean_avg_probed", crc_avg_probed_mean) << ",\n";
-        f << "    " << JNum("crc_seed_std_avg_probed", crc_avg_probed_std) << ",\n";
-        f << "    " << JNum("crc_seed_mean_recall_at_10", crc_recall10_mean) << ",\n";
-        f << "    " << JNum("crc_seed_std_recall_at_10", crc_recall10_std) << ",\n";
-        f << "    " << JStr("solver", CrcCalibrator::SolverName(crc_eval_results.solver_used)) << ",\n";
-        f << "    " << JNum("alpha", arg_crc_alpha) << ",\n";
-        f << "    " << JNum("calib_ratio", arg_crc_calib) << ",\n";
-        f << "    " << JNum("tune_ratio", arg_crc_tune) << ",\n";
-        f << "    " << JNum("selected_seed", crc_selected_seed) << ",\n";
-        f << "    " << JNum("d_min", calib_results.d_min) << ",\n";
-        f << "    " << JNum("d_max", calib_results.d_max) << ",\n";
-        f << "    " << JNum("lamhat", calib_results.lamhat) << ",\n";
-        f << "    " << JInt("kreg", calib_results.kreg) << ",\n";
-        f << "    " << JNum("reg_lambda", calib_results.reg_lambda) << ",\n";
-        f << "    " << JBool("eval_available", crc_eval_available) << ",\n";
-        f << "    " << JNum("eval_actual_fnr", crc_eval_results.actual_fnr) << ",\n";
-        f << "    " << JNum("eval_avg_probed", crc_eval_results.avg_probed) << ",\n";
-        f << "    " << JNum("eval_recall_at_1", crc_eval_results.recall_at_1) << ",\n";
-        f << "    " << JNum("eval_recall_at_5", crc_eval_results.recall_at_5) << ",\n";
-        f << "    " << JNum("eval_recall_at_10", crc_eval_results.recall_at_10) << ",\n";
-        f << "    " << JInt("eval_test_size", crc_eval_results.test_size) << ",\n";
-        f << "    " << JInt("candidate_count", crc_eval_results.candidate_count) << ",\n";
-        f << "    " << JInt("objective_evals", crc_eval_results.objective_evals) << ",\n";
-        f << "    " << JNum("profile_build_ms", crc_eval_results.profile_build_ms) << ",\n";
-        f << "    " << JNum("solver_ms", crc_eval_results.solver_ms) << "\n";
-        f << "  }\n";
-
-        f << "}\n";
-    }
-
-    if (arg_crc_enable) {
-        std::ofstream f(CrcRunCalibrationPath(output_dir));
-        f << "{\n";
-        f << "  " << JStr("params_source", crc_params_source) << ",\n";
-        f << "  " << JBool("loaded_from_sidecar", crc_sidecar_loaded) << ",\n";
-        f << "  " << JStr("solver", CrcCalibrator::SolverName(crc_eval_results.solver_used)) << ",\n";
-        f << "  " << JStr("split_mode", arg_crc_use_stratified_split ? "stratified" : "random") << ",\n";
-        f << "  " << JNum("seed_count", crc_trials.empty() ? 0 : crc_trials.size()) << ",\n";
-        f << "  \"seed_list\": [";
-        for (size_t i = 0; i < crc_seed_plan.size(); ++i) {
-            if (i) f << ",";
-            f << crc_seed_plan[i];
-        }
-        f << "],\n";
-        f << "  " << JNum("selected_seed", crc_selected_seed) << ",\n";
-        f << "  " << JNum("seed_agg_actual_fnr_mean", crc_actual_fnr_mean) << ",\n";
-        f << "  " << JNum("seed_agg_actual_fnr_std", crc_actual_fnr_std) << ",\n";
-        f << "  " << JNum("seed_agg_avg_probed_mean", crc_avg_probed_mean) << ",\n";
-        f << "  " << JNum("seed_agg_avg_probed_std", crc_avg_probed_std) << ",\n";
-        f << "  " << JNum("seed_agg_recall10_mean", crc_recall10_mean) << ",\n";
-        f << "  " << JNum("seed_agg_recall10_std", crc_recall10_std) << ",\n";
-        f << "  " << JNum("alpha", arg_crc_alpha) << ",\n";
-        f << "  " << JNum("calib_ratio", arg_crc_calib) << ",\n";
-        f << "  " << JNum("tune_ratio", arg_crc_tune) << ",\n";
-        f << "  " << JNum("seed", crc_selected_seed) << ",\n";
-        f << "  " << JNum("d_min", calib_results.d_min) << ",\n";
-        f << "  " << JNum("d_max", calib_results.d_max) << ",\n";
-        f << "  " << JNum("lamhat", calib_results.lamhat) << ",\n";
-        f << "  " << JInt("kreg", calib_results.kreg) << ",\n";
-        f << "  " << JNum("reg_lambda", calib_results.reg_lambda) << ",\n";
-        f << "  \"eval\": {\n";
-        f << "    " << JBool("available", crc_eval_available) << ",\n";
-        f << "    " << JNum("actual_fnr", crc_eval_results.actual_fnr) << ",\n";
-        f << "    " << JNum("avg_probed", crc_eval_results.avg_probed) << ",\n";
-        f << "    " << JNum("recall_at_1", crc_eval_results.recall_at_1) << ",\n";
-        f << "    " << JNum("recall_at_5", crc_eval_results.recall_at_5) << ",\n";
-        f << "    " << JNum("recall_at_10", crc_eval_results.recall_at_10) << ",\n";
-        f << "    " << JInt("test_size", crc_eval_results.test_size) << ",\n";
-        f << "    " << JInt("candidate_count", crc_eval_results.candidate_count) << ",\n";
-        f << "    " << JInt("objective_evals", crc_eval_results.objective_evals) << ",\n";
-        f << "    " << JNum("profile_build_ms", crc_eval_results.profile_build_ms) << ",\n";
-        f << "    " << JNum("solver_ms", crc_eval_results.solver_ms) << "\n";
-        f << "  }\n";
+        f << "\n  ]\n";
         f << "}\n";
     }
 

@@ -12,7 +12,7 @@ vdb_enable_target_avx512(bench_ivf_quality)
 
 # ----- E2E Benchmark -----
 add_executable(bench_e2e bench_e2e.cpp rabitq_bench_calibration.cpp)
-target_link_libraries(bench_e2e PRIVATE vdb_query vdb_io vdb_crc)
+target_link_libraries(bench_e2e PRIVATE vdb_query vdb_io)
 vdb_enable_target_avx512(bench_e2e)
 
 # ----- Offline SafeIn d_k samples generator -----
@@ -45,11 +45,6 @@ add_executable(migrate_cluster_clu_packedsign migrate_cluster_clu_packedsign.cpp
 target_link_libraries(migrate_cluster_clu_packedsign PRIVATE vdb_storage)
 vdb_enable_target_avx512(migrate_cluster_clu_packedsign)
 
-# ----- Recompute CRC scores for an existing index -----
-add_executable(recompute_crc_scores recompute_crc_scores.cpp)
-target_link_libraries(recompute_crc_scores PRIVATE vdb_index vdb_io vdb_crc)
-vdb_enable_target_avx512(recompute_crc_scores)
-
 # ----- RaBitQ Accuracy Benchmark -----
 add_executable(bench_rabitq_accuracy bench_rabitq_accuracy.cpp)
 target_link_libraries(bench_rabitq_accuracy PRIVATE vdb_index vdb_io)
@@ -59,16 +54,6 @@ vdb_enable_target_avx512(bench_rabitq_accuracy)
 add_executable(bench_conann_recall bench_conann_recall.cpp)
 target_link_libraries(bench_conann_recall PRIVATE vdb_index vdb_io)
 vdb_enable_target_avx512(bench_conann_recall)
-
-# ----- ConANN CRC Benchmark -----
-add_executable(bench_conann_crc bench_conann_crc.cpp)
-target_link_libraries(bench_conann_crc PRIVATE vdb_crc vdb_index vdb_io)
-vdb_enable_target_avx512(bench_conann_crc)
-
-# ----- CRC Overlap Integration Benchmark -----
-add_executable(bench_crc_overlap bench_crc_overlap.cpp)
-target_link_libraries(bench_crc_overlap PRIVATE vdb_crc vdb_index vdb_io)
-vdb_enable_target_avx512(bench_crc_overlap)
 
 # ----- RaBitQ Diagnostic Benchmark -----
 add_executable(bench_rabitq_diagnostic bench_rabitq_diagnostic.cpp)
@@ -95,28 +80,11 @@ vdb_enable_target_avx512(bench_phase_a_grid)
 
 # ----- Vector Search Benchmark -----
 add_executable(bench_vector_search bench_vector_search.cpp rabitq_bench_calibration.cpp)
-target_link_libraries(bench_vector_search PRIVATE vdb_query vdb_crc vdb_index vdb_io)
+target_link_libraries(bench_vector_search PRIVATE vdb_query vdb_index vdb_io)
 vdb_enable_target_avx512(bench_vector_search)
 if(VDB_USE_MKL)
     target_link_libraries(bench_vector_search PRIVATE mkl)
 endif()
 if(OpenMP_CXX_FOUND)
     target_link_libraries(bench_vector_search PRIVATE OpenMP::OpenMP_CXX)
-endif()
-
-# ----- Vector Search Benchmark (frozen inline baseline) -----
-# Baseline version preserved for comparison against the library-path refactor.
-# Change: vector-search-lib-unification (Phase 0.5).
-# This target is frozen at the state of three completed optimizations:
-#   encoder-mbit-fast-quantize + eps-calibration-simd + calibration-omp-parallel
-# It is NOT actively maintained; if library API changes break it, apply only
-# the minimal fix required to restore compilation, or mark as deprecated.
-add_executable(bench_vector_search_inline bench_vector_search_inline.cpp)
-target_link_libraries(bench_vector_search_inline PRIVATE vdb_crc vdb_index vdb_io)
-vdb_enable_target_avx512(bench_vector_search_inline)
-if(VDB_USE_MKL)
-    target_link_libraries(bench_vector_search_inline PRIVATE mkl)
-endif()
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(bench_vector_search_inline PRIVATE OpenMP::OpenMP_CXX)
 endif()

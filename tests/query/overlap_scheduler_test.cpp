@@ -76,36 +76,34 @@ class OverlapSchedulerTest : public ::testing::Test {
         return all;
     }
 
-    std::pair<float, float> ReplaceMaxErrorEntryAndReadState() {
+    float BuildUpperBoundFrontier() {
         PreadFallbackReader reader;
         SearchConfig config;
         config.top_k = 3;
         config.nprobe = kNprobe;
+        config.enable_dynamic_safeout = true;
         OverlapScheduler scheduler(*index_, reader, config);
 
         scheduler.est_top_k_ = 3;
-        scheduler.est_heap_ = {
-            {3.0f, 10.0f},
-            {2.0f, 2.0f},
-            {1.0f, 1.0f},
-        };
-        std::make_heap(scheduler.est_heap_.begin(), scheduler.est_heap_.end());
-        scheduler.est_heap_upper_frontier_ =
-            scheduler.est_heap_.front().distance + 10.0f;
+        scheduler.AddSafeOutFrontierEstimate({1.0f, 100.0f});  // U=101, low d_hat
+        scheduler.AddSafeOutFrontierEstimate({2.0f, 0.0f});    // U=2
+        scheduler.AddSafeOutFrontierEstimate({3.0f, 0.0f});    // U=3
+        scheduler.AddSafeOutFrontierEstimate({4.0f, 0.0f});    // U=4 replaces U=101
+        return scheduler.SafeOutFrontierUpper();
+    }
 
-        const OverlapScheduler::EstimateHeapEntry replacement{0.5f, 3.0f};
-        std::pop_heap(scheduler.est_heap_.begin(), scheduler.est_heap_.end());
-        scheduler.est_heap_.back() = replacement;
-        std::push_heap(scheduler.est_heap_.begin(), scheduler.est_heap_.end());
+    float ReadUnfilledUpperBoundFrontier() {
+        PreadFallbackReader reader;
+        SearchConfig config;
+        config.top_k = 3;
+        config.nprobe = kNprobe;
+        config.enable_dynamic_safeout = true;
+        OverlapScheduler scheduler(*index_, reader, config);
 
-        float max_error = 0.0f;
-        for (const auto& entry : scheduler.est_heap_) {
-            max_error = std::max(max_error, entry.error_bound);
-        }
-
-        scheduler.est_heap_upper_frontier_ =
-            scheduler.est_heap_.front().distance + max_error;
-        return {max_error, scheduler.est_heap_upper_frontier_};
+        scheduler.est_top_k_ = 3;
+        scheduler.AddSafeOutFrontierEstimate({2.0f, 0.0f});
+        scheduler.AddSafeOutFrontierEstimate({3.0f, 0.0f});
+        return scheduler.SafeOutFrontierUpper();
     }
 
     fs::path test_dir_;
@@ -113,11 +111,16 @@ class OverlapSchedulerTest : public ::testing::Test {
     std::unique_ptr<IvfIndex> index_;
 };
 
-TEST_F(OverlapSchedulerTest, EstimateHeapReplacementRecomputesMaxError) {
-    const auto [max_error, frontier] = ReplaceMaxErrorEntryAndReadState();
+TEST_F(OverlapSchedulerTest, SafeOutFrontierUsesTopKUpperBound) {
+    const float frontier = BuildUpperBoundFrontier();
 
-    EXPECT_FLOAT_EQ(max_error, 3.0f);
-    EXPECT_FLOAT_EQ(frontier, 5.0f);
+    EXPECT_FLOAT_EQ(frontier, 4.0f);
+}
+
+TEST_F(OverlapSchedulerTest, SafeOutFrontierIsInfinityUntilHeapFull) {
+    const float frontier = ReadUnfilledUpperBoundFrontier();
+
+    EXPECT_TRUE(std::isinf(frontier));
 }
 
 TEST_F(OverlapSchedulerTest, EndToEnd_PreadFallback) {
@@ -126,7 +129,6 @@ TEST_F(OverlapSchedulerTest, EndToEnd_PreadFallback) {
     config.top_k = kTopK;
     config.nprobe = kNprobe;
     config.probe_batch_size = 64;
-    config.early_stop = false;
 
     OverlapScheduler scheduler(*index_, reader, config);
 
@@ -186,7 +188,6 @@ TEST_F(OverlapSchedulerTest, StageUncertainStatsRemainConsistent) {
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
-    config.early_stop = false;
 
     OverlapScheduler scheduler(*index_, reader, config);
 
@@ -205,6 +206,45 @@ TEST_F(OverlapSchedulerTest, StageUncertainStatsRemainConsistent) {
     } else {
         EXPECT_EQ(stats.total_uncertain, stats.s1_uncertain_raw);
     }
+}
+
+TEST_F(OverlapSchedulerTest, DynamicSafeOutWorksWithoutExternalStopParams) {
+    PreadFallbackReader reader;
+    SearchConfig config;
+    config.top_k = 1;
+    config.nprobe = kNprobe;
+    config.enable_dynamic_safeout = true;
+    config.safeout_epsilon_override = 0.0f;
+
+    OverlapScheduler scheduler(*index_, reader, config);
+    const float* query = vectors_.data();
+    auto results = scheduler.Search(query);
+    const auto& stats = results.stats();
+
+    ASSERT_GT(results.size(), 0u);
+    EXPECT_GT(stats.total_safeout_frontier_estimates_buffered, 0u);
+    EXPECT_GT(stats.total_safeout_frontier_updates, 0u);
+    EXPECT_GT(stats.total_safe_out + stats.s2_safe_out, 0u);
+}
+
+TEST_F(OverlapSchedulerTest, DynamicSafeOutDoesNotBufferFrontierWhenDisabled) {
+    PreadFallbackReader reader;
+
+    SearchConfig config;
+    config.top_k = 1;
+    config.nprobe = kNprobe;
+    config.enable_dynamic_safeout = false;
+    config.safeout_epsilon_override = 0.0f;
+
+    OverlapScheduler scheduler(*index_, reader, config);
+    const float* query = vectors_.data();
+    auto results = scheduler.Search(query);
+    const auto& stats = results.stats();
+
+    ASSERT_GT(results.size(), 0u);
+    EXPECT_EQ(stats.total_safeout_frontier_estimates_buffered, 0u);
+    EXPECT_EQ(stats.total_safeout_frontier_updates, 0u);
+    EXPECT_EQ(stats.total_safe_out + stats.s2_safe_out, 0u);
 }
 
 TEST_F(OverlapSchedulerTest, DetailedHotpathTiming_PopulatesStats) {
@@ -265,7 +305,6 @@ TEST_F(OverlapSchedulerTest, IoUringFixedVecBufferCountCanEnableFixedHits) {
     config.nprobe = kNprobe;
     config.clu_read_mode = CluReadMode::FullPreload;
     config.use_resident_clusters = true;
-    config.early_stop = false;
     config.io_queue_depth = 16;
     config.fixed_vec_buffer_count = 2;
 
@@ -297,7 +336,6 @@ TEST_F(OverlapSchedulerTest, PrefetchConfig_SmallDepth) {
     config.prefetch_depth = 4;
     config.refill_threshold = 1;
     config.refill_count = 1;
-    config.early_stop = false;
 
     OverlapScheduler scheduler(*index_, reader, config);
 
@@ -326,7 +364,6 @@ TEST_F(OverlapSchedulerTest, PrefetchDepth_ExceedsNprobe) {
     config.prefetch_depth = 100;  // >> nprobe=4
     config.refill_threshold = 2;
     config.refill_count = 2;
-    config.early_stop = false;
 
     OverlapScheduler scheduler(*index_, reader, config);
 
@@ -352,7 +389,6 @@ TEST_F(OverlapSchedulerTest, MultipleQueries_StateReset) {
     config.top_k = kTopK;
     config.nprobe = kNprobe;
     config.prefetch_depth = 4;
-    config.early_stop = false;
 
     OverlapScheduler scheduler(*index_, reader, config);
 
@@ -373,7 +409,7 @@ TEST_F(OverlapSchedulerTest, MultipleQueries_StateReset) {
     }
 }
 
-TEST_F(OverlapSchedulerTest, MultipleQueriesWithEarlyStopEnabled) {
+TEST_F(OverlapSchedulerTest, MultipleQueriesUseFixedProbePath) {
     PreadFallbackReader reader;
     SearchConfig config;
     config.top_k = kTopK;
@@ -381,7 +417,6 @@ TEST_F(OverlapSchedulerTest, MultipleQueriesWithEarlyStopEnabled) {
     config.prefetch_depth = 4;
     config.refill_threshold = 2;
     config.refill_count = 2;
-    config.early_stop = true;
 
     OverlapScheduler scheduler(*index_, reader, config);
 
@@ -404,7 +439,6 @@ TEST_F(OverlapSchedulerTest, SubmitBatchingAndReservePopulateStats) {
     config.io_queue_depth = 32;
     config.cluster_submit_reserve = 4;
     config.submit_batch_size = 8;
-    config.early_stop = false;
 
     OverlapScheduler scheduler(*index_, reader, config);
 
@@ -431,7 +465,6 @@ TEST_F(OverlapSchedulerTest, SharedAndIsolatedModesProduceSameResults) {
     config.io_queue_depth = 32;
     config.cluster_submit_reserve = 4;
     config.submit_batch_size = 8;
-    config.early_stop = false;
 
     std::vector<float> query(kDim, 0.0f);
     query[0] = 1.0f;
@@ -462,7 +495,6 @@ TEST_F(OverlapSchedulerTest, WindowAndFullPreloadModesProduceSameResults) {
     config.io_queue_depth = 32;
     config.cluster_submit_reserve = 4;
     config.submit_batch_size = 8;
-    config.early_stop = false;
 
     std::vector<float> query(kDim, 0.0f);
     query[0] = 1.0f;
@@ -522,7 +554,6 @@ TEST_F(OverlapSchedulerTest, RedundantAssignmentDeduplicatesBeforeRerank) {
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
-    config.early_stop = false;
 
     OverlapScheduler scheduler(ra_index, reader, config);
     const float* query = vectors_.data();
@@ -570,7 +601,6 @@ TEST_F(OverlapSchedulerTest, RairAssignmentDeduplicatesBeforeRerank) {
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
-    config.early_stop = false;
 
     OverlapScheduler scheduler(ra_index, reader, config);
     const float* query = vectors_.data();

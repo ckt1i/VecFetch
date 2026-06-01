@@ -1,5 +1,6 @@
 #include "rabitq_bench_calibration.h"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -12,7 +13,7 @@ namespace bench {
 namespace {
 
 struct ToyCalibrationData {
-    Dim dim = 8;
+    Dim dim = 64;
     std::vector<float> vectors;
     std::vector<float> centroids;
     std::vector<std::vector<uint32_t>> cluster_members;
@@ -118,6 +119,39 @@ TEST(EpsilonCalibrationSamplingTest, ParsesSamplingMode) {
 
     auto invalid = ParseEpsilonSamplingModeArg("bad_mode");
     EXPECT_FALSE(invalid.ok());
+}
+
+TEST(SafeInDkCalibrationTest, GeneratesExactQueryToBaseKthSamples) {
+    const Dim dim = 1;
+    std::vector<float> queries = {1.0f, 6.0f};
+    std::vector<float> base = {0.0f, 10.0f, 20.0f};
+
+    auto samples = GenerateExactSafeInDkSamples(
+        queries.data(), 2, base.data(), 3, dim, 2, 2, 42,
+        SafeInDkSamplingMode::Unique);
+    std::sort(samples.begin(), samples.end());
+
+    ASSERT_EQ(samples.size(), 2u);
+    EXPECT_FLOAT_EQ(samples[0], 36.0f);
+    EXPECT_FLOAT_EQ(samples[1], 81.0f);
+}
+
+TEST(SafeInDkCalibrationTest, CalibratesExactDkWithConannPercentileRule) {
+    const Dim dim = 1;
+    std::vector<float> queries = {1.0f, 6.0f};
+    std::vector<float> base = {0.0f, 10.0f, 20.0f};
+
+    const float threshold = CalibrateExactSafeInDk(
+        queries.data(), 2, base.data(), 3, dim, 2, 2, 0.90f, 42);
+
+    EXPECT_FLOAT_EQ(threshold, 36.0f);
+}
+
+TEST(SafeInDkCalibrationTest, NamesThresholdSources) {
+    EXPECT_STREQ(SafeInThresholdSourceName(SafeInThresholdSource::ExactL2),
+                 "exact_l2");
+    EXPECT_STREQ(SafeInThresholdSourceName(SafeInThresholdSource::RabitqS2Kth),
+                 "rabitq_s2_kth");
 }
 
 }  // namespace

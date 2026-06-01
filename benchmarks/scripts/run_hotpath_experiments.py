@@ -6,8 +6,8 @@ benchmark binary, collects `results.json` from each run, and optionally wraps
 each run in `perf stat` via the existing shell helper.
 
 The current default matrix is the hot-path experiment plan v1:
-- fixed-probe baseline (`nprobe=64`, CRC enabled, early-stop disabled)
-- CRC early-stop baseline (`nprobe=256`, CRC enabled, `crc-alpha=0.02`)
+- fixed-probe baseline (`nprobe=64`)
+- fixed-probe submit batching controls
 
 The intent is to keep the benchmark binary unchanged while making it easy to
 compare baseline and currently-supported control runs in a single pass.
@@ -57,7 +57,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bits", type=int, default=4)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--run-perf", action="store_true", help="Wrap each run with perf stat")
-    p.add_argument("--skip-crc", action="store_true", help="Run with --crc 0")
     p.add_argument(
         "--mode",
         choices=("legacy-baseline", "legacy-baseline-only", "plan-v1", "plan-v1-baselines"),
@@ -92,10 +91,6 @@ def build_matrix(args: argparse.Namespace) -> List[RunSpec]:
         legacy_common = common + [
             "--nprobe",
             str(args.nprobe),
-            "--early-stop",
-            "0",
-            "--crc",
-            "0" if args.skip_crc else "1",
         ]
         matrix = [
             RunSpec(
@@ -141,20 +136,6 @@ def build_matrix(args: argparse.Namespace) -> List[RunSpec]:
     fixed_probe = common + [
         "--nprobe",
         "64",
-        "--early-stop",
-        "0",
-        "--crc",
-        "1",
-    ]
-    crc_early_stop = common + [
-        "--nprobe",
-        "256",
-        "--early-stop",
-        "1",
-        "--crc",
-        "1",
-        "--crc-alpha",
-        "0.02",
     ]
 
     matrix = [
@@ -162,12 +143,6 @@ def build_matrix(args: argparse.Namespace) -> List[RunSpec]:
             "fixed-probe-baseline",
             fixed_probe,
             profile="fixed_probe_baseline",
-            stage2_breakdown_mode="low_overhead_or_unmeasured",
-        ),
-        RunSpec(
-            "crc-early-stop-baseline",
-            crc_early_stop,
-            profile="crc_early_stop_baseline",
             stage2_breakdown_mode="low_overhead_or_unmeasured",
         ),
     ]
@@ -275,9 +250,6 @@ def main() -> int:
                 "stage2_breakdown_mode": spec.stage2_breakdown_mode,
                 "repeat": repeat,
                 "nprobe": int(arg_value(spec.extra_args, "--nprobe", str(args.nprobe))),
-                "early_stop": int(arg_value(spec.extra_args, "--early-stop", "0")),
-                "crc": int(arg_value(spec.extra_args, "--crc", "1")),
-                "crc_alpha": float(arg_value(spec.extra_args, "--crc-alpha", "0.1")),
                 "submit_batch": int(arg_value(spec.extra_args, "--submit-batch", "-1")),
                 "submit_online": int(arg_value(spec.extra_args, "--submit-online", "0")),
                 "stage2_block_first": int(arg_value(spec.extra_args, "--stage2-block-first", "1")),
@@ -304,16 +276,9 @@ def main() -> int:
                 "submit_window_tail_flushes": pipeline.get(
                     "avg_submit_window_tail_flushes", 0.0
                 ),
-                "submit_stop_flushes": pipeline.get("avg_submit_stop_flushes", 0.0),
                 "submit_window_requests": pipeline.get("avg_submit_window_requests", 0.0),
                 "avg_probed_clusters": pipeline.get("avg_probed_clusters", 0.0),
                 "avg_total_probed": pipeline.get("avg_total_probed", 0.0),
-                "early_stopped_pct": pipeline.get("early_stopped_pct", 0.0),
-                "avg_crc_would_stop": pipeline.get("avg_crc_would_stop", 0.0),
-                "avg_crc_decision_ms": pipeline.get("avg_crc_decision_ms", 0.0),
-                "avg_crc_buffer_ms": pipeline.get("avg_crc_buffer_ms", 0.0),
-                "avg_crc_merge_ms": pipeline.get("avg_crc_merge_ms", 0.0),
-                "avg_crc_online_ms": pipeline.get("avg_crc_online_ms", 0.0),
                 "candidate_collect_ms": pipeline.get("avg_candidate_collect_ms", 0.0),
                 "rerank_compute_ms": pipeline.get("avg_rerank_compute_ms", 0.0),
                 "fetch_missing_ms": pipeline.get("avg_fetch_missing_ms", 0.0),
@@ -341,9 +306,6 @@ def main() -> int:
         "stage2_breakdown_mode",
         "repeat",
         "nprobe",
-        "early_stop",
-        "crc",
-        "crc_alpha",
         "submit_batch",
         "submit_online",
         "stage2_block_first",
@@ -364,16 +326,9 @@ def main() -> int:
         "probe_submit_emit_ms",
         "submit_window_flushes",
         "submit_window_tail_flushes",
-        "submit_stop_flushes",
         "submit_window_requests",
         "avg_probed_clusters",
         "avg_total_probed",
-        "early_stopped_pct",
-        "avg_crc_would_stop",
-        "avg_crc_decision_ms",
-        "avg_crc_buffer_ms",
-        "avg_crc_merge_ms",
-        "avg_crc_online_ms",
         "candidate_collect_ms",
         "rerank_compute_ms",
         "fetch_missing_ms",

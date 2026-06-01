@@ -101,7 +101,7 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
       vec_bytes_(index.logical_dim() * sizeof(float)),
       aligned_vec_bytes_((vec_bytes_ + 4095u) & ~4095u),
       est_top_k_(config.top_k),
-      use_crc_(config.crc_params != nullptr),
+      use_dynamic_safeout_(config.enable_dynamic_safeout),
       estimator_(index.dim(), index.segment().rabitq_config().bits),
       prober_(index.conann(), index.dim(),
               index.segment().rabitq_config().bits) {
@@ -113,13 +113,12 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
     }
     query_wrapper_.scratch.quant_query.reserve(index.dim());
     query_wrapper_.scratch.fastscan_lut.reserve(static_cast<size_t>(index.dim()) * 8 + 63);
-    ready_clusters_.reserve(std::max(1u, config_.prefetch_depth + config_.initial_prefetch));
+    ready_clusters_.reserve(std::max(1u, config_.prefetch_depth));
     submitted_candidate_offsets_.Reserve(
         static_cast<size_t>(std::max(1u, config_.nprobe)) * 256);
     resident_scratch_.completions.resize(128);
-    if (use_crc_) {
-        crc_stopper_ = index::CrcStopper(*config.crc_params, index.nlist());
-        est_heap_.reserve(est_top_k_);
+    if (use_dynamic_safeout_) {
+        safeout_frontier_heap_.reserve(est_top_k_);
     }
     // Stage 2: precompute margin divisor from bits
     uint8_t bits = index.segment().rabitq_config().bits;
@@ -141,6 +140,37 @@ OverlapScheduler::~OverlapScheduler() {
     }
 }
 
+bool OverlapScheduler::AddSafeOutFrontierEstimate(
+    const EstimateHeapEntry& estimate) {
+    if (!use_dynamic_safeout_ || est_top_k_ == 0) return false;
+    SafeOutFrontierEntry entry;
+    entry.distance = estimate.distance;
+    entry.error_bound = estimate.error_bound;
+    entry.upper_bound = estimate.distance + estimate.error_bound;
+    if (safeout_frontier_heap_.size() < est_top_k_) {
+        safeout_frontier_heap_.push_back(entry);
+        std::push_heap(safeout_frontier_heap_.begin(),
+                       safeout_frontier_heap_.end());
+        return true;
+    } else if (entry.upper_bound < safeout_frontier_heap_.front().upper_bound) {
+        std::pop_heap(safeout_frontier_heap_.begin(),
+                      safeout_frontier_heap_.end());
+        safeout_frontier_heap_.back() = entry;
+        std::push_heap(safeout_frontier_heap_.begin(),
+                       safeout_frontier_heap_.end());
+        return true;
+    }
+    return false;
+}
+
+float OverlapScheduler::SafeOutFrontierUpper() const {
+    if (!use_dynamic_safeout_ || est_top_k_ == 0 ||
+        safeout_frontier_heap_.size() < est_top_k_) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return safeout_frontier_heap_.front().upper_bound;
+}
+
 SearchResults OverlapScheduler::Search(const float* query_vec) {
     // Reset per-query state
     ready_clusters_.clear();
@@ -151,8 +181,7 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     pending_vec_only_head_ = 0;
     next_to_submit_ = 0;
     inflight_clusters_ = 0;
-    est_heap_.clear();
-    est_heap_upper_frontier_ = 0.0f;
+    safeout_frontier_heap_.clear();
 
     auto t_search_start = std::chrono::steady_clock::now();
     const float* effective_query_vec = query_vec;
@@ -509,36 +538,6 @@ void OverlapScheduler::ProbeResidentThinPath(
                 clusters_since_submit = 0;
             }
         }
-
-        if (config_.early_stop) {
-            if (use_crc_) {
-                float est_kth = (est_heap_.size() >= est_top_k_)
-                    ? est_heap_.front().distance
-                    : std::numeric_limits<float>::infinity();
-                auto t_crc_decision = std::chrono::steady_clock::now();
-                const bool should_stop = crc_stopper_.ShouldStop(
-                    static_cast<uint32_t>(i + 1), est_kth);
-                ctx.stats().crc_decision_ms += std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t_crc_decision).count();
-                if (should_stop) {
-                    ctx.stats().total_crc_would_stop++;
-                    if (!config_.crc_no_break) {
-                        ctx.stats().early_stopped = true;
-                        ctx.stats().clusters_skipped =
-                            static_cast<uint32_t>(sorted_clusters.size() - 1 - i);
-                        ctx.stats().crc_clusters_probed =
-                            static_cast<uint32_t>(i + 1);
-                        break;
-                    }
-                }
-            } else if (ctx.collector().Full() &&
-                       ctx.collector().TopDistance() < index_.conann().d_k()) {
-                ctx.stats().early_stopped = true;
-                ctx.stats().clusters_skipped =
-                    static_cast<uint32_t>(sorted_clusters.size() - 1 - i);
-                break;
-            }
-        }
     }
 
     if (isolated_submission_mode_) {
@@ -825,8 +824,7 @@ void OverlapScheduler::PrefetchClusters(
         return;
     }
     uint32_t initial = std::min(
-        use_crc_ ? config_.initial_prefetch : config_.prefetch_depth,
-        static_cast<uint32_t>(sorted_clusters.size()));
+        config_.prefetch_depth, static_cast<uint32_t>(sorted_clusters.size()));
     for (uint32_t i = 0; i < initial; ++i) {
         SubmitClusterRead(sorted_clusters[i]);
     }
@@ -914,7 +912,8 @@ void OverlapScheduler::DispatchCompletion(
 }
 
 // ============================================================================
-// AsyncIOSink — ProbeResultSink that submits io_uring reads + tracks est_heap
+// AsyncIOSink — submits io_uring reads and buffers candidate estimates for
+// dynamic SafeOut frontier updates.
 // ============================================================================
 
 class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
@@ -925,7 +924,7 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
                       sched.config_.clu_read_mode == CluReadMode::FullPreload &&
                       sched.index_.assignment_mode() == index::AssignmentMode::Single),
           scratch_(sched.submit_scratch_) {
-        crc_estimates_.reserve(256);
+        candidate_estimates_.reserve(256);
     }
 
     void OnCandidates(const index::CandidateBatch& batch) override {
@@ -939,45 +938,28 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
         ScanAndPartitionBatch(batch);
         BuildReadPlans(batch);
 
-        if (sched_.use_crc_ && !crc_estimates_.empty()) {
-            crc_pending_ = true;
+        if (!candidate_estimates_.empty()) {
+            estimates_pending_ = true;
         }
     }
 
     void FinalizeCluster() {
-        if (crc_pending_) {
-            auto t_crc_merge = std::chrono::steady_clock::now();
-            ctx_.stats().total_crc_estimates_merged +=
-                static_cast<uint32_t>(crc_estimates_.size());
-            auto recompute_upper_frontier = [&] {
-                sched_.est_heap_upper_frontier_ = 0.0f;
-                for (const auto& entry : sched_.est_heap_) {
-                    sched_.est_heap_upper_frontier_ =
-                        std::max(sched_.est_heap_upper_frontier_,
-                                 entry.distance + entry.error_bound);
+        if (estimates_pending_) {
+            if (sched_.use_dynamic_safeout_) {
+                auto t_frontier_merge = std::chrono::steady_clock::now();
+                ctx_.stats().total_safeout_frontier_estimates_merged +=
+                    static_cast<uint32_t>(candidate_estimates_.size());
+                for (const auto& estimate : candidate_estimates_) {
+                    if (sched_.AddSafeOutFrontierEstimate(estimate)) {
+                        ctx_.stats().total_safeout_frontier_updates++;
+                    }
                 }
-            };
-            for (const auto& estimate : crc_estimates_) {
-                if (sched_.est_top_k_ == 0) {
-                    continue;
-                }
-                if (sched_.est_heap_.size() < sched_.est_top_k_) {
-                    sched_.est_heap_.push_back(estimate);
-                    std::push_heap(sched_.est_heap_.begin(), sched_.est_heap_.end());
-                    sched_.est_heap_upper_frontier_ =
-                        std::max(sched_.est_heap_upper_frontier_,
-                                 estimate.distance + estimate.error_bound);
-                } else if (estimate.distance < sched_.est_heap_.front().distance) {
-                    std::pop_heap(sched_.est_heap_.begin(), sched_.est_heap_.end());
-                    sched_.est_heap_.back() = estimate;
-                    std::push_heap(sched_.est_heap_.begin(), sched_.est_heap_.end());
-                    recompute_upper_frontier();
-                }
+                ctx_.stats().safeout_frontier_merge_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_frontier_merge).count();
             }
-            crc_pending_ = false;
-            crc_estimates_.clear();
-            ctx_.stats().crc_merge_ms += std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - t_crc_merge).count();
+            estimates_pending_ = false;
+            candidate_estimates_.clear();
         }
     }
 
@@ -1016,12 +998,13 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
             scratch_.unique_indices[idx] = i;
             ctx_.stats().unique_fetch_candidates++;
 
-            if (sched_.use_crc_) {
-                auto t_crc_buffer = std::chrono::steady_clock::now();
-                crc_estimates_.push_back({batch.est_dist[i], batch.est_error[i]});
-                ctx_.stats().total_crc_estimates_buffered++;
-                ctx_.stats().crc_buffer_ms += std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t_crc_buffer).count();
+            if (sched_.use_dynamic_safeout_) {
+                auto t_estimate_buffer = std::chrono::steady_clock::now();
+                candidate_estimates_.push_back({batch.est_dist[i], batch.est_error[i]});
+                const double buffer_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_estimate_buffer).count();
+                ctx_.stats().total_safeout_frontier_estimates_buffered++;
+                ctx_.stats().safeout_frontier_buffer_ms += buffer_ms;
             }
 
             const bool use_vec_all =
@@ -1067,8 +1050,8 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
     int dat_fd_;
     bool skip_dedup_ = false;
     SubmitScratch& scratch_;
-    bool crc_pending_ = false;
-    std::vector<EstimateHeapEntry> crc_estimates_;
+    bool estimates_pending_ = false;
+    std::vector<EstimateHeapEntry> candidate_estimates_;
 };
 
 // ============================================================================
@@ -1134,14 +1117,9 @@ void OverlapScheduler::ProbeCluster(
             prep_timing.quantize_ms + prep_timing.lut_build_ms;
     }
 
-    // safeout_frontier_upper:
-    // - When CRC is disabled, keep +inf to avoid any estimate-driven SafeOut.
-    // - When CRC is enabled and the estimate heap is full, use the largest
-    //   upper bound among the retained estimate top-k entries.
-    float safeout_frontier_upper = std::numeric_limits<float>::infinity();
-    if (use_crc_ && est_heap_.size() >= est_top_k_) {
-        safeout_frontier_upper = est_heap_upper_frontier_;
-    }
+    // Dynamic SafeOut uses a cluster-level snapshot of kth_smallest(d_hat + e),
+    // or +inf when disabled or not enough candidates survived previous clusters.
+    const float safeout_frontier_upper = SafeOutFrontierUpper();
 
     AsyncIOSink sink(*this, ctx, dat_fd);
     index::ProbeStats local_stats;
@@ -1296,7 +1274,6 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
         Hard,
         Soft,
         Tail,
-        StopSensitive,
         Final,
     };
 
@@ -1309,51 +1286,12 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
             reason == PendingFlushReason::Final) {
             ctx.stats().total_submit_window_tail_flushes++;
         }
-        if (reason == PendingFlushReason::StopSensitive) {
-            ctx.stats().total_submit_stop_flushes++;
-        }
         return true;
-    };
-
-    auto force_flush_and_submit = [&](PendingFlushReason reason) {
-        const bool emitted = emit_pending_with_reason(reason);
-        if (isolated_submission_mode_) {
-            flush_isolated_readers(/*force=*/true,
-                                   /*prioritize_cluster_reads=*/false,
-                                   /*vec_batch_ready=*/true);
-        } else {
-            flush_shared_reader(/*force=*/true,
-                                /*prioritize_cluster_reads=*/false,
-                                /*vec_batch_ready=*/true);
-        }
-        return emitted;
-    };
-
-    auto stop_safe_flush = [&]() {
-        force_flush_and_submit(PendingFlushReason::StopSensitive);
     };
 
     auto apply_submit_policy = [&](bool prepared_cluster_reads,
                                    bool final_cluster,
-                                   bool stop_sensitive,
                                    uint32_t remaining_clusters) {
-        if (stop_sensitive) {
-            stop_safe_flush();
-            if (prepared_cluster_reads) {
-                if (isolated_submission_mode_) {
-                    flush_isolated_readers(/*force=*/true,
-                                           /*prioritize_cluster_reads=*/true,
-                                           /*vec_batch_ready=*/true);
-                } else {
-                    flush_shared_reader(/*force=*/true,
-                                        /*prioritize_cluster_reads=*/true,
-                                        /*vec_batch_ready=*/true);
-                }
-            }
-            clusters_since_data_submit = 0;
-            return;
-        }
-
         const uint32_t pending = PendingDataRequestCount();
         uint32_t dynamic_flush_threshold = vec_flush_threshold;
         uint32_t dynamic_interval_limit = kSubmitIntervalLimit;
@@ -1465,56 +1403,6 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
             ready_clusters_.erase(cid);
         }
 
-        // Early stop
-        if (config_.early_stop) {
-            if (use_crc_) {
-                stop_safe_flush();
-                // CRC early stop: use RaBitQ estimate heap distance
-                float est_kth = (est_heap_.size() >= est_top_k_)
-                    ? est_heap_.front().distance
-                    : std::numeric_limits<float>::infinity();
-                auto t_crc_decision = std::chrono::steady_clock::now();
-                const bool should_stop = crc_stopper_.ShouldStop(
-                    static_cast<uint32_t>(i + 1), est_kth);
-                ctx.stats().crc_decision_ms += std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - t_crc_decision).count();
-                if (should_stop) {
-                    ctx.stats().total_crc_would_stop++;
-                    if (!config_.crc_no_break) {
-                        ctx.stats().early_stopped = true;
-                        ctx.stats().clusters_skipped =
-                            static_cast<uint32_t>(sorted_clusters.size() - 1 - i);
-                        ctx.stats().crc_clusters_probed =
-                            static_cast<uint32_t>(i + 1);
-                        stop_safe_flush();
-                        if (isolated_submission_mode_) {
-                            drain_completions(data_reader_, /*wait_for_one=*/false);
-                            drain_completions(cluster_reader_, /*wait_for_one=*/false);
-                        } else {
-                            drain_completions(cluster_reader_, /*wait_for_one=*/false);
-                        }
-                        break;
-                    }
-                }
-            } else {
-                // Legacy early stop: exact L2 collector vs static d_k
-                if (ctx.collector().Full() &&
-                    ctx.collector().TopDistance() < index_.conann().d_k()) {
-                    ctx.stats().early_stopped = true;
-                    ctx.stats().clusters_skipped =
-                        static_cast<uint32_t>(sorted_clusters.size() - 1 - i);
-                    stop_safe_flush();
-                    if (isolated_submission_mode_) {
-                        drain_completions(data_reader_, /*wait_for_one=*/false);
-                        drain_completions(cluster_reader_, /*wait_for_one=*/false);
-                    } else {
-                        drain_completions(cluster_reader_, /*wait_for_one=*/false);
-                    }
-                    break;
-                }
-            }
-        }
-
         // 4. Sliding window refill — cluster reads are prepared first, then
         // coalesced with vec reads into a single submit when possible.
         bool prepared_cluster_reads = false;
@@ -1538,7 +1426,6 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
         const uint32_t pending_before_policy = PendingDataRequestCount();
         apply_submit_policy(prepared_cluster_reads,
                             final_cluster,
-                            /*stop_sensitive=*/false,
                             static_cast<uint32_t>(sorted_clusters.size() - 1 - i));
         if (config_.enable_online_submit_tuning) {
             const float alpha = std::clamp(config_.submit_ema_alpha, 0.0f, 1.0f);

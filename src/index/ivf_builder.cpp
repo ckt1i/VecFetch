@@ -19,7 +19,6 @@
 #include "superkmeans/hierarchical_superkmeans.h"
 
 #include "vdb/index/conann.h"
-#include "vdb/index/crc_calibrator.h"
 #include "vdb/index/faiss_coarse_builder.h"
 #include "vdb/io/vecs_reader.h"
 #include "vdb/rabitq/rabitq_encoder.h"
@@ -1140,68 +1139,6 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
     }
     auto payload_schemas_vec = fbb.CreateVector(ps_offsets);
 
-    // --- Phase E: CRC score precomputation (optional) ---
-    flatbuffers::Offset<vdb::schema::CrcParams> crc_params_offset;
-    if (config_.crc_top_k > 0 && config_.calibration_queries != nullptr &&
-        config_.num_calibration_queries > 0) {
-        // Build ClusterData for CRC score computation.
-        // Flatten RaBitQCode objects into contiguous byte blocks.
-        const uint32_t num_words = (dim + 63) / 64;
-        const uint32_t entry_size = num_words * sizeof(uint64_t) +
-                                    sizeof(float) + sizeof(uint32_t);
-
-        std::vector<std::vector<uint8_t>> flat_codes(K);
-        std::vector<std::vector<uint32_t>> cluster_ids(K);
-        std::vector<ClusterData> crc_clusters(K);
-
-        for (uint32_t k = 0; k < K; ++k) {
-            const auto& members = cluster_members[k];
-            uint32_t n_members = static_cast<uint32_t>(members.size());
-
-            // Build flat code block
-            flat_codes[k].resize(static_cast<size_t>(n_members) * entry_size);
-            for (uint32_t m = 0; m < n_members; ++m) {
-                uint8_t* dst = flat_codes[k].data() +
-                               static_cast<size_t>(m) * entry_size;
-                const auto& code = all_codes[k][m];
-                std::memcpy(dst, code.code.data(),
-                            num_words * sizeof(uint64_t));
-                std::memcpy(dst + num_words * sizeof(uint64_t),
-                            &code.norm, sizeof(float));
-                std::memcpy(dst + num_words * sizeof(uint64_t) + sizeof(float),
-                            &code.sum_x, sizeof(uint32_t));
-            }
-
-            // Build global IDs
-            cluster_ids[k].resize(n_members);
-            for (uint32_t m = 0; m < n_members; ++m) {
-                cluster_ids[k][m] = members[m];
-            }
-
-            crc_clusters[k].vectors = nullptr;  // not needed for RaBitQ scoring
-            crc_clusters[k].ids = cluster_ids[k].data();
-            crc_clusters[k].count = n_members;
-            crc_clusters[k].codes_block = flat_codes[k].data();
-            crc_clusters[k].code_entry_size = entry_size;
-        }
-
-        // Compute QueryScores for all calibration queries
-        auto crc_scores = CrcCalibrator::ComputeScoresRaBitQ(
-            config_.calibration_queries, config_.num_calibration_queries,
-            dim, centroids_.data(), K, crc_clusters,
-            config_.crc_top_k, rotation);
-
-        // Serialize to crc_scores.bin
-        s = CrcCalibrator::WriteScores(
-            output_dir + "/crc_scores.bin", crc_scores, K, config_.crc_top_k);
-        if (!s.ok()) return s;
-
-        // Build FlatBuffers CrcParams
-        auto sf = fbb.CreateString("crc_scores.bin");
-        crc_params_offset = vdb::schema::CreateCrcParams(
-            fbb, sf, config_.num_calibration_queries, config_.crc_top_k);
-    }
-
     // SegmentMeta (use builder pattern to include payload_schemas)
     vdb::schema::SegmentMetaBuilder smb(fbb);
     smb.add_segment_id(config_.segment_id);
@@ -1213,9 +1150,6 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
     smb.add_ivf_params(ivf_params);
     smb.add_rabitq_params(rabitq_params);
     smb.add_conann_params(conann_params);
-    if (crc_params_offset.o) {
-        smb.add_crc_params(crc_params_offset);
-    }
     smb.add_clusters(clusters_vec);
     smb.add_payload_schemas(payload_schemas_vec);
     auto seg = smb.Finish();

@@ -5,8 +5,7 @@ This directory now contains a thin experiment harness for `bench_e2e`.
 ## What It Runs
 
 - The default matrix is the hot-path experiment plan v1:
-  - `fixed-probe-baseline`: `nprobe=64`, `--crc 1`, `--early-stop 0`
-  - `crc-early-stop-baseline`: `nprobe=256`, `--crc 1`, `--early-stop 1`, `--crc-alpha 0.02`
+  - `fixed-probe-baseline`: `nprobe=64`
 - The current plan-v1 control variants also include:
   - `fixed-probe-submit-batch-0`
   - `fixed-probe-submit-batch-32`
@@ -30,7 +29,7 @@ python3 benchmarks/scripts/run_hotpath_experiments.py \
 
 Add `--run-perf` to collect `perf stat` for each run when `perf` is available.
 
-To run only the two official baselines:
+To run only the fixed-probe baseline:
 
 ```bash
 python3 benchmarks/scripts/run_hotpath_experiments.py \
@@ -55,7 +54,7 @@ The CSV now also records:
 - experiment profile and Stage2 breakdown mode
 - `avg_probe_submit_ms` plus submit-window fields
 - `avg_probe_stage2_ms` plus Stage2 collect/kernel/scatter fields
-- CRC-path observability such as `avg_probed_clusters`, `early_stopped_pct`, and `avg_crc_would_stop`
+- fixed-probe observability such as `avg_probed_clusters` and `avg_total_probed`
 
 ## Interpretation
 
