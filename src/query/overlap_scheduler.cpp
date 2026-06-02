@@ -102,6 +102,8 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
       aligned_vec_bytes_((vec_bytes_ + 4095u) & ~4095u),
       est_top_k_(config.top_k),
       use_dynamic_safeout_(config.enable_dynamic_safeout),
+      use_dynamic_safein_(config.dynamic_safein_mode != DynamicSafeInMode::Static),
+      use_estimate_frontier_(use_dynamic_safeout_ || use_dynamic_safein_),
       estimator_(index.dim(), index.segment().rabitq_config().bits),
       prober_(index.conann(), index.dim(),
               index.segment().rabitq_config().bits) {
@@ -117,8 +119,17 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
     submitted_candidate_offsets_.Reserve(
         static_cast<size_t>(std::max(1u, config_.nprobe)) * 256);
     resident_scratch_.completions.resize(128);
-    if (use_dynamic_safeout_) {
+    if (use_estimate_frontier_) {
         safeout_frontier_heap_.reserve(est_top_k_);
+        safein_frontier_heap_.reserve(est_top_k_);
+    }
+    if (config_.dynamic_safein_defer_initial_clusters > 0 ||
+        config_.dynamic_safein_defer_until_ready) {
+        const uint32_t reserve_deferred =
+            config_.dynamic_safein_defer_max_candidates > 0
+                ? config_.dynamic_safein_defer_max_candidates
+                : std::max(256u, config_.nprobe * 64u);
+        deferred_safein_plans_.reserve(reserve_deferred);
     }
     // Stage 2: precompute margin divisor from bits
     uint8_t bits = index.segment().rabitq_config().bits;
@@ -142,7 +153,7 @@ OverlapScheduler::~OverlapScheduler() {
 
 bool OverlapScheduler::AddSafeOutFrontierEstimate(
     const EstimateHeapEntry& estimate) {
-    if (!use_dynamic_safeout_ || est_top_k_ == 0) return false;
+    if (!use_estimate_frontier_ || est_top_k_ == 0) return false;
     SafeOutFrontierEntry entry;
     entry.distance = estimate.distance;
     entry.error_bound = estimate.error_bound;
@@ -163,12 +174,247 @@ bool OverlapScheduler::AddSafeOutFrontierEstimate(
     return false;
 }
 
+bool OverlapScheduler::AddSafeInFrontierEstimate(float lower_bound) {
+    if (!use_estimate_frontier_ || est_top_k_ == 0 ||
+        !std::isfinite(lower_bound)) {
+        return false;
+    }
+    SafeInFrontierEntry entry;
+    entry.lower_bound = lower_bound;
+    if (safein_frontier_heap_.size() < est_top_k_) {
+        safein_frontier_heap_.push_back(entry);
+        std::push_heap(safein_frontier_heap_.begin(),
+                       safein_frontier_heap_.end());
+        return true;
+    } else if (entry.lower_bound < safein_frontier_heap_.front().lower_bound) {
+        std::pop_heap(safein_frontier_heap_.begin(),
+                      safein_frontier_heap_.end());
+        safein_frontier_heap_.back() = entry;
+        std::push_heap(safein_frontier_heap_.begin(),
+                       safein_frontier_heap_.end());
+        return true;
+    }
+    return false;
+}
+
 float OverlapScheduler::SafeOutFrontierUpper() const {
-    if (!use_dynamic_safeout_ || est_top_k_ == 0 ||
+    if (!use_estimate_frontier_ || est_top_k_ == 0 ||
         safeout_frontier_heap_.size() < est_top_k_) {
         return std::numeric_limits<float>::infinity();
     }
     return safeout_frontier_heap_.front().upper_bound;
+}
+
+float OverlapScheduler::SafeInFrontierLower() const {
+    if (!use_estimate_frontier_ || est_top_k_ == 0 ||
+        safein_frontier_heap_.size() < est_top_k_) {
+        return std::numeric_limits<float>::infinity();
+    }
+    return safein_frontier_heap_.front().lower_bound;
+}
+
+float OverlapScheduler::DynamicSafeInReferenceFrontier() const {
+    switch (config_.dynamic_safein_mode) {
+        case DynamicSafeInMode::Static:
+        case DynamicSafeInMode::Frontier:
+            return SafeInFrontierLower();
+    }
+    return SafeInFrontierLower();
+}
+
+void OverlapScheduler::UpdateDynamicSafeInState(SearchContext& ctx,
+                                                bool advance_probe) {
+    if (!use_dynamic_safein_) return;
+
+    const bool was_ready = dynamic_safein_ready_;
+    if (advance_probe) {
+        ++dynamic_safein_probes_seen_;
+    }
+    const float frontier = DynamicSafeInReferenceFrontier();
+    dynamic_safein_current_frontier_ = frontier;
+
+    if (std::isfinite(frontier)) {
+        if (std::isfinite(dynamic_safein_last_frontier_)) {
+            const float diff = std::abs(frontier - dynamic_safein_last_frontier_);
+            const float denom = std::max(std::abs(dynamic_safein_last_frontier_), 1e-12f);
+            const float rel = diff / denom;
+            if (diff <= config_.dynamic_safein_abs_tol ||
+                rel <= config_.dynamic_safein_rel_tol) {
+                ++dynamic_safein_stable_count_;
+            } else {
+                dynamic_safein_stable_count_ = 1;
+            }
+        } else {
+            dynamic_safein_stable_count_ = 1;
+        }
+        dynamic_safein_last_frontier_ = frontier;
+    } else {
+        dynamic_safein_stable_count_ = 0;
+    }
+
+    const bool has_frontier = std::isfinite(frontier);
+    const bool min_probe_ready =
+        dynamic_safein_probes_seen_ >= config_.dynamic_safein_min_probes;
+    const bool stable_ready =
+        dynamic_safein_stable_count_ >=
+        std::max<uint32_t>(1u, config_.dynamic_safein_stable_probes);
+
+    switch (config_.dynamic_safein_mode) {
+        case DynamicSafeInMode::Static:
+            dynamic_safein_ready_ = true;
+            break;
+        case DynamicSafeInMode::Frontier:
+            dynamic_safein_ready_ =
+                has_frontier && min_probe_ready && stable_ready;
+            break;
+    }
+
+    if (!was_ready && dynamic_safein_ready_) {
+        ctx.stats().dynamic_safein_ready_transitions++;
+    }
+}
+
+float OverlapScheduler::SafeInThresholdForProbe() const {
+    const float static_threshold = index_.conann().safein_d_k();
+    if (!use_dynamic_safein_ ||
+        config_.dynamic_safein_mode == DynamicSafeInMode::Static) {
+        return static_threshold;
+    }
+
+    const float disabled = -std::numeric_limits<float>::infinity();
+
+    switch (config_.dynamic_safein_mode) {
+        case DynamicSafeInMode::Static:
+            return static_threshold;
+        case DynamicSafeInMode::Frontier:
+            return dynamic_safein_ready_ &&
+                std::isfinite(dynamic_safein_current_frontier_)
+                    ? dynamic_safein_current_frontier_
+                    : disabled;
+    }
+    return static_threshold;
+}
+
+void OverlapScheduler::RecordDynamicSafeInStats(SearchContext& ctx,
+                                                float threshold,
+                                                float frontier) const {
+    if (!use_dynamic_safein_) return;
+
+    auto& stats = ctx.stats();
+    stats.dynamic_safein_clusters++;
+    if (std::isfinite(frontier)) {
+        stats.dynamic_safein_frontier_samples++;
+        stats.dynamic_safein_frontier_sum += frontier;
+        stats.dynamic_safein_final_frontier = frontier;
+    }
+    if (std::isfinite(threshold)) {
+        stats.dynamic_safein_active_clusters++;
+        stats.dynamic_safein_threshold_samples++;
+        stats.dynamic_safein_threshold_sum += threshold;
+        stats.dynamic_safein_final_threshold = threshold;
+        if (std::abs(threshold - index_.conann().safein_d_k()) > 1e-6f) {
+            stats.dynamic_safein_threshold_changed_clusters++;
+        }
+    } else {
+        stats.dynamic_safein_disabled_clusters++;
+    }
+}
+
+bool OverlapScheduler::ShouldDeferSafeInPlans() const {
+    if (!use_dynamic_safein_) return false;
+    if (config_.dynamic_safein_defer_initial_clusters == 0 &&
+        !config_.dynamic_safein_defer_until_ready) {
+        return false;
+    }
+    if (config_.dynamic_safein_defer_max_candidates > 0 &&
+        deferred_safein_plans_.size() >= config_.dynamic_safein_defer_max_candidates) {
+        return false;
+    }
+    if (config_.dynamic_safein_defer_initial_clusters > 0 &&
+        dynamic_safein_probes_seen_ <= config_.dynamic_safein_defer_initial_clusters) {
+        return true;
+    }
+    if (dynamic_safein_small_pool_extra_defer_ &&
+        config_.dynamic_safein_defer_initial_clusters > 0 &&
+        dynamic_safein_probes_seen_ <=
+            config_.dynamic_safein_defer_initial_clusters + 1) {
+        return true;
+    }
+    if (config_.dynamic_safein_defer_until_ready && !dynamic_safein_ready_) {
+        return true;
+    }
+    return false;
+}
+
+bool OverlapScheduler::ShouldHoldDeferredSafeInPlans() {
+    if (!use_dynamic_safein_) return false;
+    if (deferred_safein_plans_.empty()) return false;
+    if (config_.dynamic_safein_defer_initial_clusters > 0 &&
+        dynamic_safein_probes_seen_ <
+            config_.dynamic_safein_defer_initial_clusters) {
+        return true;
+    }
+    if (config_.dynamic_safein_defer_initial_clusters > 0 &&
+        dynamic_safein_probes_seen_ ==
+            config_.dynamic_safein_defer_initial_clusters) {
+        const uint32_t submit_batch =
+            config_.submit_batch_size == 0 ? 32u : config_.submit_batch_size;
+        const uint32_t small_pool_limit = std::max(128u, submit_batch * 4u);
+        if (deferred_safein_plans_.size() < small_pool_limit) {
+            dynamic_safein_small_pool_extra_defer_ = true;
+            return true;
+        }
+    }
+    if (config_.dynamic_safein_defer_until_ready && !dynamic_safein_ready_) {
+        return true;
+    }
+    dynamic_safein_small_pool_extra_defer_ = false;
+    return false;
+}
+
+void OverlapScheduler::RecordSafeInPrefetchDecision(
+    SearchContext& ctx, bool has_truth, bool is_true_topk) const {
+    auto& stats = ctx.stats();
+    stats.safein_prefetch_candidates++;
+    if (!has_truth) {
+        stats.safein_prefetch_unknown++;
+    } else if (is_true_topk) {
+        stats.safein_prefetch_true_topk++;
+    } else {
+        stats.safein_prefetch_false++;
+    }
+}
+
+void OverlapScheduler::FlushDeferredSafeInPlans(SearchContext& ctx,
+                                                float threshold,
+                                                bool force) {
+    if (deferred_safein_plans_.empty()) return;
+    if (!force && !std::isfinite(threshold)) return;
+
+    const bool threshold_active = std::isfinite(threshold);
+    for (const auto& plan : deferred_safein_plans_) {
+        const bool use_vec_all =
+            threshold_active &&
+            plan.addr.size <= config_.safein_all_threshold &&
+            plan.safein_upper_bound < threshold;
+        if (use_vec_all) {
+            ReadPlanEntry read;
+            read.type = PendingIO::Type::VEC_ALL;
+            read.addr = plan.addr;
+            read.read_length = plan.addr.size;
+            read.has_truth = plan.has_truth;
+            read.is_true_topk = plan.is_true_topk;
+            pending_all_plans_.push_back(read);
+            ctx.stats().total_submit_window_requests++;
+            ctx.stats().dynamic_safein_deferred_safein++;
+            RecordSafeInPrefetchDecision(ctx, plan.has_truth, plan.is_true_topk);
+        } else {
+            pending_vec_only_plans_.push_back(VecOnlyReadPlan{plan.addr});
+            ctx.stats().total_submit_window_requests++;
+        }
+    }
+    ctx.stats().dynamic_safein_deferred_flushes++;
+    deferred_safein_plans_.clear();
 }
 
 SearchResults OverlapScheduler::Search(const float* query_vec) {
@@ -178,10 +424,19 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     CleanupPendingSlots();
     pending_all_plans_.clear();
     pending_vec_only_plans_.clear();
+    deferred_safein_plans_.clear();
     pending_vec_only_head_ = 0;
     next_to_submit_ = 0;
     inflight_clusters_ = 0;
     safeout_frontier_heap_.clear();
+    safein_frontier_heap_.clear();
+    dynamic_safein_probes_seen_ = 0;
+    dynamic_safein_stable_count_ = 0;
+    dynamic_safein_ready_ = false;
+    dynamic_safein_small_pool_extra_defer_ = false;
+    dynamic_safein_last_frontier_ = std::numeric_limits<float>::infinity();
+    dynamic_safein_current_frontier_ = std::numeric_limits<float>::infinity();
+    dynamic_safein_current_threshold_ = index_.conann().safein_d_k();
 
     auto t_search_start = std::chrono::steady_clock::now();
     const float* effective_query_vec = query_vec;
@@ -539,6 +794,8 @@ void OverlapScheduler::ProbeResidentThinPath(
             }
         }
     }
+
+    FlushDeferredSafeInPlans(ctx, SafeInThresholdForProbe(), /*force=*/true);
 
     if (isolated_submission_mode_) {
         if (PendingDataRequestCount() > 0) {
@@ -918,8 +1175,11 @@ void OverlapScheduler::DispatchCompletion(
 
 class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
  public:
-    AsyncIOSink(OverlapScheduler& sched, SearchContext& ctx, int dat_fd)
+    AsyncIOSink(OverlapScheduler& sched, SearchContext& ctx, int dat_fd,
+                uint32_t cluster_id, float safein_prefetch_threshold)
         : sched_(sched), ctx_(ctx), dat_fd_(dat_fd),
+          cluster_id_(cluster_id),
+          safein_prefetch_threshold_(safein_prefetch_threshold),
           skip_dedup_(sched.config_.use_resident_clusters &&
                       sched.config_.clu_read_mode == CluReadMode::FullPreload &&
                       sched.index_.assignment_mode() == index::AssignmentMode::Single),
@@ -936,7 +1196,11 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
         scratch_.vec_only_count = 0;
 
         ScanAndPartitionBatch(batch);
-        BuildReadPlans(batch);
+        if (sched_.ShouldDeferSafeInPlans()) {
+            BuildDeferredPlans(batch);
+        } else {
+            BuildReadPlans(batch);
+        }
 
         if (!candidate_estimates_.empty()) {
             estimates_pending_ = true;
@@ -945,7 +1209,7 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
 
     void FinalizeCluster() {
         if (estimates_pending_) {
-            if (sched_.use_dynamic_safeout_) {
+            if (sched_.use_estimate_frontier_) {
                 auto t_frontier_merge = std::chrono::steady_clock::now();
                 ctx_.stats().total_safeout_frontier_estimates_merged +=
                     static_cast<uint32_t>(candidate_estimates_.size());
@@ -953,6 +1217,7 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
                     if (sched_.AddSafeOutFrontierEstimate(estimate)) {
                         ctx_.stats().total_safeout_frontier_updates++;
                     }
+                    sched_.AddSafeInFrontierEstimate(estimate.lower_bound);
                 }
                 ctx_.stats().safeout_frontier_merge_ms +=
                     std::chrono::duration<double, std::milli>(
@@ -971,6 +1236,26 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
     }
 
  private:
+    bool CandidateTruth(uint32_t local_idx, bool* is_true_topk) const {
+        if (is_true_topk != nullptr) {
+            *is_true_topk = false;
+        }
+        const auto* members = sched_.config_.false_stats_cluster_members;
+        const auto* truth = sched_.config_.false_stats_true_topk_rows;
+        if (members == nullptr || truth == nullptr ||
+            cluster_id_ >= members->size()) {
+            return false;
+        }
+        const auto& cluster_members = (*members)[cluster_id_];
+        if (local_idx >= cluster_members.size()) {
+            return false;
+        }
+        if (is_true_topk != nullptr) {
+            *is_true_topk = truth->count(cluster_members[local_idx]) != 0;
+        }
+        return true;
+    }
+
     void ScanAndPartitionBatch(const index::CandidateBatch& batch) {
         auto t0 = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < batch.count; ++i) {
@@ -998,9 +1283,10 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
             scratch_.unique_indices[idx] = i;
             ctx_.stats().unique_fetch_candidates++;
 
-            if (sched_.use_dynamic_safeout_) {
+            if (sched_.use_estimate_frontier_) {
                 auto t_estimate_buffer = std::chrono::steady_clock::now();
-                candidate_estimates_.push_back({batch.est_dist[i], batch.est_error[i]});
+                candidate_estimates_.push_back({batch.est_dist[i], batch.est_error[i],
+                                                batch.estimate_lower_bound[i]});
                 const double buffer_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t_estimate_buffer).count();
                 ctx_.stats().total_safeout_frontier_estimates_buffered++;
@@ -1020,17 +1306,40 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
             std::chrono::steady_clock::now() - t0).count();
     }
 
+    void BuildDeferredPlans(const index::CandidateBatch& batch) {
+        for (uint32_t pos = 0; pos < scratch_.unique_count; ++pos) {
+            const uint32_t batch_idx = scratch_.unique_indices[pos];
+            bool is_true_topk = false;
+            const bool has_truth =
+                CandidateTruth(batch.global_idx[batch_idx], &is_true_topk);
+            DeferredSafeInPlan plan;
+            plan.addr = batch.decoded_addr[batch_idx];
+            plan.safein_upper_bound = batch.safein_upper_bound[batch_idx];
+            plan.has_truth = has_truth;
+            plan.is_true_topk = is_true_topk;
+            sched_.deferred_safein_plans_.push_back(plan);
+            ctx_.stats().dynamic_safein_deferred_candidates++;
+        }
+    }
+
     void BuildReadPlans(const index::CandidateBatch& batch) {
         auto all_start = std::chrono::steady_clock::now();
         for (uint32_t pos = 0; pos < scratch_.safein_all_count; ++pos) {
             const uint32_t unique_idx = scratch_.safein_all_indices[pos];
-            const AddressEntry& addr = batch.decoded_addr[scratch_.unique_indices[unique_idx]];
+            const uint32_t batch_idx = scratch_.unique_indices[unique_idx];
+            const AddressEntry& addr = batch.decoded_addr[batch_idx];
+            bool is_true_topk = false;
+            const bool has_truth =
+                CandidateTruth(batch.global_idx[batch_idx], &is_true_topk);
             ReadPlanEntry plan;
             plan.type = PendingIO::Type::VEC_ALL;
             plan.addr = addr;
             plan.read_length = addr.size;
+            plan.has_truth = has_truth;
+            plan.is_true_topk = is_true_topk;
             sched_.pending_all_plans_.push_back(plan);
             ctx_.stats().total_submit_window_requests++;
+            sched_.RecordSafeInPrefetchDecision(ctx_, has_truth, is_true_topk);
         }
         prepare_all_ms_ += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - all_start).count();
@@ -1048,6 +1357,8 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
     OverlapScheduler& sched_;
     SearchContext& ctx_;
     int dat_fd_;
+    uint32_t cluster_id_ = 0;
+    float safein_prefetch_threshold_ = std::numeric_limits<float>::infinity();
     bool skip_dedup_ = false;
     SubmitScratch& scratch_;
     bool estimates_pending_ = false;
@@ -1117,14 +1428,22 @@ void OverlapScheduler::ProbeCluster(
             prep_timing.quantize_ms + prep_timing.lut_build_ms;
     }
 
-    // Dynamic SafeOut uses a cluster-level snapshot of kth_smallest(d_hat + e),
-    // or +inf when disabled or not enough candidates survived previous clusters.
-    const float safeout_frontier_upper = SafeOutFrontierUpper();
+    // Dynamic SafeOut and query-adaptive SafeIn share an estimate frontier
+    // snapshot; SafeOut still stays disabled when its flag is off.
+    const float estimate_frontier_upper = SafeOutFrontierUpper();
+    const float safeout_frontier_upper = use_dynamic_safeout_
+        ? estimate_frontier_upper
+        : std::numeric_limits<float>::infinity();
+    UpdateDynamicSafeInState(ctx, /*advance_probe=*/true);
+    const float safein_prefetch_threshold = SafeInThresholdForProbe();
+    RecordDynamicSafeInStats(ctx, safein_prefetch_threshold,
+                             dynamic_safein_current_frontier_);
 
-    AsyncIOSink sink(*this, ctx, dat_fd);
+    AsyncIOSink sink(*this, ctx, dat_fd, cluster_id, safein_prefetch_threshold);
     index::ProbeStats local_stats;
     auto classify_start = std::chrono::steady_clock::now();
     prober_.Probe(pc, cluster_id, prepared, safeout_frontier_upper,
+                  safein_prefetch_threshold,
                   config_.enable_address_decode_simd,
                   config_.enable_fine_grained_timing,
                   config_.enable_stage1_safein,
@@ -1170,6 +1489,10 @@ void OverlapScheduler::ProbeCluster(
     ctx.stats().stage2_lanes_skipped += local_stats.stage2_lanes_skipped;
     ctx.stats().stage2_lanes_total_valid += local_stats.stage2_lanes_total_valid;
     sink.FinalizeCluster();
+    UpdateDynamicSafeInState(ctx, /*advance_probe=*/false);
+    if (!ShouldHoldDeferredSafeInPlans()) {
+        FlushDeferredSafeInPlans(ctx, SafeInThresholdForProbe(), /*force=*/false);
+    }
     ctx.stats().probe_submit_ms += sink.submit_cpu_ms();
     ctx.stats().probe_submit_prepare_vec_only_ms += sink.prepare_vec_only_ms_;
     ctx.stats().probe_submit_prepare_all_ms += sink.prepare_all_ms_;
@@ -1434,6 +1757,8 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
                 alpha * static_cast<float>(pending_before_policy);
         }
     }
+
+    FlushDeferredSafeInPlans(ctx, SafeInThresholdForProbe(), /*force=*/true);
 
     if (isolated_submission_mode_) {
         emit_pending_with_reason(PendingFlushReason::Final);

@@ -32,6 +32,8 @@ struct CandidateBatch {
     uint32_t global_idx[kMaxCandidates] = {};
     float est_dist[kMaxCandidates] = {};
     float est_error[kMaxCandidates] = {};
+    float estimate_lower_bound[kMaxCandidates] = {};
+    float safein_upper_bound[kMaxCandidates] = {};
     CandidateClass cls[kMaxCandidates] = {};
     AddressEntry decoded_addr[kMaxCandidates] = {};
 };
@@ -119,12 +121,16 @@ class ClusterProber {
     ///                         (safeout_frontier_heap.size() >= top_k)
     ///                           ? kth_smallest(d_hat + e)
     ///                           : +infinity
+    /// @param safein_threshold_base   Active SafeIn threshold center. This is
+    ///                         normally conann.safein_d_k(), but may be lowered
+    ///                         or delayed by query-adaptive prefetch policies.
     /// @param sink           Receives non-SafeOut candidates
     /// @param stats          Accumulated classification statistics
     void Probe(const query::ParsedCluster& pc,
                uint32_t cluster_id,
                const rabitq::PreparedClusterQueryView& view,
                float safeout_frontier_upper,
+               float safein_threshold_base,
                bool enable_address_decode_simd,
                bool enable_fine_grained_timing,
                bool enable_stage1_safein,

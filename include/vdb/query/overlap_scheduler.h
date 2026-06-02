@@ -176,10 +176,19 @@ class OverlapScheduler {
         PendingIO::Type type = PendingIO::Type::VEC_ONLY;
         AddressEntry addr;
         uint32_t read_length = 0;
+        bool has_truth = false;
+        bool is_true_topk = false;
     };
 
     struct VecOnlyReadPlan {
         AddressEntry addr;
+    };
+
+    struct DeferredSafeInPlan {
+        AddressEntry addr;
+        float safein_upper_bound = std::numeric_limits<float>::infinity();
+        bool has_truth = false;
+        bool is_true_topk = false;
     };
 
     using PreparedClusterQueryView = rabitq::PreparedClusterQueryView;
@@ -194,6 +203,7 @@ class OverlapScheduler {
     SubmitScratch submit_scratch_;
     std::deque<ReadPlanEntry> pending_all_plans_;
     std::vector<VecOnlyReadPlan> pending_vec_only_plans_;
+    std::vector<DeferredSafeInPlan> deferred_safein_plans_;
     size_t pending_vec_only_head_ = 0;
     uint32_t next_to_submit_ = 0;
     uint32_t inflight_clusters_ = 0;
@@ -205,6 +215,7 @@ class OverlapScheduler {
     struct EstimateHeapEntry {
         float distance = 0.0f;
         float error_bound = 0.0f;
+        float lower_bound = 0.0f;
 
         bool operator<(const EstimateHeapEntry& other) const {
             return distance < other.distance;
@@ -223,12 +234,45 @@ class OverlapScheduler {
         }
     };
 
+    struct SafeInFrontierEntry {
+        float lower_bound = 0.0f;
+
+        bool operator<(const SafeInFrontierEntry& other) const {
+            return lower_bound < other.lower_bound;
+        }
+    };
+
     std::vector<SafeOutFrontierEntry> safeout_frontier_heap_;
+    std::vector<SafeInFrontierEntry> safein_frontier_heap_;
     uint32_t est_top_k_ = 0;
     bool use_dynamic_safeout_ = true;
+    bool use_dynamic_safein_ = false;
+    bool use_estimate_frontier_ = true;
+
+    uint32_t dynamic_safein_probes_seen_ = 0;
+    uint32_t dynamic_safein_stable_count_ = 0;
+    bool dynamic_safein_ready_ = false;
+    bool dynamic_safein_small_pool_extra_defer_ = false;
+    float dynamic_safein_last_frontier_ = std::numeric_limits<float>::infinity();
+    float dynamic_safein_current_frontier_ = std::numeric_limits<float>::infinity();
+    float dynamic_safein_current_threshold_ = std::numeric_limits<float>::infinity();
 
     bool AddSafeOutFrontierEstimate(const EstimateHeapEntry& estimate);
+    bool AddSafeInFrontierEstimate(float lower_bound);
     float SafeOutFrontierUpper() const;
+    float SafeInFrontierLower() const;
+    float DynamicSafeInReferenceFrontier() const;
+    void UpdateDynamicSafeInState(SearchContext& ctx, bool advance_probe);
+    float SafeInThresholdForProbe() const;
+    void RecordDynamicSafeInStats(SearchContext& ctx, float threshold,
+                                  float frontier) const;
+    bool ShouldDeferSafeInPlans() const;
+    bool ShouldHoldDeferredSafeInPlans();
+    void RecordSafeInPrefetchDecision(SearchContext& ctx,
+                                      bool has_truth,
+                                      bool is_true_topk) const;
+    void FlushDeferredSafeInPlans(SearchContext& ctx, float threshold,
+                                  bool force);
 
     // Stage 2 ExRaBitQ re-classification
     float margin_s2_divisor_ = 1.0f;  // 2^(bits-1), precomputed

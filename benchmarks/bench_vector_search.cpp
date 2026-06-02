@@ -129,6 +129,48 @@ static bool ParseSafeInDkSpaceArg(const std::string& value,
 static const char* SafeInDkSpaceName(SafeInDkSpace space) {
     return space == SafeInDkSpace::RabitqS2 ? "rabitq_s2" : "exact_l2";
 }
+static bool ParseDynamicSafeInModeArg(const std::string& value,
+                                      DynamicSafeInMode* out) {
+    if (value == "static" || value == "off") {
+        *out = DynamicSafeInMode::Static;
+        return true;
+    }
+    if (value == "frontier") {
+        *out = DynamicSafeInMode::Frontier;
+        return true;
+    }
+    return false;
+}
+static const char* DynamicSafeInModeName(DynamicSafeInMode mode) {
+    switch (mode) {
+        case DynamicSafeInMode::Static:
+            return "static";
+        case DynamicSafeInMode::Frontier:
+            return "frontier";
+    }
+    return "unknown";
+}
+
+static bool RejectDeletedDynamicSafeInFlag(int argc, char* argv[]) {
+    static constexpr const char* kDeletedFlags[] = {
+        "--dynamic-safein-scale",
+        "--dynamic-safein-scale-cap-static",
+        "--dynamic-safein-payload-only",
+        "--dynamic-safein-gap-rel-tol",
+        "--dynamic-safein-gap-abs-tol",
+    };
+    for (const char* flag : kDeletedFlags) {
+        if (HasFlag(argc, argv, flag)) {
+            std::fprintf(stderr,
+                         "Unsupported Dynamic SafeIn option %s: "
+                         "use --dynamic-safein frontier without scale, "
+                         "gap, cap, or payload-only flags.\n",
+                         flag);
+            return true;
+        }
+    }
+    return false;
+}
 
 // ============================================================================
 // Main
@@ -143,6 +185,37 @@ int main(int argc, char* argv[]) {
     uint32_t nprobe  = static_cast<uint32_t>(GetIntArg(argc, argv, "--nprobe", 32));
     uint32_t top_k   = static_cast<uint32_t>(GetIntArg(argc, argv, "--topk", 10));
     bool dynamic_safeout = GetIntArg(argc, argv, "--dynamic-safeout", 1) != 0;
+    DynamicSafeInMode dynamic_safein_mode = DynamicSafeInMode::Static;
+    const std::string dynamic_safein_arg =
+        GetArg(argc, argv, "--dynamic-safein", "static");
+    if (!ParseDynamicSafeInModeArg(dynamic_safein_arg, &dynamic_safein_mode)) {
+        std::fprintf(stderr,
+                     "Invalid --dynamic-safein: %s "
+                     "(expected static, off, or frontier)\n",
+                     dynamic_safein_arg.c_str());
+        return 1;
+    }
+    if (RejectDeletedDynamicSafeInFlag(argc, argv)) {
+        return 1;
+    }
+    uint32_t dynamic_safein_min_probes = static_cast<uint32_t>(
+        GetIntArg(argc, argv, "--dynamic-safein-min-probes", 0));
+    uint32_t dynamic_safein_stable_probes = static_cast<uint32_t>(
+        GetIntArg(argc, argv, "--dynamic-safein-stable-probes", 2));
+    float dynamic_safein_rel_tol =
+        GetFloatArg(argc, argv, "--dynamic-safein-rel-tol", 0.005f);
+    float dynamic_safein_abs_tol =
+        GetFloatArg(argc, argv, "--dynamic-safein-abs-tol", 0.0f);
+    uint32_t dynamic_safein_defer_initial_clusters = static_cast<uint32_t>(
+        GetIntArg(argc, argv, "--dynamic-safein-defer-initial-clusters", 0));
+    bool dynamic_safein_defer_until_ready =
+        GetIntArg(argc, argv, "--dynamic-safein-defer-until-ready", 0) != 0;
+    uint32_t dynamic_safein_defer_max_candidates = static_cast<uint32_t>(
+        GetIntArg(argc, argv, "--dynamic-safein-defer-max-candidates", 0));
+    int safein_all_threshold_bytes =
+        GetIntArg(argc, argv, "--safein-all-threshold-bytes", 256 * 1024);
+    bool skip_false_stats =
+        GetIntArg(argc, argv, "--skip-false-stats", 0) != 0;
     uint64_t seed    = static_cast<uint64_t>(GetIntArg(argc, argv, "--seed", 42));
     std::string outdir = GetArg(argc, argv, "--outdir", "");
     int q_limit      = GetIntArg(argc, argv, "--queries", 0);
@@ -203,10 +276,19 @@ int main(int argc, char* argv[]) {
             "[--safein-dk-space exact_l2|rabitq_s2] "
             "[--safein-dk-samples-input path] "
             "[--safein-dk-samples-output path] "
+            "[--dynamic-safein static|off|frontier] "
+            "[--safein-all-threshold-bytes N] "
             "[--per-query-stats-output path] "
             "[--pad-to-pow2 1] "
             "[--enable-stage1-safein 0|1] "
             "[--index-dir <path>] [--tmp-dir <path>] [--keep-index]\n");
+        return 1;
+    }
+    if (safein_all_threshold_bytes < 0) {
+        std::fprintf(stderr,
+                     "Invalid --safein-all-threshold-bytes: %d "
+                     "(expected >= 0)\n",
+                     safein_all_threshold_bytes);
         return 1;
     }
 
@@ -267,9 +349,11 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         image_ids = ids.data;
-        image_id_to_row.reserve(image_ids.size() * 2);
-        for (uint32_t row = 0; row < image_ids.size(); ++row) {
-            image_id_to_row[image_ids[row]] = row;
+        if (!skip_false_stats) {
+            image_id_to_row.reserve(image_ids.size() * 2);
+            for (uint32_t row = 0; row < image_ids.size(); ++row) {
+                image_id_to_row[image_ids[row]] = row;
+            }
         }
         Log("  Loaded image ids: %zu\n", image_ids.size());
     }
@@ -376,7 +460,7 @@ int main(int argc, char* argv[]) {
             }
             Log("  GT: %u queries, k=%u\n", gt_rows, gt_k);
         }
-        if (!image_ids.empty()) {
+        if (!skip_false_stats && !image_ids.empty()) {
             uint64_t row_range_count = 0;
             uint64_t image_id_hit_count = 0;
             uint64_t total_gt_ids = 0;
@@ -404,15 +488,17 @@ int main(int argc, char* argv[]) {
                 Log("  GT row ids converted to image ids for recall.\n");
             }
         }
-        gt_row_ids.resize(gt_ids.size());
-        for (uint32_t qi = 0; qi < gt_ids.size(); ++qi) {
-            gt_row_ids[qi].reserve(gt_ids[qi].size());
-            for (int64_t id : gt_ids[qi]) {
-                auto it = image_id_to_row.find(id);
-                if (it != image_id_to_row.end()) {
-                    gt_row_ids[qi].push_back(it->second);
-                } else if (id >= 0 && static_cast<uint64_t>(id) < N) {
-                    gt_row_ids[qi].push_back(static_cast<uint32_t>(id));
+        if (!skip_false_stats) {
+            gt_row_ids.resize(gt_ids.size());
+            for (uint32_t qi = 0; qi < gt_ids.size(); ++qi) {
+                gt_row_ids[qi].reserve(gt_ids[qi].size());
+                for (int64_t id : gt_ids[qi]) {
+                    auto it = image_id_to_row.find(id);
+                    if (it != image_id_to_row.end()) {
+                        gt_row_ids[qi].push_back(it->second);
+                    } else if (id >= 0 && static_cast<uint64_t>(id) < N) {
+                        gt_row_ids[qi].push_back(static_cast<uint32_t>(id));
+                    }
                 }
             }
         }
@@ -568,7 +654,16 @@ int main(int argc, char* argv[]) {
     EpsilonCalibrationStats safeout_epsilon_stats;
     std::vector<std::vector<uint32_t>> cluster_members_for_stats;
     bool have_cluster_members_for_stats = false;
-    if (!arg_index_dir.empty() && !image_ids.empty()) {
+    const bool needs_rabitq_dk_samples =
+        safein_dk_percentile >= 0.0f &&
+        safein_dk_samples_input.empty() &&
+        requested_safein_dk_space == SafeInDkSpace::RabitqS2;
+    const bool needs_cluster_members =
+        !skip_false_stats ||
+        safein_epsilon_percentile >= 0.0f ||
+        safeout_epsilon_percentile >= 0.0f ||
+        needs_rabitq_dk_samples;
+    if (needs_cluster_members && !arg_index_dir.empty() && !image_ids.empty()) {
         auto recover_status = RecoverClusterMembersFromIndex(
             index, image_id_to_row, &cluster_members_for_stats);
         if (!recover_status.ok()) {
@@ -578,10 +673,10 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         have_cluster_members_for_stats = true;
-    } else if (!built_assignments.empty()) {
+    } else if (needs_cluster_members && !built_assignments.empty()) {
         BuildClusterMembers(built_assignments, index.nlist(), &cluster_members_for_stats);
         have_cluster_members_for_stats = true;
-    } else if (!assignments_path.empty()) {
+    } else if (needs_cluster_members && !assignments_path.empty()) {
         auto assignments_or = LoadAssignments(assignments_path, N);
         if (!assignments_or.ok()) {
             std::fprintf(stderr, "Failed to load assignments: %s\n",
@@ -720,6 +815,19 @@ int main(int argc, char* argv[]) {
     search_cfg.top_k = top_k;
     search_cfg.nprobe = nprobe;
     search_cfg.enable_dynamic_safeout = dynamic_safeout;
+    search_cfg.dynamic_safein_mode = dynamic_safein_mode;
+    search_cfg.dynamic_safein_min_probes = dynamic_safein_min_probes;
+    search_cfg.dynamic_safein_stable_probes = dynamic_safein_stable_probes;
+    search_cfg.dynamic_safein_rel_tol = dynamic_safein_rel_tol;
+    search_cfg.dynamic_safein_abs_tol = dynamic_safein_abs_tol;
+    search_cfg.dynamic_safein_defer_initial_clusters =
+        dynamic_safein_defer_initial_clusters;
+    search_cfg.dynamic_safein_defer_until_ready =
+        dynamic_safein_defer_until_ready;
+    search_cfg.dynamic_safein_defer_max_candidates =
+        dynamic_safein_defer_max_candidates;
+    search_cfg.safein_all_threshold =
+        static_cast<uint32_t>(safein_all_threshold_bytes);
     search_cfg.prefetch_depth = 16;
     search_cfg.io_queue_depth = 64;
     search_cfg.refill_threshold = 4;
@@ -775,9 +883,31 @@ int main(int argc, char* argv[]) {
     uint64_t s2_false_safein = 0, s2_false_safeout = 0;
     uint64_t final_uncertain = 0;
     uint64_t total_probed_clusters = 0;
+    uint64_t vec_only_read_requests = 0;
+    uint64_t all_read_requests = 0;
+    uint64_t payload_read_requests = 0;
+    uint64_t safein_payload_prefetched = 0;
+    uint64_t remaining_payload_fetches = 0;
+    uint64_t total_io_submitted = 0;
+    uint64_t safein_prefetch_candidates = 0;
+    uint64_t safein_prefetch_true_topk = 0;
+    uint64_t safein_prefetch_false = 0;
+    uint64_t safein_prefetch_unknown = 0;
+    uint64_t dynamic_safein_deferred_candidates = 0;
+    uint64_t dynamic_safein_deferred_flushes = 0;
+    uint64_t dynamic_safein_deferred_safein = 0;
     uint64_t safeout_frontier_estimates_buffered = 0;
     uint64_t safeout_frontier_estimates_merged = 0;
     uint64_t safeout_frontier_updates = 0;
+    uint64_t dynamic_safein_clusters = 0;
+    uint64_t dynamic_safein_active_clusters = 0;
+    uint64_t dynamic_safein_disabled_clusters = 0;
+    uint64_t dynamic_safein_threshold_changed_clusters = 0;
+    uint64_t dynamic_safein_ready_transitions = 0;
+    uint64_t dynamic_safein_frontier_samples = 0;
+    uint64_t dynamic_safein_threshold_samples = 0;
+    double dynamic_safein_frontier_sum = 0.0;
+    double dynamic_safein_threshold_sum = 0.0;
     const uint32_t probed_clusters_per_query =
         std::min<uint32_t>(nprobe, index.nlist());
     std::ofstream per_query_stats;
@@ -787,7 +917,19 @@ int main(int argc, char* argv[]) {
             << "query_id,exact_kth_l2,T_minus_Rq,s1_safein,s1_false_safein,"
             << "s2_safein,s2_false_safein,total_safein,total_false_safein,"
             << "s1_safeout,s1_false_safeout,s2_safeout,s2_false_safeout,"
-            << "s1_uncertain,s2_uncertain,final_uncertain,latency_ms,probed_clusters\n";
+            << "s1_uncertain,s2_uncertain,final_uncertain,"
+            << "vec_only_read_requests,all_read_requests,payload_read_requests,"
+            << "safein_payload_prefetched,remaining_payload_fetches,"
+            << "safein_prefetch_candidates,safein_prefetch_true_topk,"
+            << "safein_prefetch_false,safein_prefetch_false_rate,"
+            << "safein_prefetch_topk_coverage,safein_prefetch_unknown,"
+            << "dynamic_safein_deferred_candidates,"
+            << "dynamic_safein_deferred_flushes,"
+            << "dynamic_safein_deferred_safein,"
+            << "dynamic_safein_clusters,dynamic_safein_active_clusters,"
+            << "dynamic_safein_disabled_clusters,dynamic_safein_threshold_avg,"
+            << "dynamic_safein_final_threshold,dynamic_safein_final_frontier,"
+            << "latency_ms,probed_clusters\n";
         per_query_stats << std::fixed << std::setprecision(9);
     }
 
@@ -824,17 +966,56 @@ int main(int argc, char* argv[]) {
         s2_false_safein += st.s2_false_safe_in;
         s2_false_safeout += st.s2_false_safe_out;
         final_uncertain += st.total_uncertain;
+        vec_only_read_requests += st.vec_only_read_requests;
+        all_read_requests += st.all_read_requests;
+        payload_read_requests += st.payload_read_requests;
+        safein_payload_prefetched += st.total_safein_payload_prefetched;
+        remaining_payload_fetches += st.total_payload_fetched;
+        total_io_submitted += st.total_io_submitted;
+        safein_prefetch_candidates += st.safein_prefetch_candidates;
+        safein_prefetch_true_topk += st.safein_prefetch_true_topk;
+        safein_prefetch_false += st.safein_prefetch_false;
+        safein_prefetch_unknown += st.safein_prefetch_unknown;
+        dynamic_safein_deferred_candidates +=
+            st.dynamic_safein_deferred_candidates;
+        dynamic_safein_deferred_flushes += st.dynamic_safein_deferred_flushes;
+        dynamic_safein_deferred_safein += st.dynamic_safein_deferred_safein;
         safeout_frontier_estimates_buffered +=
             st.total_safeout_frontier_estimates_buffered;
         safeout_frontier_estimates_merged +=
             st.total_safeout_frontier_estimates_merged;
         safeout_frontier_updates += st.total_safeout_frontier_updates;
+        dynamic_safein_clusters += st.dynamic_safein_clusters;
+        dynamic_safein_active_clusters += st.dynamic_safein_active_clusters;
+        dynamic_safein_disabled_clusters += st.dynamic_safein_disabled_clusters;
+        dynamic_safein_threshold_changed_clusters +=
+            st.dynamic_safein_threshold_changed_clusters;
+        dynamic_safein_ready_transitions += st.dynamic_safein_ready_transitions;
+        dynamic_safein_frontier_samples += st.dynamic_safein_frontier_samples;
+        dynamic_safein_threshold_samples += st.dynamic_safein_threshold_samples;
+        dynamic_safein_frontier_sum += st.dynamic_safein_frontier_sum;
+        dynamic_safein_threshold_sum += st.dynamic_safein_threshold_sum;
         total_probed_clusters += probed_clusters_per_query;
 
         if (per_query_stats.is_open()) {
             const uint64_t query_safein = st.total_safe_in + st.s2_safe_in;
             const uint64_t query_false_safein =
                 st.s1_false_safe_in + st.s2_false_safe_in;
+            const double query_dynamic_threshold_avg =
+                st.dynamic_safein_threshold_samples > 0
+                    ? st.dynamic_safein_threshold_sum /
+                          st.dynamic_safein_threshold_samples
+                    : 0.0;
+            const double query_prefetch_false_rate =
+                st.safein_prefetch_candidates > 0
+                    ? static_cast<double>(st.safein_prefetch_false) /
+                          static_cast<double>(st.safein_prefetch_candidates)
+                    : 0.0;
+            const double query_prefetch_coverage =
+                top_k > 0
+                    ? static_cast<double>(st.safein_prefetch_true_topk) /
+                          static_cast<double>(top_k)
+                    : 0.0;
             per_query_stats
                 << qi << ','
                 << exact_kth_l2[qi] << ','
@@ -852,6 +1033,26 @@ int main(int argc, char* argv[]) {
                 << st.s1_uncertain_raw << ','
                 << st.s2_uncertain << ','
                 << st.total_uncertain << ','
+                << st.vec_only_read_requests << ','
+                << st.all_read_requests << ','
+                << st.payload_read_requests << ','
+                << st.total_safein_payload_prefetched << ','
+                << st.total_payload_fetched << ','
+                << st.safein_prefetch_candidates << ','
+                << st.safein_prefetch_true_topk << ','
+                << st.safein_prefetch_false << ','
+                << query_prefetch_false_rate << ','
+                << query_prefetch_coverage << ','
+                << st.safein_prefetch_unknown << ','
+                << st.dynamic_safein_deferred_candidates << ','
+                << st.dynamic_safein_deferred_flushes << ','
+                << st.dynamic_safein_deferred_safein << ','
+                << st.dynamic_safein_clusters << ','
+                << st.dynamic_safein_active_clusters << ','
+                << st.dynamic_safein_disabled_clusters << ','
+                << query_dynamic_threshold_avg << ','
+                << st.dynamic_safein_final_threshold << ','
+                << st.dynamic_safein_final_frontier << ','
                 << latencies[qi] << ','
                 << probed_clusters_per_query << '\n';
         }
@@ -893,6 +1094,7 @@ int main(int argc, char* argv[]) {
     double recall_1   = ComputeRecall(1);
     double recall_5   = ComputeRecall(std::min(5u, top_k));
     double recall_10  = ComputeRecall(std::min(10u, top_k));
+    double recall_k   = ComputeRecall(top_k);
     double recall_100 = ComputeRecall(std::min(100u, top_k));
 
     // Latency stats
@@ -904,6 +1106,16 @@ int main(int argc, char* argv[]) {
     double p99 = sorted_lat[static_cast<size_t>(Q * 0.99)];
 
     double avg_probed = static_cast<double>(total_probed_clusters) / Q;
+    const double safein_prefetch_false_rate =
+        safein_prefetch_candidates > 0
+            ? static_cast<double>(safein_prefetch_false) /
+                  static_cast<double>(safein_prefetch_candidates)
+            : 0.0;
+    const double safein_prefetch_topk_coverage =
+        (Q > 0 && top_k > 0)
+            ? static_cast<double>(safein_prefetch_true_topk) /
+                  (static_cast<double>(Q) * static_cast<double>(top_k))
+            : 0.0;
 
     uint64_t s1_total = s1_safein + s1_safeout + s1_uncertain;
     auto pct = [](uint64_t num, uint64_t den) -> double {
@@ -919,6 +1131,7 @@ int main(int argc, char* argv[]) {
     Log("  recall@1  = %.4f\n", recall_1);
     Log("  recall@5  = %.4f\n", recall_5);
     Log("  recall@10 = %.4f\n", recall_10);
+    Log("  recall@k  = %.4f (k=%u)\n", recall_k, top_k);
     if (top_k >= 100)
         Log("  recall@100= %.4f\n", recall_100);
     Log("\n");
@@ -929,12 +1142,33 @@ int main(int argc, char* argv[]) {
     Log("\n");
     Log("  build_time      = %.1f ms\n", build_time_ms);
     Log("  avg_probed      = %.2f / %u clusters\n", avg_probed, nprobe);
+    Log("  vec_only/all/payload reads = %lu / %lu / %lu\n",
+        vec_only_read_requests, all_read_requests, payload_read_requests);
+    Log("  safein_payload_prefetched / remaining_payload_fetches = %lu / %lu\n",
+        safein_payload_prefetched, remaining_payload_fetches);
+    Log("  safein_prefetch true/false/total = %lu / %lu / %lu (coverage=%.2f%% false_rate=%.2f%%)\n",
+        safein_prefetch_true_topk, safein_prefetch_false,
+        safein_prefetch_candidates, 100.0 * safein_prefetch_topk_coverage,
+        100.0 * safein_prefetch_false_rate);
+    Log("  dynamic_safein deferred candidates/flushes/safein = %lu / %lu / %lu\n",
+        dynamic_safein_deferred_candidates, dynamic_safein_deferred_flushes,
+        dynamic_safein_deferred_safein);
     Log("  safeout_frontier_estimates_buffered = %lu\n",
         safeout_frontier_estimates_buffered);
     Log("  safeout_frontier_estimates_merged   = %lu\n",
         safeout_frontier_estimates_merged);
     Log("  safeout_frontier_updates            = %lu\n",
         safeout_frontier_updates);
+    if (dynamic_safein_mode != DynamicSafeInMode::Static) {
+        const double dyn_thr_avg = dynamic_safein_threshold_samples > 0
+            ? dynamic_safein_threshold_sum / dynamic_safein_threshold_samples
+            : 0.0;
+        Log("  dynamic_safein_mode                 = %s\n",
+            DynamicSafeInModeName(dynamic_safein_mode));
+        Log("  dynamic_safein_active_clusters      = %lu / %lu\n",
+            dynamic_safein_active_clusters, dynamic_safein_clusters);
+        Log("  dynamic_safein_threshold_avg        = %.6f\n", dyn_thr_avg);
+    }
 
     // Stage 1 Uncertain is the raw FastScan population that flows into Stage 2.
     // Stage 2 Uncertain is the unresolved remainder after ExRaBitQ re-classification.
@@ -980,6 +1214,24 @@ int main(int argc, char* argv[]) {
         jf << "  \"metric\": \"" << metric << "\",\n";
         jf << "  \"dynamic_safeout_enabled\": "
            << (dynamic_safeout ? "true" : "false") << ",\n";
+        jf << "  \"dynamic_safein_mode\": \""
+           << DynamicSafeInModeName(dynamic_safein_mode) << "\",\n";
+        jf << "  \"dynamic_safein_min_probes\": "
+           << dynamic_safein_min_probes << ",\n";
+        jf << "  \"dynamic_safein_stable_probes\": "
+           << dynamic_safein_stable_probes << ",\n";
+        jf << "  \"dynamic_safein_rel_tol\": "
+           << dynamic_safein_rel_tol << ",\n";
+        jf << "  \"dynamic_safein_abs_tol\": "
+           << dynamic_safein_abs_tol << ",\n";
+        jf << "  \"dynamic_safein_defer_initial_clusters\": "
+           << search_cfg.dynamic_safein_defer_initial_clusters << ",\n";
+        jf << "  \"dynamic_safein_defer_until_ready\": "
+           << (search_cfg.dynamic_safein_defer_until_ready ? "true" : "false") << ",\n";
+        jf << "  \"dynamic_safein_defer_max_candidates\": "
+           << search_cfg.dynamic_safein_defer_max_candidates << ",\n";
+        jf << "  \"safein_all_threshold_bytes\": "
+           << search_cfg.safein_all_threshold << ",\n";
         jf << "  \"safein_dk_percentile\": " << safein_dk_percentile << ",\n";
         jf << "  \"safein_dk_space\": \""
            << SafeInDkSpaceName(requested_safein_dk_space) << "\",\n";
@@ -1010,6 +1262,7 @@ int main(int argc, char* argv[]) {
         jf << "  \"recall_at_1\": " << recall_1 << ",\n";
         jf << "  \"recall_at_5\": " << recall_5 << ",\n";
         jf << "  \"recall_at_10\": " << recall_10 << ",\n";
+        jf << "  \"recall_at_k\": " << recall_k << ",\n";
         jf << "  \"recall_at_100\": " << recall_100 << ",\n";
         jf << "  \"latency_avg_ms\": " << avg_lat << ",\n";
         jf << "  \"latency_p50_ms\": " << p50 << ",\n";
@@ -1023,6 +1276,60 @@ int main(int argc, char* argv[]) {
            << safeout_frontier_estimates_merged << ",\n";
         jf << "  \"safeout_frontier_updates\": "
            << safeout_frontier_updates << ",\n";
+        jf << "  \"vec_only_read_requests\": "
+           << vec_only_read_requests << ",\n";
+        jf << "  \"all_read_requests\": "
+           << all_read_requests << ",\n";
+        jf << "  \"payload_read_requests\": "
+           << payload_read_requests << ",\n";
+        jf << "  \"safein_payload_prefetched\": "
+           << safein_payload_prefetched << ",\n";
+        jf << "  \"remaining_payload_fetches\": "
+           << remaining_payload_fetches << ",\n";
+        jf << "  \"safein_prefetch_candidates\": "
+           << safein_prefetch_candidates << ",\n";
+        jf << "  \"safein_prefetch_true_topk\": "
+           << safein_prefetch_true_topk << ",\n";
+        jf << "  \"safein_prefetch_false\": "
+           << safein_prefetch_false << ",\n";
+        jf << "  \"safein_prefetch_unknown\": "
+           << safein_prefetch_unknown << ",\n";
+        jf << "  \"safein_prefetch_false_rate\": "
+           << safein_prefetch_false_rate << ",\n";
+        jf << "  \"safein_prefetch_topk_coverage\": "
+           << safein_prefetch_topk_coverage << ",\n";
+        jf << "  \"dynamic_safein_deferred_candidates\": "
+           << dynamic_safein_deferred_candidates << ",\n";
+        jf << "  \"dynamic_safein_deferred_flushes\": "
+           << dynamic_safein_deferred_flushes << ",\n";
+        jf << "  \"dynamic_safein_deferred_safein\": "
+           << dynamic_safein_deferred_safein << ",\n";
+        jf << "  \"total_io_submitted\": "
+           << total_io_submitted << ",\n";
+        jf << "  \"dynamic_safein_clusters\": "
+           << dynamic_safein_clusters << ",\n";
+        jf << "  \"dynamic_safein_active_clusters\": "
+           << dynamic_safein_active_clusters << ",\n";
+        jf << "  \"dynamic_safein_disabled_clusters\": "
+           << dynamic_safein_disabled_clusters << ",\n";
+        jf << "  \"dynamic_safein_threshold_changed_clusters\": "
+           << dynamic_safein_threshold_changed_clusters << ",\n";
+        jf << "  \"dynamic_safein_ready_transitions\": "
+           << dynamic_safein_ready_transitions << ",\n";
+        jf << "  \"dynamic_safein_frontier_samples\": "
+           << dynamic_safein_frontier_samples << ",\n";
+        jf << "  \"dynamic_safein_threshold_samples\": "
+           << dynamic_safein_threshold_samples << ",\n";
+        jf << "  \"dynamic_safein_frontier_avg\": "
+           << (dynamic_safein_frontier_samples > 0
+                   ? dynamic_safein_frontier_sum /
+                         dynamic_safein_frontier_samples
+                   : 0.0) << ",\n";
+        jf << "  \"dynamic_safein_threshold_avg\": "
+           << (dynamic_safein_threshold_samples > 0
+                   ? dynamic_safein_threshold_sum /
+                         dynamic_safein_threshold_samples
+                   : 0.0) << ",\n";
         jf << "  \"s1_safein\": " << s1_safein << ",\n";
         jf << "  \"s1_safeout\": " << s1_safeout << ",\n";
         jf << "  \"s1_uncertain\": " << s1_uncertain << ",\n";

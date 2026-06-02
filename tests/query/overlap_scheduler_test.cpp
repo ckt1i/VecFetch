@@ -106,6 +106,119 @@ class OverlapSchedulerTest : public ::testing::Test {
         return scheduler.SafeOutFrontierUpper();
     }
 
+    float ReadInitialDynamicSafeInFrontierThreshold() {
+        PreadFallbackReader reader;
+        SearchConfig config;
+        config.top_k = 3;
+        config.nprobe = kNprobe;
+        config.enable_dynamic_safeout = false;
+        config.dynamic_safein_mode = DynamicSafeInMode::Frontier;
+        config.dynamic_safein_min_probes = 0;
+
+        OverlapScheduler scheduler(*index_, reader, config);
+        return scheduler.SafeInThresholdForProbe();
+    }
+
+    float BuildDynamicSafeInFrontierThreshold(uint32_t* ready_transitions) {
+        PreadFallbackReader reader;
+        SearchConfig config;
+        config.top_k = 3;
+        config.nprobe = kNprobe;
+        config.enable_dynamic_safeout = false;
+        config.dynamic_safein_mode = DynamicSafeInMode::Frontier;
+        config.dynamic_safein_min_probes = 0;
+        config.dynamic_safein_stable_probes = 1;
+
+        OverlapScheduler scheduler(*index_, reader, config);
+        scheduler.est_top_k_ = 3;
+        scheduler.AddSafeOutFrontierEstimate({1.0f, 0.0f});
+        scheduler.AddSafeOutFrontierEstimate({2.0f, 0.0f});
+        scheduler.AddSafeOutFrontierEstimate({3.0f, 0.0f});
+        scheduler.AddSafeInFrontierEstimate(1.0f);
+        scheduler.AddSafeInFrontierEstimate(2.0f);
+        scheduler.AddSafeInFrontierEstimate(3.0f);
+
+        SearchContext ctx(vectors_.data(), config);
+        scheduler.UpdateDynamicSafeInState(ctx, /*advance_probe=*/true);
+        *ready_transitions = ctx.stats().dynamic_safein_ready_transitions;
+        return scheduler.SafeInThresholdForProbe();
+    }
+
+    uint32_t FlushDynamicSafeInDeferredPlans(float threshold,
+                                             bool force,
+                                             uint32_t* vec_only_count) {
+        PreadFallbackReader reader;
+        SearchConfig config;
+        config.top_k = 3;
+        config.nprobe = kNprobe;
+        config.enable_dynamic_safeout = false;
+        config.dynamic_safein_mode = DynamicSafeInMode::Frontier;
+        config.safein_all_threshold = 4096;
+
+        OverlapScheduler scheduler(*index_, reader, config);
+        SearchContext ctx(vectors_.data(), config);
+        AddressEntry small;
+        small.offset = 128;
+        small.size = 512;
+        AddressEntry large;
+        large.offset = 1024;
+        large.size = 8192;
+
+        OverlapScheduler::DeferredSafeInPlan safein;
+        safein.addr = small;
+        safein.safein_upper_bound = threshold - 0.1f;
+        safein.has_truth = true;
+        safein.is_true_topk = true;
+        scheduler.deferred_safein_plans_.push_back(safein);
+
+        OverlapScheduler::DeferredSafeInPlan vec_only_by_bound;
+        vec_only_by_bound.addr = small;
+        vec_only_by_bound.safein_upper_bound = threshold + 0.1f;
+        scheduler.deferred_safein_plans_.push_back(vec_only_by_bound);
+
+        OverlapScheduler::DeferredSafeInPlan vec_only_by_size;
+        vec_only_by_size.addr = large;
+        vec_only_by_size.safein_upper_bound = threshold - 0.1f;
+        scheduler.deferred_safein_plans_.push_back(vec_only_by_size);
+
+        scheduler.FlushDeferredSafeInPlans(ctx, threshold, force);
+        *vec_only_count =
+            static_cast<uint32_t>(scheduler.pending_vec_only_plans_.size() -
+                                  scheduler.pending_vec_only_head_);
+        return static_cast<uint32_t>(scheduler.pending_all_plans_.size());
+    }
+
+    bool ShouldHoldDeferredPool(uint32_t probes_seen, size_t pool_size,
+                                bool* defers_next_probe = nullptr) {
+        PreadFallbackReader reader;
+        SearchConfig config;
+        config.top_k = 3;
+        config.nprobe = kNprobe;
+        config.enable_dynamic_safeout = false;
+        config.dynamic_safein_mode = DynamicSafeInMode::Frontier;
+        config.dynamic_safein_defer_initial_clusters = 4;
+        config.dynamic_safein_defer_until_ready = true;
+        config.submit_batch_size = 32;
+
+        OverlapScheduler scheduler(*index_, reader, config);
+        scheduler.dynamic_safein_probes_seen_ = probes_seen;
+        scheduler.dynamic_safein_ready_ = true;
+        AddressEntry addr;
+        addr.offset = 128;
+        addr.size = 512;
+        for (size_t i = 0; i < pool_size; ++i) {
+            OverlapScheduler::DeferredSafeInPlan plan;
+            plan.addr = addr;
+            scheduler.deferred_safein_plans_.push_back(plan);
+        }
+        const bool hold = scheduler.ShouldHoldDeferredSafeInPlans();
+        if (defers_next_probe != nullptr) {
+            scheduler.dynamic_safein_probes_seen_ = probes_seen + 1;
+            *defers_next_probe = scheduler.ShouldDeferSafeInPlans();
+        }
+        return hold;
+    }
+
     fs::path test_dir_;
     std::vector<float> vectors_;
     std::unique_ptr<IvfIndex> index_;
@@ -121,6 +234,40 @@ TEST_F(OverlapSchedulerTest, SafeOutFrontierIsInfinityUntilHeapFull) {
     const float frontier = ReadUnfilledUpperBoundFrontier();
 
     EXPECT_TRUE(std::isinf(frontier));
+}
+
+TEST_F(OverlapSchedulerTest, DynamicSafeInFrontierDisablesUntilFrontierExists) {
+    const float initial = ReadInitialDynamicSafeInFrontierThreshold();
+    EXPECT_TRUE(std::isinf(initial));
+    EXPECT_LT(initial, 0.0f);
+
+    uint32_t ready_transitions = 0;
+    const float threshold =
+        BuildDynamicSafeInFrontierThreshold(&ready_transitions);
+    EXPECT_TRUE(std::isfinite(threshold));
+    EXPECT_FLOAT_EQ(threshold, 3.0f);
+    EXPECT_EQ(ready_transitions, 1u);
+}
+
+TEST_F(OverlapSchedulerTest, DynamicSafeInDeferredFlushReclassifiesByFrontier) {
+    uint32_t vec_only_count = 0;
+    const uint32_t all_count =
+        FlushDynamicSafeInDeferredPlans(4.0f, /*force=*/false,
+                                        &vec_only_count);
+
+    EXPECT_EQ(all_count, 1u);
+    EXPECT_EQ(vec_only_count, 2u);
+}
+
+TEST_F(OverlapSchedulerTest, DynamicSafeInDeferredSmallPoolHoldsOneExtraCluster) {
+    bool defers_next_probe = false;
+    EXPECT_TRUE(ShouldHoldDeferredPool(/*probes_seen=*/4, /*pool_size=*/64,
+                                      &defers_next_probe));
+    EXPECT_TRUE(defers_next_probe);
+    EXPECT_FALSE(ShouldHoldDeferredPool(/*probes_seen=*/4, /*pool_size=*/128,
+                                       &defers_next_probe));
+    EXPECT_FALSE(defers_next_probe);
+    EXPECT_FALSE(ShouldHoldDeferredPool(/*probes_seen=*/5, /*pool_size=*/64));
 }
 
 TEST_F(OverlapSchedulerTest, EndToEnd_PreadFallback) {

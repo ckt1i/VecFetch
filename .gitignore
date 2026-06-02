@@ -75,3 +75,18 @@ CLAUDE.md
 # perf files
 profile_output/
 **perf**
+
+# safeIn_dk_review_logs
+**/results.json
+**/config.json
+**/cmd.txt
+**/run.log
+**/*.npy
+**/online_per_query.csv
+**/summary.json
+**/aggressive*/
+**/dynamic*/
+**/msmarco*/
+**/blend0_check/
+**/frontier_apply_validation/
+**/quality_gate_check/

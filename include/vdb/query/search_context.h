@@ -21,6 +21,11 @@ enum class CluReadMode : uint8_t {
     FullPreload = 1,
 };
 
+enum class DynamicSafeInMode : uint8_t {
+    Static = 0,
+    Frontier = 1,
+};
+
 struct SearchConfig {
     uint32_t top_k = 10;
     uint32_t nprobe = 8;
@@ -45,6 +50,18 @@ struct SearchConfig {
     // When enabled, Dynamic SafeOut maintains a kth upper-bound frontier for
     // estimate-driven SafeOut pruning.
     bool enable_dynamic_safeout = true;
+
+    // Query-adaptive SafeIn threshold for payload prefetch. Static preserves
+    // the legacy global safein_d_k threshold. Frontier uses the online kth
+    // lower-bound frontier maintained during the query.
+    DynamicSafeInMode dynamic_safein_mode = DynamicSafeInMode::Static;
+    uint32_t dynamic_safein_min_probes = 0;
+    uint32_t dynamic_safein_stable_probes = 2;
+    float dynamic_safein_rel_tol = 0.005f;
+    float dynamic_safein_abs_tol = 0.0f;
+    uint32_t dynamic_safein_defer_initial_clusters = 0;
+    bool dynamic_safein_defer_until_ready = false;
+    uint32_t dynamic_safein_defer_max_candidates = 0;
 
     // Submit batching: submit when pending vec requests reach N.
     // `0` preserves the legacy "submit on pressure/final drain" behavior.
@@ -106,6 +123,24 @@ struct SearchStats {
     uint32_t total_safeout_frontier_estimates_buffered = 0;
     uint32_t total_safeout_frontier_estimates_merged = 0;
     uint32_t total_safeout_frontier_updates = 0;
+    uint32_t dynamic_safein_clusters = 0;
+    uint32_t dynamic_safein_active_clusters = 0;
+    uint32_t dynamic_safein_disabled_clusters = 0;
+    uint32_t dynamic_safein_threshold_changed_clusters = 0;
+    uint32_t dynamic_safein_ready_transitions = 0;
+    uint32_t dynamic_safein_frontier_samples = 0;
+    uint32_t dynamic_safein_threshold_samples = 0;
+    double dynamic_safein_frontier_sum = 0.0;
+    double dynamic_safein_threshold_sum = 0.0;
+    float dynamic_safein_final_frontier = 0.0f;
+    float dynamic_safein_final_threshold = 0.0f;
+    uint32_t dynamic_safein_deferred_candidates = 0;
+    uint32_t dynamic_safein_deferred_flushes = 0;
+    uint32_t dynamic_safein_deferred_safein = 0;
+    uint32_t safein_prefetch_candidates = 0;
+    uint32_t safein_prefetch_true_topk = 0;
+    uint32_t safein_prefetch_false = 0;
+    uint32_t safein_prefetch_unknown = 0;
     uint32_t total_stage2_block_lookups = 0;
     uint32_t total_stage2_block_reuses = 0;
     uint32_t duplicate_candidates = 0;

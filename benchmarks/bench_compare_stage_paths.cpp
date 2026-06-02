@@ -308,9 +308,11 @@ int main(int argc, char* argv[]) {
             index::ProbeStats stats_a;
             index::ProbeStats stats_b;
             prober_a.Probe(*cpa, cid_a, va, dyn_a,
+                           index_a.conann().safein_d_k(),
                            false, false, false, false, false,
                            nullptr, nullptr, sink_a, stats_a);
             prober_b.Probe(*cpb, cid_b, vb, dyn_b,
+                           index_b.conann().safein_d_k(),
                            false, false, false, false, false,
                            nullptr, nullptr, sink_b, stats_b);
             if (sink_a.est_dists.size() != sink_b.est_dists.size()) {

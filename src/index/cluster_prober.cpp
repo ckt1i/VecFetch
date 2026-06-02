@@ -61,6 +61,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                            uint32_t cluster_id,
                            const rabitq::PreparedClusterQueryView& view,
                            float safeout_frontier_upper,
+                           float safein_threshold_base,
                            bool enable_address_decode_simd,
                            bool enable_fine_grained_timing,
                            bool enable_stage1_safein,
@@ -72,7 +73,6 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                            ProbeStats& stats) const {
     const rabitq::PreparedQuery& pq = *view.prepared;
     const uint32_t packed_sz = storage::FastScanPackedSize(dim_);
-    const float safein_threshold_base = conann_.safein_d_k();
     const bool collect_false_stats =
         false_stats_cluster_members != nullptr &&
         false_stats_true_topk_rows != nullptr &&
@@ -288,6 +288,10 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
             batch.global_idx[batch.count] = global_idx;
             batch.est_dist[batch.count] = est_dist_s1;
             batch.est_error[batch.count] = safeout_margin_s1;
+            batch.estimate_lower_bound[batch.count] =
+                est_dist_s1 - safeout_margin_s1;
+            batch.safein_upper_bound[batch.count] =
+                est_dist_s1 + safein_margin_s1;
             batch.cls[batch.count] = (rc_final == ResultClass::SafeIn)
                 ? CandidateClass::SafeIn
                 : CandidateClass::Uncertain;
@@ -463,7 +467,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         pq.norm_qc,
                         pq.norm_qc_sq,
                         1.0f / margin_s2_divisor_,
-                        conann_.safein_d_k(),
+                        safein_threshold_base,
                         safeout_frontier_upper);
 
                     stats.s2_safein += static_cast<uint32_t>(__builtin_popcount(classify_masks.safein));
@@ -500,9 +504,15 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         est_dist_s2 = std::max(est_dist_s2, 0.0f);
                         const float safeout_margin_s2 =
                             entry.safeout_margin_s1 / margin_s2_divisor_;
+                        const float safein_margin_s2 =
+                            entry.margin_s1 / margin_s2_divisor_;
                         batch.global_idx[batch.count] = entry.global_idx;
                         batch.est_dist[batch.count] = est_dist_s2;
                         batch.est_error[batch.count] = safeout_margin_s2;
+                        batch.estimate_lower_bound[batch.count] =
+                            est_dist_s2 - safeout_margin_s2;
+                        batch.safein_upper_bound[batch.count] =
+                            est_dist_s2 + safein_margin_s2;
                         batch.cls[batch.count] = ((classify_masks.safein >> lane) & 1u) != 0
                             ? CandidateClass::SafeIn
                             : CandidateClass::Uncertain;
@@ -523,10 +533,12 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         const float safein_margin_s2 = entry.margin_s1 / margin_s2_divisor_;
                         const float safeout_margin_s2 =
                             entry.safeout_margin_s1 / margin_s2_divisor_;
-                        const ResultClass rc_s2 =
-                            conann_.ClassifyAdaptive(est_dist_s2, safein_margin_s2,
-                                                     safeout_margin_s2,
-                                                     safeout_frontier_upper);
+                        ResultClass rc_s2 = ResultClass::Uncertain;
+                        if (est_dist_s2 > safeout_frontier_upper + safeout_margin_s2) {
+                            rc_s2 = ResultClass::SafeOut;
+                        } else if (est_dist_s2 < safein_threshold_base - safein_margin_s2) {
+                            rc_s2 = ResultClass::SafeIn;
+                        }
 
                         if (rc_s2 == ResultClass::SafeIn) {
                             ++stats.s2_safein;
@@ -546,6 +558,10 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         batch.global_idx[batch.count] = entry.global_idx;
                         batch.est_dist[batch.count] = est_dist_s2;
                         batch.est_error[batch.count] = safeout_margin_s2;
+                        batch.estimate_lower_bound[batch.count] =
+                            est_dist_s2 - safeout_margin_s2;
+                        batch.safein_upper_bound[batch.count] =
+                            est_dist_s2 + safein_margin_s2;
                         batch.cls[batch.count] = (rc_s2 == ResultClass::SafeIn)
                             ? CandidateClass::SafeIn
                             : CandidateClass::Uncertain;
