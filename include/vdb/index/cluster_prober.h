@@ -121,9 +121,10 @@ class ClusterProber {
     ///                         (safeout_frontier_heap.size() >= top_k)
     ///                           ? kth_smallest(d_hat + e)
     ///                           : +infinity
-    /// @param safein_threshold_base   Active SafeIn threshold center. This is
-    ///                         normally conann.safein_d_k(), but may be lowered
-    ///                         or delayed by query-adaptive prefetch policies.
+    /// @param safein_threshold_base   Active SafeIn threshold center. Static
+    ///                         SafeIn uses conann.safein_d_k(); query-adaptive
+    ///                         SafeIn supplies a per-query frontier or -inf
+    ///                         while SafeIn prefetch is disabled.
     /// @param sink           Receives non-SafeOut candidates
     /// @param stats          Accumulated classification statistics
     void Probe(const query::ParsedCluster& pc,

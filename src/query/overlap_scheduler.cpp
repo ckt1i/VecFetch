@@ -131,6 +131,9 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
                 : std::max(256u, config_.nprobe * 64u);
         deferred_safein_plans_.reserve(reserve_deferred);
     }
+    if (config_.non_safeout_candidate_budget > 0) {
+        budgeted_read_plan_heap_.reserve(config_.non_safeout_candidate_budget);
+    }
     // Stage 2: precompute margin divisor from bits
     uint8_t bits = index.segment().rabitq_config().bits;
     if (bits > 1) {
@@ -275,29 +278,28 @@ void OverlapScheduler::UpdateDynamicSafeInState(SearchContext& ctx,
 }
 
 float OverlapScheduler::SafeInThresholdForProbe() const {
-    const float static_threshold = index_.conann().safein_d_k();
     if (!use_dynamic_safein_ ||
         config_.dynamic_safein_mode == DynamicSafeInMode::Static) {
-        return static_threshold;
+        return index_.conann().safein_d_k();
     }
 
     const float disabled = -std::numeric_limits<float>::infinity();
 
     switch (config_.dynamic_safein_mode) {
         case DynamicSafeInMode::Static:
-            return static_threshold;
+            return index_.conann().safein_d_k();
         case DynamicSafeInMode::Frontier:
             return dynamic_safein_ready_ &&
                 std::isfinite(dynamic_safein_current_frontier_)
                     ? dynamic_safein_current_frontier_
                     : disabled;
     }
-    return static_threshold;
+    return disabled;
 }
 
 void OverlapScheduler::RecordDynamicSafeInStats(SearchContext& ctx,
                                                 float threshold,
-                                                float frontier) const {
+                                                float frontier) {
     if (!use_dynamic_safein_) return;
 
     auto& stats = ctx.stats();
@@ -312,11 +314,14 @@ void OverlapScheduler::RecordDynamicSafeInStats(SearchContext& ctx,
         stats.dynamic_safein_threshold_samples++;
         stats.dynamic_safein_threshold_sum += threshold;
         stats.dynamic_safein_final_threshold = threshold;
-        if (std::abs(threshold - index_.conann().safein_d_k()) > 1e-6f) {
+        if (!std::isfinite(dynamic_safein_current_threshold_) ||
+            std::abs(threshold - dynamic_safein_current_threshold_) > 1e-6f) {
             stats.dynamic_safein_threshold_changed_clusters++;
         }
+        dynamic_safein_current_threshold_ = threshold;
     } else {
         stats.dynamic_safein_disabled_clusters++;
+        dynamic_safein_current_threshold_ = threshold;
     }
 }
 
@@ -385,6 +390,72 @@ void OverlapScheduler::RecordSafeInPrefetchDecision(
     }
 }
 
+bool OverlapScheduler::UseNonSafeOutCandidateBudget() const {
+    return config_.non_safeout_candidate_budget > 0;
+}
+
+void OverlapScheduler::AddBudgetedReadPlan(SearchContext& ctx,
+                                           const ReadPlanEntry& plan,
+                                           float rank_key) {
+    if (!UseNonSafeOutCandidateBudget()) return;
+    if (!std::isfinite(rank_key)) {
+        rank_key = std::numeric_limits<float>::infinity();
+    }
+
+    auto& stats = ctx.stats();
+    stats.candidate_budget_seen++;
+    BudgetedReadPlan entry{rank_key, plan};
+    const uint32_t budget = config_.non_safeout_candidate_budget;
+    if (budgeted_read_plan_heap_.size() < budget) {
+        budgeted_read_plan_heap_.push_back(entry);
+        std::push_heap(budgeted_read_plan_heap_.begin(),
+                       budgeted_read_plan_heap_.end());
+        return;
+    }
+    if (!budgeted_read_plan_heap_.empty() &&
+        rank_key < budgeted_read_plan_heap_.front().rank_key) {
+        std::pop_heap(budgeted_read_plan_heap_.begin(),
+                      budgeted_read_plan_heap_.end());
+        budgeted_read_plan_heap_.back() = entry;
+        std::push_heap(budgeted_read_plan_heap_.begin(),
+                       budgeted_read_plan_heap_.end());
+    }
+}
+
+void OverlapScheduler::MaterializeBudgetedReadPlans(SearchContext& ctx) {
+    if (!UseNonSafeOutCandidateBudget() || budgeted_read_plan_heap_.empty()) {
+        return;
+    }
+    std::sort_heap(budgeted_read_plan_heap_.begin(),
+                   budgeted_read_plan_heap_.end());
+    std::sort(budgeted_read_plan_heap_.begin(), budgeted_read_plan_heap_.end(),
+              [](const BudgetedReadPlan& a, const BudgetedReadPlan& b) {
+                  return a.rank_key < b.rank_key;
+              });
+
+    auto& stats = ctx.stats();
+    stats.candidate_budget_selected =
+        static_cast<uint32_t>(budgeted_read_plan_heap_.size());
+    stats.candidate_budget_dropped =
+        stats.candidate_budget_seen > stats.candidate_budget_selected
+            ? stats.candidate_budget_seen - stats.candidate_budget_selected
+            : 0;
+
+    for (const auto& entry : budgeted_read_plan_heap_) {
+        const ReadPlanEntry& plan = entry.plan;
+        if (plan.type == PendingIO::Type::VEC_ALL) {
+            pending_all_plans_.push_back(plan);
+            RecordSafeInPrefetchDecision(ctx, plan.has_truth,
+                                         plan.is_true_topk);
+        } else {
+            pending_vec_only_plans_.push_back(VecOnlyReadPlan{plan.addr});
+        }
+        stats.total_submit_window_requests++;
+        stats.unique_fetch_candidates++;
+    }
+    budgeted_read_plan_heap_.clear();
+}
+
 void OverlapScheduler::FlushDeferredSafeInPlans(SearchContext& ctx,
                                                 float threshold,
                                                 bool force) {
@@ -404,13 +475,28 @@ void OverlapScheduler::FlushDeferredSafeInPlans(SearchContext& ctx,
             read.read_length = plan.addr.size;
             read.has_truth = plan.has_truth;
             read.is_true_topk = plan.is_true_topk;
-            pending_all_plans_.push_back(read);
-            ctx.stats().total_submit_window_requests++;
             ctx.stats().dynamic_safein_deferred_safein++;
-            RecordSafeInPrefetchDecision(ctx, plan.has_truth, plan.is_true_topk);
+            if (UseNonSafeOutCandidateBudget()) {
+                AddBudgetedReadPlan(ctx, read, plan.rank_key);
+            } else {
+                pending_all_plans_.push_back(read);
+                ctx.stats().total_submit_window_requests++;
+                RecordSafeInPrefetchDecision(ctx, plan.has_truth,
+                                             plan.is_true_topk);
+            }
         } else {
-            pending_vec_only_plans_.push_back(VecOnlyReadPlan{plan.addr});
-            ctx.stats().total_submit_window_requests++;
+            if (UseNonSafeOutCandidateBudget()) {
+                ReadPlanEntry read;
+                read.type = PendingIO::Type::VEC_ONLY;
+                read.addr = plan.addr;
+                read.read_length = vec_bytes_;
+                read.has_truth = plan.has_truth;
+                read.is_true_topk = plan.is_true_topk;
+                AddBudgetedReadPlan(ctx, read, plan.rank_key);
+            } else {
+                pending_vec_only_plans_.push_back(VecOnlyReadPlan{plan.addr});
+                ctx.stats().total_submit_window_requests++;
+            }
         }
     }
     ctx.stats().dynamic_safein_deferred_flushes++;
@@ -425,6 +511,7 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     pending_all_plans_.clear();
     pending_vec_only_plans_.clear();
     deferred_safein_plans_.clear();
+    budgeted_read_plan_heap_.clear();
     pending_vec_only_head_ = 0;
     next_to_submit_ = 0;
     inflight_clusters_ = 0;
@@ -436,7 +523,7 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     dynamic_safein_small_pool_extra_defer_ = false;
     dynamic_safein_last_frontier_ = std::numeric_limits<float>::infinity();
     dynamic_safein_current_frontier_ = std::numeric_limits<float>::infinity();
-    dynamic_safein_current_threshold_ = index_.conann().safein_d_k();
+    dynamic_safein_current_threshold_ = std::numeric_limits<float>::infinity();
 
     auto t_search_start = std::chrono::steady_clock::now();
     const float* effective_query_vec = query_vec;
@@ -796,6 +883,7 @@ void OverlapScheduler::ProbeResidentThinPath(
     }
 
     FlushDeferredSafeInPlans(ctx, SafeInThresholdForProbe(), /*force=*/true);
+    MaterializeBudgetedReadPlans(ctx);
 
     if (isolated_submission_mode_) {
         if (PendingDataRequestCount() > 0) {
@@ -1281,7 +1369,9 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
 
             const uint32_t idx = scratch_.unique_count++;
             scratch_.unique_indices[idx] = i;
-            ctx_.stats().unique_fetch_candidates++;
+            if (!sched_.UseNonSafeOutCandidateBudget()) {
+                ctx_.stats().unique_fetch_candidates++;
+            }
 
             if (sched_.use_estimate_frontier_) {
                 auto t_estimate_buffer = std::chrono::steady_clock::now();
@@ -1314,6 +1404,7 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
                 CandidateTruth(batch.global_idx[batch_idx], &is_true_topk);
             DeferredSafeInPlan plan;
             plan.addr = batch.decoded_addr[batch_idx];
+            plan.rank_key = batch.est_dist[batch_idx];
             plan.safein_upper_bound = batch.safein_upper_bound[batch_idx];
             plan.has_truth = has_truth;
             plan.is_true_topk = is_true_topk;
@@ -1337,18 +1428,36 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
             plan.read_length = addr.size;
             plan.has_truth = has_truth;
             plan.is_true_topk = is_true_topk;
-            sched_.pending_all_plans_.push_back(plan);
-            ctx_.stats().total_submit_window_requests++;
-            sched_.RecordSafeInPrefetchDecision(ctx_, has_truth, is_true_topk);
+            if (sched_.UseNonSafeOutCandidateBudget()) {
+                sched_.AddBudgetedReadPlan(ctx_, plan, batch.est_dist[batch_idx]);
+            } else {
+                sched_.pending_all_plans_.push_back(plan);
+                ctx_.stats().total_submit_window_requests++;
+                sched_.RecordSafeInPrefetchDecision(ctx_, has_truth,
+                                                    is_true_topk);
+            }
         }
         prepare_all_ms_ += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - all_start).count();
         auto vec_start = std::chrono::steady_clock::now();
         for (uint32_t pos = 0; pos < scratch_.vec_only_count; ++pos) {
             const uint32_t unique_idx = scratch_.vec_only_indices[pos];
-            const AddressEntry& addr = batch.decoded_addr[scratch_.unique_indices[unique_idx]];
-            sched_.pending_vec_only_plans_.push_back(VecOnlyReadPlan{addr});
-            ctx_.stats().total_submit_window_requests++;
+            const uint32_t batch_idx = scratch_.unique_indices[unique_idx];
+            const AddressEntry& addr = batch.decoded_addr[batch_idx];
+            if (sched_.UseNonSafeOutCandidateBudget()) {
+                ReadPlanEntry plan;
+                plan.type = PendingIO::Type::VEC_ONLY;
+                plan.addr = addr;
+                plan.read_length = sched_.vec_bytes_;
+                bool is_true_topk = false;
+                plan.has_truth =
+                    CandidateTruth(batch.global_idx[batch_idx], &is_true_topk);
+                plan.is_true_topk = is_true_topk;
+                sched_.AddBudgetedReadPlan(ctx_, plan, batch.est_dist[batch_idx]);
+            } else {
+                sched_.pending_vec_only_plans_.push_back(VecOnlyReadPlan{addr});
+                ctx_.stats().total_submit_window_requests++;
+            }
         }
         prepare_vec_only_ms_ += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - vec_start).count();
@@ -1759,6 +1868,7 @@ void OverlapScheduler::ProbeAndDrainInterleaved(
     }
 
     FlushDeferredSafeInPlans(ctx, SafeInThresholdForProbe(), /*force=*/true);
+    MaterializeBudgetedReadPlans(ctx);
 
     if (isolated_submission_mode_) {
         emit_pending_with_reason(PendingFlushReason::Final);

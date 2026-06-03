@@ -13,6 +13,7 @@
 ///     results.json   — metrics + pipeline stats + per-query samples
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -24,8 +25,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <unordered_map>
@@ -207,6 +210,108 @@ static std::string InferGtMode(const std::string& gt_file) {
     if (EndsWith(gt_file, ".npy")) return "npy";
     return "";
 }
+
+struct FlatstorPayloadReader {
+    std::vector<int64_t> offsets_and_lengths;
+    uint32_t rows = 0;
+    uint32_t cols = 0;
+    int fd = -1;
+    std::string index_path;
+    std::string data_path;
+    uint64_t total_payload_bytes = 0;
+
+    ~FlatstorPayloadReader() {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+
+    Status Open(const std::string& index_file,
+                const std::string& data_file,
+                uint32_t expected_rows) {
+        index_path = index_file;
+        data_path = data_file;
+
+        auto idx_or = io::LoadNpyInt64Matrix(index_file);
+        if (!idx_or.ok()) return idx_or.status();
+        auto idx = std::move(idx_or.value());
+        if (idx.rows < expected_rows) {
+            return Status::InvalidArgument(
+                "Payload index rows (" + std::to_string(idx.rows) +
+                ") smaller than dataset rows (" +
+                std::to_string(expected_rows) + ")");
+        }
+        if (idx.cols < 2) {
+            return Status::InvalidArgument(
+                "Payload index must have at least two columns: offset,length");
+        }
+
+        std::error_code ec;
+        const uint64_t data_bytes = fs::file_size(data_file, ec);
+        if (ec) {
+            return Status::IOError("Failed to stat payload data file: " + data_file);
+        }
+
+        total_payload_bytes = 0;
+        for (uint32_t row = 0; row < expected_rows; ++row) {
+            const int64_t* entry =
+                idx.data.data() + static_cast<size_t>(row) * idx.cols;
+            const int64_t offset = entry[0];
+            const int64_t length = entry[1];
+            if (offset < 0 || length < 0) {
+                return Status::InvalidArgument(
+                    "Payload index contains negative offset/length at row " +
+                    std::to_string(row));
+            }
+            if (static_cast<uint64_t>(length) >
+                static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+                return Status::InvalidArgument(
+                    "Payload length exceeds uint32_t at row " +
+                    std::to_string(row));
+            }
+            const uint64_t begin = static_cast<uint64_t>(offset);
+            const uint64_t len = static_cast<uint64_t>(length);
+            if (begin > data_bytes || len > data_bytes - begin) {
+                return Status::InvalidArgument(
+                    "Payload index points outside data file at row " +
+                    std::to_string(row));
+            }
+            total_payload_bytes += len;
+        }
+
+        offsets_and_lengths = std::move(idx.data);
+        rows = idx.rows;
+        cols = idx.cols;
+        fd = open(data_file.c_str(), O_RDONLY);
+        if (fd < 0) {
+            return Status::IOError("Failed to open payload data file: " + data_file);
+        }
+        return Status::OK();
+    }
+
+    std::string Read(uint32_t row) const {
+        if (row >= rows || fd < 0) {
+            throw std::runtime_error("FlatStor payload reader is not ready");
+        }
+        const int64_t* entry =
+            offsets_and_lengths.data() + static_cast<size_t>(row) * cols;
+        const off_t offset = static_cast<off_t>(entry[0]);
+        const size_t length = static_cast<size_t>(entry[1]);
+        std::string payload(length, '\0');
+        size_t done = 0;
+        while (done < length) {
+            ssize_t n = pread(fd, payload.data() + done, length - done,
+                              offset + static_cast<off_t>(done));
+            if (n <= 0) {
+                throw std::runtime_error(
+                    "Failed to read FlatStor payload row " +
+                    std::to_string(row) + ": " + std::strerror(errno));
+            }
+            done += static_cast<size_t>(n);
+        }
+        return payload;
+    }
+};
 
 static StatusOr<std::vector<std::vector<int64_t>>> LoadExternalGroundTruth(
     const std::string& gt_file, uint32_t q_count, uint32_t gt_k) {
@@ -521,6 +626,9 @@ struct QueryResult {
     uint32_t duplicate_candidates = 0;
     uint32_t deduplicated_candidates = 0;
     uint32_t unique_fetch_candidates = 0;
+    uint32_t candidate_budget_seen = 0;
+    uint32_t candidate_budget_selected = 0;
+    uint32_t candidate_budget_dropped = 0;
     uint32_t num_candidates_buffered = 0;
     uint32_t num_candidates_reranked = 0;
     uint32_t num_safein_payload_prefetched = 0;
@@ -630,6 +738,9 @@ struct RoundMetrics {
     double avg_duplicate_candidates = 0;
     double avg_deduplicated_candidates = 0;
     double avg_unique_fetch_candidates = 0;
+    double avg_candidate_budget_seen = 0;
+    double avg_candidate_budget_selected = 0;
+    double avg_candidate_budget_dropped = 0;
     double avg_candidate_batches_per_cluster = 0;
     double avg_safeout_frontier_estimates_buffered_per_cluster = 0;
     double avg_safeout_frontier_estimates_merged_per_cluster = 0;
@@ -885,6 +996,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.duplicate_candidates = results.stats().duplicate_candidates;
         qr.deduplicated_candidates = results.stats().deduplicated_candidates;
         qr.unique_fetch_candidates = results.stats().unique_fetch_candidates;
+        qr.candidate_budget_seen = results.stats().candidate_budget_seen;
+        qr.candidate_budget_selected =
+            results.stats().candidate_budget_selected;
+        qr.candidate_budget_dropped =
+            results.stats().candidate_budget_dropped;
         qr.num_candidates_buffered = results.stats().buffered_candidates;
         qr.num_candidates_reranked = results.stats().reranked_candidates;
         qr.num_safein_payload_prefetched = results.stats().total_safein_payload_prefetched;
@@ -953,6 +1069,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_probed_clusters = 0, sum_probed = 0, sum_si = 0, sum_so = 0, sum_unc = 0;
     double sum_s2_si = 0, sum_s2_so = 0, sum_s2_unc = 0;
     double sum_dup = 0, sum_dedup = 0, sum_unique_fetch = 0;
+    double sum_candidate_budget_seen = 0;
+    double sum_candidate_budget_selected = 0;
+    double sum_candidate_budget_dropped = 0;
     double sum_false_so = 0, sum_false_si = 0;
     double sum_io_wait = 0, sum_total = 0;
     double sum_coarse_select = 0, sum_coarse_score = 0, sum_coarse_topn = 0;
@@ -1053,6 +1172,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_dup += qresults[qi].duplicate_candidates;
         sum_dedup += qresults[qi].deduplicated_candidates;
         sum_unique_fetch += qresults[qi].unique_fetch_candidates;
+        sum_candidate_budget_seen += qresults[qi].candidate_budget_seen;
+        sum_candidate_budget_selected += qresults[qi].candidate_budget_selected;
+        sum_candidate_budget_dropped += qresults[qi].candidate_budget_dropped;
         sum_false_so += qresults[qi].false_safeout;
         sum_false_si += qresults[qi].false_safein_upper;
         sum_io_wait += qresults[qi].io_wait_ms;
@@ -1311,6 +1433,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_duplicate_candidates = sum_dup / Q;
     m.avg_deduplicated_candidates = sum_dedup / Q;
     m.avg_unique_fetch_candidates = sum_unique_fetch / Q;
+    m.avg_candidate_budget_seen = sum_candidate_budget_seen / Q;
+    m.avg_candidate_budget_selected = sum_candidate_budget_selected / Q;
+    m.avg_candidate_budget_dropped = sum_candidate_budget_dropped / Q;
     m.avg_candidates_buffered = sum_candidates_buffered / Q;
     m.avg_candidates_reranked = sum_candidates_reranked / Q;
     m.avg_safein_payload_prefetched = sum_safein_payload_prefetched / Q;
@@ -1419,6 +1544,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     Log("  %s: duplicate_candidates=%.1f  deduplicated=%.1f  unique_fetch=%.1f\n",
         label, m.avg_duplicate_candidates, m.avg_deduplicated_candidates,
         m.avg_unique_fetch_candidates);
+    Log("  %s: candidate_budget=%u  seen=%.1f  selected=%.1f  dropped=%.1f\n",
+        label, search_cfg.non_safeout_candidate_budget,
+        m.avg_candidate_budget_seen,
+        m.avg_candidate_budget_selected,
+        m.avg_candidate_budget_dropped);
     Log("  %s: buffered=%.1f  reranked=%.1f  safein_payload_prefetched=%.1f  remaining_payload_fetches=%.1f\n",
         label, m.avg_candidates_buffered, m.avg_candidates_reranked,
         m.avg_safein_payload_prefetched, m.avg_remaining_payload_fetches);
@@ -1507,6 +1637,8 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--dynamic-safein-defer-until-ready", 0);
     int arg_dynamic_safein_defer_max_candidates =
         GetIntArg(argc, argv, "--dynamic-safein-defer-max-candidates", 0);
+    int arg_non_safeout_candidate_budget =
+        GetIntArg(argc, argv, "--non-safeout-candidate-budget", 0);
     int arg_safein_all_threshold_bytes =
         GetIntArg(argc, argv, "--safein-all-threshold-bytes", 256 * 1024);
     int arg_bits       = GetIntArg(argc, argv, "--bits", 1);
@@ -1552,6 +1684,12 @@ int main(int argc, char* argv[]) {
     int arg_skip_gt = GetIntArg(argc, argv, "--skip-gt", 0);
     int arg_skip_false_stats = GetIntArg(argc, argv, "--skip-false-stats", 0);
     std::string arg_gt_file = GetStringArg(argc, argv, "--gt-file", "");
+    std::string arg_payload_mode =
+        GetStringArg(argc, argv, "--payload-mode", "metadata");
+    std::string arg_payload_index =
+        GetStringArg(argc, argv, "--payload-index", "");
+    std::string arg_payload_data =
+        GetStringArg(argc, argv, "--payload-data", "");
     int arg_fine_grained_timing =
         GetIntArg(argc, argv, "--fine-grained-timing", 0);
     int arg_hotpath_detailed_timing =
@@ -1638,6 +1776,33 @@ int main(int argc, char* argv[]) {
                      arg_safein_all_threshold_bytes);
         return 1;
     }
+    if (arg_non_safeout_candidate_budget < 0) {
+        std::fprintf(stderr,
+                     "Invalid --non-safeout-candidate-budget: %d "
+                     "(expected >= 0)\n",
+                     arg_non_safeout_candidate_budget);
+        return 1;
+    }
+    if (arg_payload_mode != "metadata" &&
+        arg_payload_mode != "audio-flatstor" &&
+        arg_payload_mode != "audio_flatstor" &&
+        arg_payload_mode != "raw-flatstor" &&
+        arg_payload_mode != "raw_flatstor" &&
+        arg_payload_mode != "flatstor" &&
+        arg_payload_mode != "flatstor-payload") {
+        std::fprintf(stderr,
+                     "Invalid --payload-mode: %s "
+                     "(expected metadata, raw-flatstor, or audio-flatstor)\n",
+                     arg_payload_mode.c_str());
+        return 1;
+    }
+    if (arg_payload_mode == "audio_flatstor") {
+        arg_payload_mode = "audio-flatstor";
+    } else if (arg_payload_mode == "raw_flatstor" ||
+               arg_payload_mode == "flatstor" ||
+               arg_payload_mode == "flatstor-payload") {
+        arg_payload_mode = "raw-flatstor";
+    }
     if (arg_assignment_factor != 1 && arg_assignment_factor != 2) {
         std::fprintf(stderr,
                      "Invalid --assignment-factor: %d (expected 1 or 2)\n",
@@ -1716,6 +1881,16 @@ int main(int argc, char* argv[]) {
 
     // Pre-built index directory (skip Phase C build if specified)
     std::string arg_index_dir = GetStringArg(argc, argv, "--index-dir", "");
+    if ((arg_payload_mode == "audio-flatstor" ||
+         arg_payload_mode == "raw-flatstor") &&
+        arg_index_dir.empty() &&
+        (arg_payload_index.empty() || arg_payload_data.empty())) {
+        std::fprintf(stderr,
+                     "--payload-mode %s requires --payload-index and "
+                     "--payload-data when building a new index\n",
+                     arg_payload_mode.c_str());
+        return 1;
+    }
 
     float arg_override_eps_ip = GetFloatArg(argc, argv, "--override-eps-ip", -1.0f);
     float arg_override_d_k = GetFloatArg(argc, argv, "--override-d-k", -1.0f);
@@ -1737,6 +1912,8 @@ int main(int argc, char* argv[]) {
         GetFloatArg(argc, argv, "--safein-epsilon-override", -1.0f);
     float arg_safeout_epsilon_percentile =
         GetFloatArg(argc, argv, "--safeout-epsilon-percentile", -1.0f);
+    float arg_safeout_epsilon_override =
+        GetFloatArg(argc, argv, "--safeout-epsilon-override", -1.0f);
     int arg_enable_stage1_safein =
         GetIntArg(argc, argv, "--enable-stage1-safein", 1);
     auto safein_dk_scope_or = ParseSafeInDkSearchScopeArg(
@@ -1856,20 +2033,47 @@ int main(int argc, char* argv[]) {
 
     Log("  Images: %u, Queries: %u/%u, Dim: %u\n", N, Q, Q_total, dim);
 
+    const bool use_flatstor_payload =
+        (arg_payload_mode == "audio-flatstor" ||
+         arg_payload_mode == "raw-flatstor");
+    FlatstorPayloadReader flatstor_payload_reader;
+
     // Load metadata
     std::unordered_map<int64_t, std::string> id_to_caption;
-    auto s = io::ReadJsonlLines(data_dir + "/metadata.jsonl",
-        [&](uint32_t, std::string_view line) {
-            int64_t id = ParseImageId(line);
-            if (id >= 0) {
-                id_to_caption[id] = ParseCaption(line);
-            }
-        });
-    if (!s.ok()) {
-        std::fprintf(stderr, "Failed to load metadata: %s\n", s.ToString().c_str());
-        return 1;
+    Status s = Status::OK();
+    if (!use_flatstor_payload) {
+        s = io::ReadJsonlLines(data_dir + "/metadata.jsonl",
+            [&](uint32_t, std::string_view line) {
+                int64_t id = ParseImageId(line);
+                if (id >= 0) {
+                    id_to_caption[id] = ParseCaption(line);
+                }
+            });
+        if (!s.ok()) {
+            std::fprintf(stderr, "Failed to load metadata: %s\n",
+                         s.ToString().c_str());
+            return 1;
+        }
+        Log("  Metadata entries: %zu\n", id_to_caption.size());
+    } else {
+        Log("  Metadata load skipped for %s payload mode\n",
+            arg_payload_mode.c_str());
     }
-    Log("  Metadata entries: %zu\n", id_to_caption.size());
+
+    if (use_flatstor_payload && arg_index_dir.empty()) {
+        Log("  Loading FlatStor payload index: %s\n", arg_payload_index.c_str());
+        s = flatstor_payload_reader.Open(arg_payload_index, arg_payload_data, N);
+        if (!s.ok()) {
+            std::fprintf(stderr, "Failed to open FlatStor payload store: %s\n",
+                         s.ToString().c_str());
+            return 1;
+        }
+        Log("  FlatStor payload store: rows=%u bytes=%llu data=%s\n",
+            flatstor_payload_reader.rows,
+            static_cast<unsigned long long>(
+                flatstor_payload_reader.total_payload_bytes),
+            arg_payload_data.c_str());
+    }
 
     // ================================================================
     // Phase B: Brute-Force Ground Truth
@@ -2004,13 +2208,27 @@ int main(int argc, char* argv[]) {
         cfg.use_blocked_hadamard_permuted =
             (arg_blocked_hadamard_permuted != 0);
         cfg.use_fht_kac_rotator = (arg_fht_kac_rotator != 0);
-        cfg.payload_schemas = {
-            {0, "id",      DType::INT64,  false},
-            {1, "caption", DType::STRING, false},
-        };
+        if (use_flatstor_payload) {
+            const char* payload_field =
+                (arg_payload_mode == "audio-flatstor") ? "audio_payload"
+                                                       : "raw_payload";
+            cfg.payload_schemas = {
+                {0, "id", DType::INT64, false},
+                {1, payload_field, DType::BYTES, false},
+            };
+        } else {
+            cfg.payload_schemas = {
+                {0, "id",      DType::INT64,  false},
+                {1, "caption", DType::STRING, false},
+            };
+        }
 
         PayloadFn payload_fn = [&](uint32_t idx) -> std::vector<Datum> {
             int64_t id = img_ids.data[idx];
+            if (use_flatstor_payload) {
+                return {Datum::Int64(id),
+                        Datum::Bytes(flatstor_payload_reader.Read(idx))};
+            }
             auto it = id_to_caption.find(id);
             std::string cap = (it != id_to_caption.end()) ? it->second : "";
             return {Datum::Int64(id), Datum::String(std::move(cap))};
@@ -2077,21 +2295,48 @@ int main(int argc, char* argv[]) {
 
     const float loaded_eps_ip = index.conann().epsilon();
     const float loaded_d_k = index.conann().d_k();
-    float runtime_safein_d_k = index.conann().safein_d_k();
-    if (runtime_safein_d_k <= 0.0f) {
-        runtime_safein_d_k = index.conann().d_k();
+    const bool uses_static_safein_threshold =
+        arg_dynamic_safein_mode == DynamicSafeInMode::Static;
+    const bool explicit_safein_dk_requested =
+        arg_safein_dk_percentile >= 0.0f ||
+        !arg_safein_dk_samples_input.empty() ||
+        !arg_safein_dk_samples_output.empty();
+    float runtime_safein_d_k = 0.0f;
+    bool runtime_safein_d_k_valid = false;
+    auto ensure_runtime_safein_d_k = [&]() {
+        if (!runtime_safein_d_k_valid) {
+            runtime_safein_d_k = index.conann().safein_d_k();
+            if (runtime_safein_d_k <= 0.0f) {
+                runtime_safein_d_k = index.conann().d_k();
+            }
+            runtime_safein_d_k_valid = true;
+        }
+    };
+    if (uses_static_safein_threshold || explicit_safein_dk_requested ||
+        arg_safein_epsilon_percentile >= 0.0f ||
+        arg_safeout_epsilon_percentile >= 0.0f) {
+        ensure_runtime_safein_d_k();
     }
     float runtime_safein_epsilon = index.conann().epsilon();
     float runtime_safeout_epsilon = index.conann().epsilon();
+    if (arg_safein_epsilon_override >= 0.0f) {
+        runtime_safein_epsilon = arg_safein_epsilon_override;
+    }
+    if (arg_safeout_epsilon_override >= 0.0f) {
+        runtime_safeout_epsilon = arg_safeout_epsilon_override;
+    }
     EpsilonCalibrationStats safein_epsilon_stats;
     EpsilonCalibrationStats safeout_epsilon_stats;
     std::vector<float> safein_dk_sample_values;
     const bool has_safein_epsilon_override =
         arg_safein_epsilon_percentile >= 0.0f ||
         arg_safein_epsilon_override >= 0.0f;
+    const bool has_safeout_epsilon_override =
+        arg_safeout_epsilon_percentile >= 0.0f ||
+        arg_safeout_epsilon_override >= 0.0f;
     const bool split_safein_safeout_eps =
         has_safein_epsilon_override ||
-        arg_safeout_epsilon_percentile >= 0.0f;
+        has_safeout_epsilon_override;
 
     const bool skip_false_stats = (arg_skip_false_stats != 0);
     const bool needs_cluster_members =
@@ -2109,18 +2354,7 @@ int main(int argc, char* argv[]) {
 
     std::vector<std::vector<uint32_t>> cluster_members_for_stats;
     bool have_cluster_members_for_stats = false;
-    if (needs_cluster_members && !arg_index_dir.empty() &&
-        !image_id_to_row.empty()) {
-        auto recover_status = RecoverClusterMembersFromIndex(
-            index, image_id_to_row, &cluster_members_for_stats);
-        if (!recover_status.ok()) {
-            std::fprintf(stderr,
-                         "Failed to recover cluster members from index payload: %s\n",
-                         recover_status.ToString().c_str());
-            return 1;
-        }
-        have_cluster_members_for_stats = true;
-    } else if (needs_cluster_members && !built_assignments.empty()) {
+    if (needs_cluster_members && !built_assignments.empty()) {
         BuildClusterMembers(built_assignments, index.nlist(),
                             &cluster_members_for_stats);
         have_cluster_members_for_stats = true;
@@ -2134,12 +2368,23 @@ int main(int argc, char* argv[]) {
         BuildClusterMembers(assignments_or.value(), index.nlist(),
                             &cluster_members_for_stats);
         have_cluster_members_for_stats = true;
+    } else if (needs_cluster_members && !arg_index_dir.empty() &&
+        !image_id_to_row.empty()) {
+        auto recover_status = RecoverClusterMembersFromIndex(
+            index, image_id_to_row, &cluster_members_for_stats);
+        if (!recover_status.ok()) {
+            std::fprintf(stderr,
+                         "Failed to recover cluster members from index payload: %s\n",
+                         recover_status.ToString().c_str());
+            return 1;
+        }
+        have_cluster_members_for_stats = true;
     }
 
     if (arg_safein_dk_percentile >= 0.0f ||
         !arg_safein_dk_samples_input.empty() ||
         !arg_safein_dk_samples_output.empty() ||
-        has_safein_epsilon_override ||
+        arg_safein_epsilon_percentile >= 0.0f ||
         arg_safeout_epsilon_percentile >= 0.0f) {
         const bool need_calibration_codes =
             !arg_safein_dk_samples_output.empty() ||
@@ -2252,6 +2497,7 @@ int main(int argc, char* argv[]) {
         if (arg_safein_dk_percentile >= 0.0f && !safein_dk_sample_values.empty()) {
             runtime_safein_d_k = SelectSafeInDkFromSamples(
                 safein_dk_sample_values, arg_safein_dk_percentile);
+            runtime_safein_d_k_valid = true;
             Log("  SafeIn d_k selected: percentile=%.4f value=%.6f\n",
                 arg_safein_dk_percentile, runtime_safein_d_k);
         }
@@ -2260,6 +2506,7 @@ int main(int argc, char* argv[]) {
             return 0;
         }
         if (arg_safein_epsilon_percentile >= 0.0f) {
+            ensure_runtime_safein_d_k();
             runtime_safein_epsilon = CalibrateSplitEpsilon(
                 all_codes, cluster_members_for_stats, img_emb.data.data(),
                 index.centroids(), index.rotation(), dim,
@@ -2272,6 +2519,7 @@ int main(int argc, char* argv[]) {
             runtime_safein_epsilon = arg_safein_epsilon_override;
         }
         if (arg_safeout_epsilon_percentile >= 0.0f) {
+            ensure_runtime_safein_d_k();
             runtime_safeout_epsilon = CalibrateSplitEpsilon(
                 all_codes, cluster_members_for_stats, img_emb.data.data(),
                 index.centroids(), index.rotation(), dim,
@@ -2281,12 +2529,25 @@ int main(int argc, char* argv[]) {
                 calibration_cluster_subset_ptr, arg_epsilon_sampling_mode,
                 &safeout_epsilon_stats);
         }
-        index.OverrideConANN(runtime_safeout_epsilon, index.conann().legacy_d_k(),
-                             runtime_safein_d_k, true);
-        Log("  Runtime SafeIn/SafeOut overrides: safein_d_k=%.6f safein_eps=%.6f safeout_eps=%.6f scope=%s nprobe=%d\n",
-            runtime_safein_d_k, runtime_safein_epsilon, runtime_safeout_epsilon,
-            arg_safein_dk_search_scope == SafeInDkSearchScope::NProbe ? "nprobe" : "full",
-            arg_safein_dk_nprobe);
+        if (arg_safein_dk_percentile >= 0.0f) {
+            ensure_runtime_safein_d_k();
+            index.OverrideConANN(runtime_safeout_epsilon,
+                                 index.conann().legacy_d_k(),
+                                 runtime_safein_d_k, true);
+            Log("  Runtime SafeIn/SafeOut overrides: safein_d_k=%.6f safein_eps=%.6f safeout_eps=%.6f scope=%s nprobe=%d\n",
+                runtime_safein_d_k, runtime_safein_epsilon,
+                runtime_safeout_epsilon,
+                arg_safein_dk_search_scope == SafeInDkSearchScope::NProbe ? "nprobe" : "full",
+                arg_safein_dk_nprobe);
+        } else {
+            Log("  Runtime SafeIn/SafeOut overrides: safein_d_k=(none) safein_eps=%.6f safeout_eps=%.6f scope=%s nprobe=%d\n",
+                runtime_safein_epsilon, runtime_safeout_epsilon,
+                arg_safein_dk_search_scope == SafeInDkSearchScope::NProbe ? "nprobe" : "full",
+                arg_safein_dk_nprobe);
+        }
+    } else if (!runtime_safein_d_k_valid &&
+               arg_dynamic_safein_mode == DynamicSafeInMode::Frontier) {
+        Log("  Runtime SafeIn threshold: dynamic_frontier (no static safein_d_k loaded)\n");
     }
 
     if ((arg_use_resident_clusters != 0) ||
@@ -2376,6 +2637,8 @@ int main(int argc, char* argv[]) {
         (arg_dynamic_safein_defer_until_ready != 0);
     search_cfg.dynamic_safein_defer_max_candidates =
         static_cast<uint32_t>(std::max(arg_dynamic_safein_defer_max_candidates, 0));
+    search_cfg.non_safeout_candidate_budget =
+        static_cast<uint32_t>(arg_non_safeout_candidate_budget);
     search_cfg.safein_all_threshold =
         static_cast<uint32_t>(arg_safein_all_threshold_bytes);
     search_cfg.prefetch_depth = static_cast<uint32_t>(
@@ -2436,7 +2699,7 @@ int main(int argc, char* argv[]) {
     if (has_safein_epsilon_override) {
         search_cfg.safein_epsilon_override = runtime_safein_epsilon;
     }
-    if (arg_safeout_epsilon_percentile >= 0.0f) {
+    if (has_safeout_epsilon_override) {
         search_cfg.safeout_epsilon_override = runtime_safeout_epsilon;
     }
     if (split_safein_safeout_eps) {
@@ -2706,6 +2969,11 @@ int main(int argc, char* argv[]) {
         metrics.avg_duplicate_candidates,
         metrics.avg_deduplicated_candidates,
         metrics.avg_unique_fetch_candidates);
+    Log("  non_safeout_candidate_budget=%u  budget_seen=%.1f  selected=%.1f  dropped=%.1f\n",
+        search_cfg.non_safeout_candidate_budget,
+        metrics.avg_candidate_budget_seen,
+        metrics.avg_candidate_budget_selected,
+        metrics.avg_candidate_budget_dropped);
     Log("  false_safeout=%.2f  false_safein_upper=%.1f  total_safein=%lu\n",
         metrics.avg_false_safeout, metrics.avg_false_safein_upper,
         static_cast<unsigned long>(metrics.total_final_safein));
@@ -2769,6 +3037,12 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("rair_lambda", arg_rair_lambda) << ",\n";
         f << "    " << JBool("rair_strict_second_choice", arg_rair_strict_second_choice != 0) << ",\n";
         f << "    " << JStr("requested_index_dir", arg_index_dir) << ",\n";
+        f << "    " << JStr("payload_mode", arg_payload_mode) << ",\n";
+        f << "    " << JStr("payload_index", arg_payload_index) << ",\n";
+        f << "    " << JStr("payload_data", arg_payload_data) << ",\n";
+        f << "    " << JNum("payload_source_bytes",
+                            static_cast<double>(
+                                flatstor_payload_reader.total_payload_bytes)) << ",\n";
         f << "    " << JStr("resolved_index_dir", resolved_index_dir) << "\n";
         f << "  },\n";
         f << "  \"search_config\": {\n";
@@ -2792,6 +3066,8 @@ int main(int argc, char* argv[]) {
                              search_cfg.dynamic_safein_defer_until_ready) << ",\n";
         f << "    " << JInt("dynamic_safein_defer_max_candidates",
                             search_cfg.dynamic_safein_defer_max_candidates) << ",\n";
+        f << "    " << JInt("non_safeout_candidate_budget",
+                            search_cfg.non_safeout_candidate_budget) << ",\n";
         f << "    " << JInt("safein_all_threshold_bytes",
                             search_cfg.safein_all_threshold) << ",\n";
         f << "    " << JInt("prefetch_depth", search_cfg.prefetch_depth) << ",\n";
@@ -2839,7 +3115,13 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("loaded_d_k", loaded_d_k) << ",\n";
         f << "    " << JNum("runtime_eps_ip", index.conann().epsilon()) << ",\n";
         f << "    " << JNum("runtime_d_k", index.conann().d_k()) << ",\n";
-        f << "    " << JNum("runtime_safein_d_k", runtime_safein_d_k) << ",\n";
+        f << "    \"runtime_safein_d_k\": ";
+        if (runtime_safein_d_k_valid) {
+            f << std::fixed << std::setprecision(4) << runtime_safein_d_k;
+        } else {
+            f << "null";
+        }
+        f << ",\n";
         f << "    " << JNum("runtime_safein_epsilon", runtime_safein_epsilon) << ",\n";
         f << "    " << JNum("runtime_safeout_epsilon", runtime_safeout_epsilon) << ",\n";
         f << "    " << JNum("safein_dk_percentile", arg_safein_dk_percentile) << ",\n";
@@ -2893,6 +3175,10 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("brute_force_time_ms", brute_force_time_ms) << ",\n";
         f << "    " << JStr("index_source", index_source) << ",\n";
         f << "    " << JStr("resolved_index_dir", resolved_index_dir) << ",\n";
+        f << "    " << JStr("payload_mode", arg_payload_mode) << ",\n";
+        f << "    " << JNum("payload_source_bytes",
+                            static_cast<double>(
+                                flatstor_payload_reader.total_payload_bytes)) << ",\n";
         f << "    " << JInt("exrabitq_storage_version",
                             index.segment().cluster_reader().file_version()) << ",\n";
         f << "    " << JStr("exrabitq_storage_format",
@@ -2902,7 +3188,13 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("loaded_d_k", loaded_d_k) << ",\n";
         f << "    " << JNum("runtime_eps_ip", index.conann().epsilon()) << ",\n";
         f << "    " << JNum("runtime_d_k", index.conann().d_k()) << ",\n";
-        f << "    " << JNum("runtime_safein_d_k", runtime_safein_d_k) << ",\n";
+        f << "    \"runtime_safein_d_k\": ";
+        if (runtime_safein_d_k_valid) {
+            f << std::fixed << std::setprecision(4) << runtime_safein_d_k;
+        } else {
+            f << "null";
+        }
+        f << ",\n";
         f << "    " << JNum("runtime_safein_epsilon", runtime_safein_epsilon) << ",\n";
         f << "    " << JNum("runtime_safeout_epsilon", runtime_safeout_epsilon) << ",\n";
         f << "    " << JNum("safein_dk_percentile", arg_safein_dk_percentile) << ",\n";
@@ -2974,6 +3266,9 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_duplicate_candidates", metrics.avg_duplicate_candidates) << ",\n";
         f << "    " << JNum("avg_deduplicated_candidates", metrics.avg_deduplicated_candidates) << ",\n";
         f << "    " << JNum("avg_unique_fetch_candidates", metrics.avg_unique_fetch_candidates) << ",\n";
+        f << "    " << JNum("avg_candidate_budget_seen", metrics.avg_candidate_budget_seen) << ",\n";
+        f << "    " << JNum("avg_candidate_budget_selected", metrics.avg_candidate_budget_selected) << ",\n";
+        f << "    " << JNum("avg_candidate_budget_dropped", metrics.avg_candidate_budget_dropped) << ",\n";
         f << "    " << JNum("avg_false_safeout", metrics.avg_false_safeout) << ",\n";
         f << "    " << JNum("avg_false_safein_upper", metrics.avg_false_safein_upper) << ",\n";
         f << "    " << JInt("total_final_safein", static_cast<int64_t>(metrics.total_final_safein)) << ",\n";
@@ -3179,6 +3474,9 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("remaining_payload_fetch_ms", qr.remaining_payload_fetch_ms) << ",\n";
             f << "      " << JInt("num_candidates_buffered", qr.num_candidates_buffered) << ",\n";
             f << "      " << JInt("num_candidates_reranked", qr.num_candidates_reranked) << ",\n";
+            f << "      " << JInt("candidate_budget_seen", qr.candidate_budget_seen) << ",\n";
+            f << "      " << JInt("candidate_budget_selected", qr.candidate_budget_selected) << ",\n";
+            f << "      " << JInt("candidate_budget_dropped", qr.candidate_budget_dropped) << ",\n";
             f << "      " << JInt("num_safein_payload_prefetched", qr.num_safein_payload_prefetched) << ",\n";
             f << "      " << JInt("num_remaining_payload_fetches", qr.num_remaining_payload_fetches) << ",\n";
             f << "      " << JInt("dynamic_safein_deferred_candidates", qr.dynamic_safein_deferred_candidates) << ",\n";

@@ -640,7 +640,27 @@ int main(int argc, char* argv[]) {
         index.conann().epsilon(), index.conann().d_k(),
         index.nlist(), index.used_hadamard());
 
-    float runtime_safein_dk = index.conann().safein_d_k();
+    const bool uses_static_safein_threshold =
+        dynamic_safein_mode == DynamicSafeInMode::Static;
+    const bool explicit_safein_dk_requested =
+        safein_dk_percentile >= 0.0f ||
+        !safein_dk_samples_input.empty() ||
+        !safein_dk_samples_output.empty();
+    const bool needs_safein_dk_for_calibration =
+        safein_epsilon_percentile >= 0.0f ||
+        safeout_epsilon_percentile >= 0.0f;
+    float runtime_safein_dk = 0.0f;
+    bool runtime_safein_dk_valid = false;
+    auto ensure_runtime_safein_dk = [&]() {
+        if (!runtime_safein_dk_valid) {
+            runtime_safein_dk = index.conann().safein_d_k();
+            runtime_safein_dk_valid = true;
+        }
+    };
+    if (uses_static_safein_threshold || explicit_safein_dk_requested ||
+        needs_safein_dk_for_calibration) {
+        ensure_runtime_safein_dk();
+    }
     float runtime_safein_eps = index.conann().epsilon();
     float runtime_safeout_eps = index.conann().epsilon();
     SafeInThresholdSource safein_threshold_source =
@@ -760,6 +780,7 @@ int main(int argc, char* argv[]) {
             }
             runtime_safein_dk = SelectSafeInDkFromSamples(
                 samples, safein_dk_percentile);
+            runtime_safein_dk_valid = true;
             safein_threshold_source =
                 (requested_safein_dk_space == SafeInDkSpace::RabitqS2)
                     ? SafeInThresholdSource::RabitqS2Kth
@@ -775,6 +796,7 @@ int main(int argc, char* argv[]) {
                              "SafeIn epsilon calibration requires encoded RabitQ codes.\n");
                 return 1;
             }
+            ensure_runtime_safein_dk();
             runtime_safein_eps = CalibrateSplitEpsilon(
                 all_codes, cluster_members_for_stats, base.data.data(), index.centroids(),
                 index.rotation(), dim, epsilon_samples, safein_epsilon_percentile,
@@ -787,24 +809,30 @@ int main(int argc, char* argv[]) {
                              "SafeOut epsilon calibration requires encoded RabitQ codes.\n");
                 return 1;
             }
+            ensure_runtime_safein_dk();
             runtime_safeout_eps = CalibrateSplitEpsilon(
                 all_codes, cluster_members_for_stats, base.data.data(), index.centroids(),
                 index.rotation(), dim, epsilon_samples, safeout_epsilon_percentile,
                 seed, runtime_safein_dk, bits, nullptr, epsilon_sampling_mode,
                 &safeout_epsilon_stats);
         }
-        override_conann = true;
+        override_conann = safein_dk_percentile >= 0.0f;
     }
 
     if (override_conann) {
+        ensure_runtime_safein_dk();
         index.OverrideConANN(runtime_safeout_eps, index.conann().legacy_d_k(),
                              runtime_safein_dk, true);
         Log("  override safein_threshold=%.6f source=%s safein_eps=%.6f safeout_eps=%.6f\n",
             runtime_safein_dk, SafeInThresholdSourceName(safein_threshold_source),
             runtime_safein_eps, runtime_safeout_eps);
     }
-    Log("  active SafeIn threshold source=%s threshold=%.6f\n",
-        SafeInThresholdSourceName(safein_threshold_source), runtime_safein_dk);
+    if (runtime_safein_dk_valid) {
+        Log("  active SafeIn threshold source=%s threshold=%.6f\n",
+            SafeInThresholdSourceName(safein_threshold_source), runtime_safein_dk);
+    } else {
+        Log("  active SafeIn threshold source=dynamic_frontier threshold=(per-query)\n");
+    }
 
     // ================================================================
     // Phase D: Query
@@ -1019,7 +1047,9 @@ int main(int argc, char* argv[]) {
             per_query_stats
                 << qi << ','
                 << exact_kth_l2[qi] << ','
-                << (runtime_safein_dk - exact_kth_l2[qi]) << ','
+                << (runtime_safein_dk_valid
+                        ? runtime_safein_dk - exact_kth_l2[qi]
+                        : std::numeric_limits<float>::quiet_NaN()) << ','
                 << st.total_safe_in << ','
                 << st.s1_false_safe_in << ','
                 << st.s2_safe_in << ','
@@ -1240,13 +1270,22 @@ int main(int argc, char* argv[]) {
            << safein_dk_samples_written << "\",\n";
         jf << "  \"safein_dk_samples_count\": "
            << safein_dk_samples_count << ",\n";
-        jf << "  \"safein_d_k\": " << runtime_safein_dk << ",\n";
+        jf << "  \"safein_d_k\": ";
+        if (runtime_safein_dk_valid) {
+            jf << runtime_safein_dk;
+        } else {
+            jf << "null";
+        }
+        jf << ",\n";
         jf << "  \"safein_epsilon_percentile\": " << safein_epsilon_percentile << ",\n";
         jf << "  \"safein_epsilon\": " << runtime_safein_eps << ",\n";
         jf << "  \"safeout_epsilon_percentile\": " << safeout_epsilon_percentile << ",\n";
         jf << "  \"safeout_epsilon\": " << runtime_safeout_eps << ",\n";
         jf << "  \"safein_threshold_source\": \""
-           << SafeInThresholdSourceName(safein_threshold_source) << "\",\n";
+           << (runtime_safein_dk_valid
+                   ? SafeInThresholdSourceName(safein_threshold_source)
+                   : "dynamic_frontier")
+           << "\",\n";
         jf << "  \"epsilon_sampling_mode\": \""
            << EpsilonSamplingModeName(epsilon_sampling_mode) << "\",\n";
         jf << "  \"epsilon_requested_samples\": " << epsilon_samples << ",\n";

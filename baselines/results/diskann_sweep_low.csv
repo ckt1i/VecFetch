@@ -1,9 +1,0 @@
-system,dataset,topk,param,recall@1,recall@5,recall@10,avg_latency_ms,p50_latency_ms,p99_latency_ms,notes,protocol
-DiskANN-disk,coco_100k,10,"R=64,L_build=100,L_search=1",0.8960,0.9910,0.9970,0.9691,0.9441,1.6023,"warmup=100,queries=1000,beam=4,cache_nodes=10000",warm
-DiskANN-disk,coco_100k,10,"R=64,L_build=100,L_search=2",0.8960,0.9910,0.9970,0.9500,0.9237,1.6361,"warmup=100,queries=1000,beam=4,cache_nodes=10000",warm
-DiskANN-disk,coco_100k,10,"R=64,L_build=100,L_search=4",0.8960,0.9910,0.9970,0.9463,0.9203,1.5558,"warmup=100,queries=1000,beam=4,cache_nodes=10000",warm
-DiskANN-disk,coco_100k,10,"R=64,L_build=100,L_search=8",0.8960,0.9910,0.9970,1.1357,1.1134,1.9426,"warmup=100,queries=1000,beam=4,cache_nodes=10000",warm
-DiskANN-disk,coco_100k,10,"R=64,L_build=100,L_search=16",0.9290,0.9980,0.9990,1.6735,1.6399,2.4992,"warmup=100,queries=1000,beam=4,cache_nodes=10000",warm
-DiskANN-disk,coco_100k,10,"R=64,L_build=100,L_search=32",0.9680,1.0000,1.0000,2.6148,2.5704,3.5168,"warmup=100,queries=1000,beam=4,cache_nodes=10000",warm
-DiskANN-disk,coco_100k,10,"R=32,L_build=50,L_search=1",0.7840,0.9830,0.9930,1.1090,1.0803,1.8078,"warmup=100,queries=1000,beam=4,cache_nodes=10000",warm
-DiskANN-disk,coco_100k,10,"R=32,L_build=50,L_search=2",0.7840,0.9830,0.9930,1.1189,1.0891,1.8073,"warmup=100,queries=1000,beam=4,cache_nodes=10000",warm

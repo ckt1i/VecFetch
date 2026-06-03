@@ -18,7 +18,7 @@ ImageNet-1K and VoxCeleb2 embeddings have now been materialized locally, but the
 - Reuse IVF/RaBitQ index caches and shared vector-search outputs across FlatStor and Lance wherever parameters match.
 - For each dataset, use only one final DiskANN build configuration in the promoted baseline table; the selected graph index must have an `L_search`/beam sweep whose recall range covers the corresponding IVF+RaBitQ recall range:
   - the lowest valid DiskANN recall point is at or below the lowest valid IVF+RaBitQ point for the same dataset/top-k where possible;
-  - the highest valid DiskANN recall point is at or above the highest valid IVF+RaBitQ point for the same dataset/top-k.
+  - the highest valid DiskANN recall point is at or above the highest valid IVF+RaBitQ point for the same dataset/top-k, unless an operator cap is explicitly requested; the current ImageNet promotion uses a high-end cap of `0.995`.
 - Keep DiskANN tuning/probe rows isolated until the single-index coverage check passes, then promote only the accepted index rows into the main ICDE baseline summary.
 - Preserve disk-space safety: avoid unpacking ImageNet/Vox raw archives into duplicate full file trees, and do not delete any user-provided raw downloads or existing experiment results.
 

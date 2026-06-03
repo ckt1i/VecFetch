@@ -78,9 +78,9 @@ profile_output/
 
 # safeIn_dk_review_logs
 **/results.json
-**/config.json
+**/*.json
 **/cmd.txt
-**/run.log
+**/*.log
 **/*.npy
 **/online_per_query.csv
 **/summary.json

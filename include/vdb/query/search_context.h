@@ -92,6 +92,10 @@ struct SearchConfig {
     float safein_epsilon_override = -1.0f;
     float safeout_epsilon_override = -1.0f;
 
+    // Optional cap for non-SafeOut candidates. When non-zero, the scheduler
+    // keeps only the best estimated candidates for vector verification.
+    uint32_t non_safeout_candidate_budget = 0;
+
     // Optional benchmark-only truth metadata for per-stage false classification
     // counters. cluster_members maps cluster-local vector offsets to original
     // database row ids; true_topk_rows is the current query's GT top-k set.
@@ -148,6 +152,9 @@ struct SearchStats {
     uint32_t unique_fetch_candidates = 0;
     uint32_t buffered_candidates = 0;
     uint32_t reranked_candidates = 0;
+    uint32_t candidate_budget_seen = 0;
+    uint32_t candidate_budget_selected = 0;
+    uint32_t candidate_budget_dropped = 0;
     double coarse_select_ms = 0;
     double coarse_score_ms = 0;
     double coarse_topn_ms = 0;

@@ -186,9 +186,19 @@ class OverlapScheduler {
 
     struct DeferredSafeInPlan {
         AddressEntry addr;
+        float rank_key = std::numeric_limits<float>::infinity();
         float safein_upper_bound = std::numeric_limits<float>::infinity();
         bool has_truth = false;
         bool is_true_topk = false;
+    };
+
+    struct BudgetedReadPlan {
+        float rank_key = std::numeric_limits<float>::infinity();
+        ReadPlanEntry plan;
+
+        bool operator<(const BudgetedReadPlan& other) const {
+            return rank_key < other.rank_key;
+        }
     };
 
     using PreparedClusterQueryView = rabitq::PreparedClusterQueryView;
@@ -204,6 +214,7 @@ class OverlapScheduler {
     std::deque<ReadPlanEntry> pending_all_plans_;
     std::vector<VecOnlyReadPlan> pending_vec_only_plans_;
     std::vector<DeferredSafeInPlan> deferred_safein_plans_;
+    std::vector<BudgetedReadPlan> budgeted_read_plan_heap_;
     size_t pending_vec_only_head_ = 0;
     uint32_t next_to_submit_ = 0;
     uint32_t inflight_clusters_ = 0;
@@ -265,7 +276,7 @@ class OverlapScheduler {
     void UpdateDynamicSafeInState(SearchContext& ctx, bool advance_probe);
     float SafeInThresholdForProbe() const;
     void RecordDynamicSafeInStats(SearchContext& ctx, float threshold,
-                                  float frontier) const;
+                                  float frontier);
     bool ShouldDeferSafeInPlans() const;
     bool ShouldHoldDeferredSafeInPlans();
     void RecordSafeInPrefetchDecision(SearchContext& ctx,
@@ -273,6 +284,10 @@ class OverlapScheduler {
                                       bool is_true_topk) const;
     void FlushDeferredSafeInPlans(SearchContext& ctx, float threshold,
                                   bool force);
+    bool UseNonSafeOutCandidateBudget() const;
+    void AddBudgetedReadPlan(SearchContext& ctx, const ReadPlanEntry& plan,
+                             float rank_key);
+    void MaterializeBudgetedReadPlans(SearchContext& ctx);
 
     // Stage 2 ExRaBitQ re-classification
     float margin_s2_divisor_ = 1.0f;  // 2^(bits-1), precomputed
