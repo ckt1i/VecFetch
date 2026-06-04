@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fixed-parameter MSMARCO rotation comparison for padded/blocked/FhtKac."""
+"""Run the fixed-parameter MSMARCO FHT-Kac mainline validation."""
 
 from __future__ import annotations
 
@@ -8,23 +8,13 @@ import csv
 import json
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
-
-
-@dataclass(frozen=True)
-class RotationRun:
-    name: str
-    pad_to_pow2: bool
-    blocked_hadamard_permuted: bool
-    fht_kac_rotator: bool
-    centroids: str
+from typing import Dict, Sequence
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run the fixed-parameter MSMARCO padded/blocked/FhtKac comparison."
+        description="Run the MSMARCO FHT-Kac mainline validation."
     )
     p.add_argument(
         "--bench-bin",
@@ -40,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--output-root",
-        default="/home/zcq/VDB/test/msmarco_fht_kac_compare",
+        default="/home/zcq/VDB/test/msmarco_fht_kac_mainline",
     )
     p.add_argument(
         "--gt-file",
@@ -80,42 +70,10 @@ def prepare_adapter(args: argparse.Namespace) -> None:
     run_cmd(cmd, cwd=script.parent)
 
 
-def run_specs(args: argparse.Namespace) -> List[RotationRun]:
+def bench_command(args: argparse.Namespace, run_output: Path, index_dir: Path) -> list[str]:
     root = Path(args.embeddings_root)
-    return [
-        RotationRun(
-            name="hadamard_padded",
-            pad_to_pow2=True,
-            blocked_hadamard_permuted=False,
-            fht_kac_rotator=False,
-            centroids=str(root / "msmarco_passage_centroid_16384_pad1024.fvecs"),
-        ),
-        RotationRun(
-            name="blocked_hadamard_permuted",
-            pad_to_pow2=False,
-            blocked_hadamard_permuted=True,
-            fht_kac_rotator=False,
-            centroids=str(root / "msmarco_passage_centroid_16384.fvecs"),
-        ),
-        RotationRun(
-            name="fht_kac_rotator",
-            pad_to_pow2=False,
-            blocked_hadamard_permuted=False,
-            fht_kac_rotator=True,
-            centroids=str(root / "msmarco_passage_centroid_16384.fvecs"),
-        ),
-    ]
-
-
-def bench_command(
-    args: argparse.Namespace,
-    spec: RotationRun,
-    run_output: Path,
-    index_dir: Path,
-) -> List[str]:
-    assignments = (
-        Path(args.embeddings_root) / "msmarco_passage_cluster_id_16384.ivecs"
-    )
+    assignments = root / "msmarco_passage_cluster_id_16384.ivecs"
+    centroids = root / "msmarco_passage_centroid_16384.fvecs"
     cmd = [
         str(Path(args.bench_bin)),
         "--dataset",
@@ -137,23 +95,11 @@ def bench_command(
         "--metric",
         "cosine",
         "--centroids",
-        spec.centroids,
+        str(centroids),
         "--assignments",
         str(assignments),
-        "--pad-to-pow2",
-        "1" if spec.pad_to_pow2 else "0",
-        "--blocked-hadamard-permuted",
-        "1" if spec.blocked_hadamard_permuted else "0",
-        "--fht-kac-rotator",
-        "1" if spec.fht_kac_rotator else "0",
-        "--assignment-mode",
-        "single",
         "--coarse-builder",
         "superkmeans",
-        "--clu-read-mode",
-        "full_preload",
-        "--use-resident-clusters",
-        "1",
     ]
     reuse_index = (not args.force_rebuild) and (index_dir / "segment.meta").exists()
     if reuse_index:
@@ -171,13 +117,11 @@ def resolve_results_path(run_output: Path) -> Path:
     raise FileNotFoundError(f"results.json not found under {run_output}")
 
 
-def write_reports(output_root: Path, rows: List[Dict[str, object]]) -> None:
-    csv_path = output_root / "rotation_compare.csv"
-    json_path = output_root / "rotation_compare.json"
-    md_path = output_root / "rotation_compare.md"
-
+def write_reports(output_root: Path, row: Dict[str, object]) -> None:
+    csv_path = output_root / "fht_kac_mainline.csv"
+    json_path = output_root / "fht_kac_mainline.json"
+    md_path = output_root / "fht_kac_mainline.md"
     fieldnames = [
-        "name",
         "rotation_mode",
         "padding_mode",
         "logical_dimension",
@@ -195,62 +139,57 @@ def write_reports(output_root: Path, rows: List[Dict[str, object]]) -> None:
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
-
+        writer.writerow(row)
     with json_path.open("w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2)
-
+        json.dump(row, f, indent=2, ensure_ascii=False)
+        f.write("\n")
     with md_path.open("w", encoding="utf-8") as f:
-        f.write("| mode | logical/effective | avg ms | recall@10 | clu bytes | rotated centroids | rotation.bin | total bytes |\n")
-        f.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
-        for row in rows:
-            f.write(
-                f"| {row['name']} | {row['logical_dimension']}/{row['effective_dimension']} | "
-                f"{row['avg_query_time_ms']:.4f} | {row['recall_at_10']:.4f} | "
-                f"{int(row['index_cluster_clu_bytes'])} | {int(row['index_rotated_centroids_bytes'])} | "
-                f"{int(row['index_rotation_bytes'])} | {int(row['index_total_bytes'])} |\n"
-            )
+        f.write("# MSMARCO FHT-Kac mainline validation\n\n")
+        f.write("| rotation | logical/effective | avg ms | recall@10 | total bytes |\n")
+        f.write("| --- | --- | ---: | ---: | ---: |\n")
+        f.write(
+            f"| {row['rotation_mode']} | "
+            f"{row['logical_dimension']}/{row['effective_dimension']} | "
+            f"{row['avg_query_time_ms']:.4f} | {row['recall_at_10']:.4f} | "
+            f"{int(row['index_total_bytes'])} |\n"
+        )
 
 
-def extract_row(spec: RotationRun, results: Dict) -> Dict[str, object]:
+def extract_row(args: argparse.Namespace, results: Dict) -> Dict[str, object]:
     metrics = results["metrics"]
-    index_meta = results["index"]
     return {
-        "name": spec.name,
-        "rotation_mode": index_meta["rotation_mode"],
-        "padding_mode": index_meta["padding_mode"],
-        "logical_dimension": index_meta["logical_dimension"],
-        "effective_dimension": index_meta["effective_dimension"],
-        "nlist": results["build"]["nlist"],
-        "nprobe": results["query"]["nprobe"],
+        "rotation_mode": metrics["rotation_mode"],
+        "padding_mode": metrics["padding_mode"],
+        "logical_dimension": metrics["logical_dimension"],
+        "effective_dimension": metrics["effective_dimension"],
+        "nlist": args.nlist,
+        "nprobe": args.nprobe,
         "avg_query_time_ms": metrics["avg_query_time_ms"],
         "recall_at_10": metrics["recall_at_10"],
-        "index_cluster_clu_bytes": metrics["index_cluster_clu_bytes"],
-        "index_rotated_centroids_bytes": metrics["index_rotated_centroids_bytes"],
-        "index_rotation_bytes": metrics["index_rotation_bytes"],
-        "index_total_bytes": metrics["index_total_bytes"],
-        "resolved_index_dir": results["build"]["resolved_index_dir"],
+        "index_cluster_clu_bytes": metrics.get("index_cluster_clu_bytes", 0.0),
+        "index_rotated_centroids_bytes": metrics.get(
+            "index_rotated_centroids_bytes", 0.0
+        ),
+        "index_rotation_bytes": metrics.get("index_rotation_bytes", 0.0),
+        "index_total_bytes": metrics.get("index_total_bytes", 0.0),
+        "resolved_index_dir": metrics.get("resolved_index_dir", ""),
     }
 
 
 def main() -> int:
     args = parse_args()
-    output_root = Path(args.output_root)
+    output_root = Path(args.output_root).resolve()
+    run_output = output_root / "fht_kac_rotator"
+    index_dir = output_root / "indices" / "fht_kac_rotator"
     output_root.mkdir(parents=True, exist_ok=True)
+    run_output.mkdir(parents=True, exist_ok=True)
+    index_dir.parent.mkdir(parents=True, exist_ok=True)
 
     prepare_adapter(args)
-
-    rows: List[Dict[str, object]] = []
-    for spec in run_specs(args):
-        run_output = output_root / spec.name
-        index_dir = run_output / "index"
-        run_output.mkdir(parents=True, exist_ok=True)
-        run_cmd(bench_command(args, spec, run_output, index_dir))
-        results = load_json(resolve_results_path(run_output))
-        rows.append(extract_row(spec, results))
-
-    write_reports(output_root, rows)
-    print(json.dumps(rows, indent=2))
+    run_cmd(bench_command(args, run_output, index_dir), cwd=run_output)
+    row = extract_row(args, load_json(resolve_results_path(run_output)))
+    write_reports(output_root, row)
+    print(json.dumps(row, indent=2, ensure_ascii=False))
     return 0
 
 

@@ -450,8 +450,6 @@ TEST_F(OverlapSchedulerTest, IoUringFixedVecBufferCountCanEnableFixedHits) {
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
-    config.clu_read_mode = CluReadMode::FullPreload;
-    config.use_resident_clusters = true;
     config.io_queue_depth = 16;
     config.fixed_vec_buffer_count = 2;
 
@@ -471,18 +469,15 @@ TEST_F(OverlapSchedulerTest, IoUringFixedVecBufferCountCanEnableFixedHits) {
 }
 
 // ============================================================================
-// Phase 8: Async cluster prefetch tests
+// Resident full-preload query path tests
 // ============================================================================
 
-TEST_F(OverlapSchedulerTest, PrefetchConfig_SmallDepth) {
+TEST_F(OverlapSchedulerTest, ResidentPathMultipleRandomQueries) {
     PreadFallbackReader reader;
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
     config.probe_batch_size = 64;
-    config.prefetch_depth = 4;
-    config.refill_threshold = 1;
-    config.refill_count = 1;
 
     OverlapScheduler scheduler(*index_, reader, config);
 
@@ -503,15 +498,13 @@ TEST_F(OverlapSchedulerTest, PrefetchConfig_SmallDepth) {
     }
 }
 
-TEST_F(OverlapSchedulerTest, PrefetchDepth_ExceedsNprobe) {
+TEST_F(OverlapSchedulerTest, ResidentPathAutoPreloads) {
     PreadFallbackReader reader;
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
-    config.prefetch_depth = 100;  // >> nprobe=4
-    config.refill_threshold = 2;
-    config.refill_count = 2;
 
+    EXPECT_FALSE(index_->segment().resident_preload_enabled());
     OverlapScheduler scheduler(*index_, reader, config);
 
     std::mt19937 rng(789);
@@ -528,6 +521,8 @@ TEST_F(OverlapSchedulerTest, PrefetchDepth_ExceedsNprobe) {
             EXPECT_LE(results[i - 1].distance, results[i].distance);
         }
     }
+    EXPECT_TRUE(index_->segment().resident_preload_enabled());
+    EXPECT_GT(index_->segment().resident_preload_bytes(), 0u);
 }
 
 TEST_F(OverlapSchedulerTest, MultipleQueries_StateReset) {
@@ -535,7 +530,6 @@ TEST_F(OverlapSchedulerTest, MultipleQueries_StateReset) {
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
-    config.prefetch_depth = 4;
 
     OverlapScheduler scheduler(*index_, reader, config);
 
@@ -561,9 +555,6 @@ TEST_F(OverlapSchedulerTest, MultipleQueriesUseFixedProbePath) {
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
-    config.prefetch_depth = 4;
-    config.refill_threshold = 2;
-    config.refill_count = 2;
 
     OverlapScheduler scheduler(*index_, reader, config);
 
@@ -580,9 +571,6 @@ TEST_F(OverlapSchedulerTest, SubmitBatchingAndReservePopulateStats) {
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
-    config.prefetch_depth = 4;
-    config.refill_threshold = 2;
-    config.refill_count = 2;
     config.io_queue_depth = 32;
     config.cluster_submit_reserve = 4;
     config.submit_batch_size = 8;
@@ -606,9 +594,6 @@ TEST_F(OverlapSchedulerTest, SharedAndIsolatedModesProduceSameResults) {
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
-    config.prefetch_depth = 4;
-    config.refill_threshold = 2;
-    config.refill_count = 2;
     config.io_queue_depth = 32;
     config.cluster_submit_reserve = 4;
     config.submit_batch_size = 8;
@@ -632,13 +617,10 @@ TEST_F(OverlapSchedulerTest, SharedAndIsolatedModesProduceSameResults) {
     }
 }
 
-TEST_F(OverlapSchedulerTest, WindowAndFullPreloadModesProduceSameResults) {
+TEST_F(OverlapSchedulerTest, ResidentPathUsesPreloadedClusters) {
     SearchConfig config;
     config.top_k = kTopK;
     config.nprobe = kNprobe;
-    config.prefetch_depth = 4;
-    config.refill_threshold = 2;
-    config.refill_count = 2;
     config.io_queue_depth = 32;
     config.cluster_submit_reserve = 4;
     config.submit_batch_size = 8;
@@ -646,20 +628,14 @@ TEST_F(OverlapSchedulerTest, WindowAndFullPreloadModesProduceSameResults) {
     std::vector<float> query(kDim, 0.0f);
     query[0] = 1.0f;
 
-    PreadFallbackReader window_reader;
-    OverlapScheduler window_scheduler(*index_, window_reader, config);
-    auto window_results = window_scheduler.Search(query.data());
-
     PreadFallbackReader preload_reader;
-    config.clu_read_mode = CluReadMode::FullPreload;
     OverlapScheduler preload_scheduler(*index_, preload_reader, config);
     auto preload_results = preload_scheduler.Search(query.data());
 
-    ASSERT_EQ(window_results.size(), preload_results.size());
-    for (uint32_t i = 0; i < window_results.size(); ++i) {
-        EXPECT_FLOAT_EQ(window_results[i].distance, preload_results[i].distance);
+    ASSERT_GT(preload_results.size(), 0u);
+    for (uint32_t i = 1; i < preload_results.size(); ++i) {
+        EXPECT_LE(preload_results[i - 1].distance, preload_results[i].distance);
     }
-    EXPECT_EQ(preload_results.stats().parse_cluster_ms, 0.0);
     EXPECT_TRUE(index_->segment().resident_preload_enabled());
     EXPECT_GT(index_->segment().resident_preload_bytes(), 0u);
     if (preload_results.stats().stage2_masked_kernel_calls > 0) {
@@ -669,95 +645,4 @@ TEST_F(OverlapSchedulerTest, WindowAndFullPreloadModesProduceSameResults) {
                   preload_results.stats().stage2_lanes_skipped,
                   preload_results.stats().stage2_lanes_total_valid);
     }
-}
-
-TEST_F(OverlapSchedulerTest, RedundantAssignmentDeduplicatesBeforeRerank) {
-    auto ra_dir = fs::temp_directory_path() / "vdb_scheduler_test_ra";
-    fs::remove_all(ra_dir);
-    fs::create_directories(ra_dir);
-
-    IvfBuilderConfig cfg;
-    cfg.nlist = kNlist;
-    cfg.max_iterations = 20;
-    cfg.seed = 42;
-    cfg.rabitq.c_factor = 5.75f;
-    cfg.calibration_samples = 50;
-    cfg.calibration_topk = kTopK;
-    cfg.epsilon_samples = 20;
-    cfg.page_size = 1;
-    cfg.assignment_factor = 2;
-    cfg.assignment_mode = AssignmentMode::RedundantTop2Naive;
-
-    IvfBuilder builder(cfg);
-    auto s = builder.Build(vectors_.data(), N, kDim, ra_dir.string());
-    ASSERT_TRUE(s.ok()) << s.message();
-
-    IvfIndex ra_index;
-    s = ra_index.Open(ra_dir.string());
-    ASSERT_TRUE(s.ok()) << s.message();
-    EXPECT_EQ(ra_index.assignment_factor(), 2u);
-
-    PreadFallbackReader reader;
-    SearchConfig config;
-    config.top_k = kTopK;
-    config.nprobe = kNprobe;
-
-    OverlapScheduler scheduler(ra_index, reader, config);
-    const float* query = vectors_.data();
-    auto results = scheduler.Search(query);
-
-    ASSERT_GT(results.size(), 0u);
-    EXPECT_GT(results.stats().duplicate_candidates, 0u);
-    EXPECT_GT(results.stats().deduplicated_candidates, 0u);
-    EXPECT_EQ(results.stats().total_reranked,
-              results.stats().unique_fetch_candidates);
-
-    fs::remove_all(ra_dir);
-}
-
-TEST_F(OverlapSchedulerTest, RairAssignmentDeduplicatesBeforeRerank) {
-    auto ra_dir = fs::temp_directory_path() / "vdb_scheduler_test_rair";
-    fs::remove_all(ra_dir);
-    fs::create_directories(ra_dir);
-
-    IvfBuilderConfig cfg;
-    cfg.nlist = kNlist;
-    cfg.max_iterations = 20;
-    cfg.seed = 42;
-    cfg.rabitq.c_factor = 5.75f;
-    cfg.calibration_samples = 50;
-    cfg.calibration_topk = kTopK;
-    cfg.epsilon_samples = 20;
-    cfg.page_size = 1;
-    cfg.assignment_factor = 2;
-    cfg.assignment_mode = AssignmentMode::RedundantTop2Rair;
-    cfg.rair_lambda = 0.75f;
-
-    IvfBuilder builder(cfg);
-    auto s = builder.Build(vectors_.data(), N, kDim, ra_dir.string());
-    ASSERT_TRUE(s.ok()) << s.message();
-
-    IvfIndex ra_index;
-    s = ra_index.Open(ra_dir.string());
-    ASSERT_TRUE(s.ok()) << s.message();
-    EXPECT_EQ(ra_index.assignment_mode(), AssignmentMode::RedundantTop2Rair);
-    EXPECT_EQ(ra_index.assignment_factor(), 2u);
-    EXPECT_FLOAT_EQ(ra_index.rair_lambda(), 0.75f);
-
-    PreadFallbackReader reader;
-    SearchConfig config;
-    config.top_k = kTopK;
-    config.nprobe = kNprobe;
-
-    OverlapScheduler scheduler(ra_index, reader, config);
-    const float* query = vectors_.data();
-    auto results = scheduler.Search(query);
-
-    ASSERT_GT(results.size(), 0u);
-    EXPECT_GT(results.stats().duplicate_candidates, 0u);
-    EXPECT_GT(results.stats().deduplicated_candidates, 0u);
-    EXPECT_EQ(results.stats().total_reranked,
-              results.stats().unique_fetch_candidates);
-
-    fs::remove_all(ra_dir);
 }

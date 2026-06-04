@@ -152,6 +152,30 @@ class Segment {
     uint64_t resident_cluster_mem_bytes() const {
         return clu_reader_.resident_cluster_mem_bytes();
     }
+    uint64_t resident_file_size_bytes() const {
+        return clu_reader_.resident_file_size_bytes();
+    }
+    uint64_t resident_file_buffer_bytes() const {
+        return clu_reader_.resident_file_buffer_bytes();
+    }
+    uint64_t resident_code_storage_bytes() const {
+        return clu_reader_.resident_code_storage_bytes();
+    }
+    uint64_t resident_decoded_address_bytes() const {
+        return clu_reader_.resident_decoded_address_bytes();
+    }
+    uint64_t resident_raw_address_bytes() const {
+        return clu_reader_.resident_raw_address_bytes();
+    }
+    uint64_t resident_parsed_address_duplicate_bytes() const {
+        return clu_reader_.resident_parsed_address_duplicate_bytes();
+    }
+    uint32_t resident_preload_batch_size() const {
+        return clu_reader_.resident_preload_batch_size();
+    }
+    const std::string& resident_preload_mode() const {
+        return clu_reader_.resident_preload_mode();
+    }
     uint64_t resident_parallel_view_bytes() const {
         return clu_reader_.resident_parallel_view_bytes();
     }

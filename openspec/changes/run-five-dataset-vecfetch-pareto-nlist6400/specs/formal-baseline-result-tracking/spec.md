@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: VecFetch Pareto 结果行必须保留索引身份和正式 recall 来源
-本 change 生成的每个 Full VecFetch 结果行都必须记录足够 metadata，用于证明该行由哪个可复用索引、哪个 ground truth 文件和哪个正式 query protocol 生成。
+本 change 生成的每个 Full VecFetch 结果行都 MUST 记录足够 metadata，用于证明该行由哪个可复用索引、哪个 ground truth 文件和哪个正式 query protocol 生成。
 
 #### Scenario: Full VecFetch 行包含可复用索引 metadata
 - **WHEN** 一个 Full VecFetch 运行完成
@@ -17,7 +17,7 @@
 - **AND** 由 `gt_top10.npy` 生成的行不得进入本 change 的正式 Pareto 结果面。
 
 ### Requirement: 聚合必须将新 Pareto 结果面与历史输出隔离
-结果追踪工作流必须将本 change 的输出写入专用位置，并保留历史行但按新过滤规则排除不合格行。
+结果追踪工作流 MUST 将本 change 的输出写入专用位置，并保留历史行但按新过滤规则排除不合格行。
 
 #### Scenario: 使用专用输出根目录
 - **WHEN** 本 change 聚合运行结果
@@ -37,7 +37,7 @@
 - **AND** DiskANN 行必须保留既有 accepted `index_id` 值。
 
 ### Requirement: Pareto 与 threshold 输出必须覆盖 Recall@10 和 Recall@100
-新 summary 必须支持两个正式 top-k 档位的论文级 Pareto 作图和阈值选择。
+新 summary MUST 支持两个正式 top-k 档位的论文级 Pareto 作图和阈值选择。
 
 #### Scenario: Pareto CSV 包含全部对比系统
 - **WHEN** 聚合完成
@@ -62,12 +62,12 @@
 - **AND** `topk=20` 或 `topk=50` 的行必须从本 change 的正式 summary 中排除。
 
 ### Requirement: 实验完成后必须绘制五数据集 Pareto 曲线图表
-本 change 在正式运行和聚合完成后，必须基于已有聚合结果绘制五个数据集下的 Pareto 曲线图表，供后续人工查看和论文图表筛选。
+本 change 在正式运行和聚合完成后，MUST 基于已有聚合结果绘制五个数据集下的 Pareto 曲线图表，供后续人工查看和论文图表筛选。
 
 #### Scenario: 每个数据集生成 Recall@10 和 Recall@100 Pareto 图
 - **WHEN** combined Pareto CSV 生成并通过验证
 - **THEN** 绘图流程必须为 `coco_100k`、`msmarco_passage`、`amazon_esci`、`imagenet1k` 和 `voxceleb2_ecapa_150k` 分别生成 `Recall@10` 与 `Recall@100` Pareto 图
-- **AND** 每张图必须以 recall 为横轴、query latency 为纵轴
+- **AND** 每张图必须以 recall 为横轴、QPS（`1000 / avg_ms`）为纵轴
 - **AND** 每张图必须同时展示 Full VecFetch 和六种 baseline 组合。
 
 #### Scenario: 图表输出位置和输入来源可审计
@@ -79,10 +79,13 @@
 #### Scenario: 图表不得使用未验证或历史错误口径行
 - **WHEN** 生成 Pareto 图表
 - **THEN** 图表输入必须排除 `topk=20`、`topk=50`、ImageNet1K IVF `nlist=4096` 行和 `gt_top10.npy` VecFetch 行
+- **AND** Full VecFetch 图表输入必须保留全部有效 `nprobe` 点，包括在 QPS/recall Pareto 意义下被 dominated 的点
+- **AND** DiskANN 图表输入必须使用该后端的全部 accepted raw-vector 参数组合，先取 QPS Pareto frontier
+- **AND** 如果某条 DiskANN frontier 超过 8 个点，绘图必须在相近 recall 区间内保留 QPS 最高的代表点，并将曲线压缩到 5-8 个点；如果严格 frontier 少于 5 个点，则保留全部 frontier 点而不补入被支配点
 - **AND** 如果某个数据集或系统缺少可绘制点，报告必须记录缺口，而不是静默生成误导性图表。
 
 ### Requirement: 报告必须记录执行安全性、可复用索引和验证结果
-本 change 的最终报告必须能在无需人工检查日志的情况下审计实验。
+本 change 的最终报告 MUST 能在无需人工检查日志的情况下审计实验。
 
 #### Scenario: 报告列出所有可复用索引路径
 - **WHEN** 生成报告

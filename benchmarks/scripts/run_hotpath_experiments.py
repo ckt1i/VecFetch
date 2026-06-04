@@ -81,10 +81,6 @@ def build_matrix(args: argparse.Namespace) -> List[RunSpec]:
         str(args.queries),
         "--bits",
         str(args.bits),
-        "--clu-read-mode",
-        "full_preload",
-        "--use-resident-clusters",
-        "1",
     ]
 
     if args.mode.startswith("legacy-baseline"):
@@ -105,18 +101,6 @@ def build_matrix(args: argparse.Namespace) -> List[RunSpec]:
 
         matrix.extend(
             [
-                RunSpec(
-                    "no-resident",
-                    legacy_common + ["--use-resident-clusters", "0"],
-                    profile="legacy_fixed_probe",
-                    stage2_breakdown_mode="low_overhead_or_unmeasured",
-                ),
-                RunSpec(
-                    "window-read",
-                    legacy_common + ["--clu-read-mode", "window"],
-                    profile="legacy_fixed_probe",
-                    stage2_breakdown_mode="low_overhead_or_unmeasured",
-                ),
                 RunSpec(
                     "submit-batch-0",
                     legacy_common + ["--submit-batch", "0"],

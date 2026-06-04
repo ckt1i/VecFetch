@@ -46,14 +46,6 @@ bool IsPowerOf2(uint32_t n) {
     return n > 0 && (n & (n - 1)) == 0;
 }
 
-uint32_t NextPowerOf2(uint32_t n) {
-    if (n == 0) return 1;
-    if (IsPowerOf2(n)) return n;
-    uint32_t p = 1;
-    while (p < n) p <<= 1;
-    return p;
-}
-
 uint32_t RoundUpToMultiple(uint32_t value, uint32_t multiple) {
     if (multiple == 0) {
         return value;
@@ -112,18 +104,6 @@ const char* CoarseBuilderName(CoarseBuilder builder) {
         case CoarseBuilder::Auto:
         default:
             return "auto";
-    }
-}
-
-const char* AssignmentModeName(AssignmentMode mode) {
-    switch (mode) {
-        case AssignmentMode::RedundantTop2Naive:
-            return "redundant_top2_naive";
-        case AssignmentMode::RedundantTop2Rair:
-            return "redundant_top2_rair";
-        case AssignmentMode::Single:
-        default:
-            return "single";
     }
 }
 
@@ -198,20 +178,11 @@ Status IvfBuilder::Build(const float* vectors, uint32_t N, Dim dim,
     if (config_.nlist > N) {
         return Status::InvalidArgument("nlist must be <= N");
     }
-    if (config_.assignment_factor != 1 && config_.assignment_factor != 2) {
-        return Status::InvalidArgument("assignment_factor must be 1 or 2");
-    }
-
-    if (config_.assignment_mode == AssignmentMode::RedundantTop2Rair &&
-        config_.assignment_factor != 2) {
-        return Status::InvalidArgument(
-            "assignment_mode=redundant_top2_rair requires assignment_factor=2");
-    }
-
     logical_dim_ = dim;
     effective_dim_ = dim;
     padding_mode_ = "none";
     rotation_mode_ = "random_matrix";
+    assignment_mode_ = AssignmentMode::Single;
 
     std::vector<float> padded_vectors;
     std::vector<float> padded_calibration_queries;
@@ -219,7 +190,7 @@ Status IvfBuilder::Build(const float* vectors, uint32_t N, Dim dim,
     const float* calibration_queries = config_.calibration_queries;
     Dim build_dim = dim;
 
-    if (!IsPowerOf2(dim) && config_.use_fht_kac_rotator) {
+    if (!IsPowerOf2(dim)) {
         effective_dim_ = static_cast<Dim>(RoundUpToMultiple(dim, 64u));
         build_dim = effective_dim_;
         padding_mode_ = (effective_dim_ == logical_dim_) ? "none"
@@ -237,36 +208,10 @@ Status IvfBuilder::Build(const float* vectors, uint32_t N, Dim dim,
                 calibration_queries = padded_calibration_queries.data();
             }
         }
-    } else if (config_.pad_non_power_of_two_to_pow2 && !IsPowerOf2(dim)) {
-        effective_dim_ = static_cast<Dim>(NextPowerOf2(dim));
-        build_dim = effective_dim_;
-        padding_mode_ = "zero_pad_to_pow2";
-        padded_vectors = PadRowsToDim(vectors, N, dim, build_dim);
-        build_vectors = padded_vectors.data();
-        if (config_.calibration_queries != nullptr &&
-            config_.num_calibration_queries > 0) {
-            padded_calibration_queries = PadRowsToDim(
-                config_.calibration_queries,
-                config_.num_calibration_queries,
-                dim,
-                build_dim);
-            calibration_queries = padded_calibration_queries.data();
-        }
     }
 
     // Phase A: K-means clustering
     auto s = RunKMeans(build_vectors, N, build_dim);
-    if (!s.ok()) return s;
-
-    assignment_mode_ = config_.assignment_mode;
-    if (assignment_mode_ == AssignmentMode::Single &&
-        config_.assignment_factor == 2) {
-        assignment_mode_ = AssignmentMode::RedundantTop2Naive;
-    }
-    rair_lambda_ = config_.rair_lambda;
-    rair_strict_second_choice_ = config_.rair_strict_second_choice;
-
-    s = DeriveSecondaryAssignments(build_vectors, N, build_dim);
     if (!s.ok()) return s;
 
     // Phase B: calibrate ConANN d_k
@@ -302,11 +247,7 @@ Status IvfBuilder::RunKMeans(const float* vectors, uint32_t N, Dim dim) {
         auto& c = c_or.value();
         if (c.cols == dim) {
             centroids_.assign(c.data.begin(), c.data.end());
-        } else if (config_.use_fht_kac_rotator &&
-                   c.cols == logical_dim_ &&
-                   dim == effective_dim_) {
-            centroids_ = PadRowsToDim(c.data.data(), c.rows, c.cols, dim);
-        } else if (config_.pad_non_power_of_two_to_pow2 &&
+        } else if (!IsPowerOf2(logical_dim_) &&
                    c.cols == logical_dim_ &&
                    dim == effective_dim_) {
             centroids_ = PadRowsToDim(c.data.data(), c.rows, c.cols, dim);
@@ -468,114 +409,6 @@ Status IvfBuilder::RunKMeans(const float* vectors, uint32_t N, Dim dim) {
         for (uint32_t i = 0; i < N; ++i) {
             f.write(reinterpret_cast<const char*>(&one), 4);
             f.write(reinterpret_cast<const char*>(&assignments_[i]), 4);
-        }
-    }
-
-    return Status::OK();
-}
-
-Status IvfBuilder::DeriveSecondaryAssignments(const float* vectors,
-                                              uint32_t N,
-                                              Dim dim) {
-    secondary_assignments_.assign(N, std::numeric_limits<uint32_t>::max());
-    if (!(assignment_mode_ == AssignmentMode::Single ||
-          config_.assignment_factor == 1)) {
-        std::vector<float> normalized_vectors;
-        const float* assignment_vectors = vectors;
-        if (config_.metric == "cosine") {
-            normalized_vectors.assign(
-                vectors, vectors + static_cast<size_t>(N) * dim);
-            NormalizeRows(&normalized_vectors, N, dim);
-            assignment_vectors = normalized_vectors.data();
-        }
-        const uint32_t K = config_.nlist;
-#pragma omp parallel for schedule(static)
-        for (int64_t i = 0; i < static_cast<int64_t>(N); ++i) {
-            const float* vec = assignment_vectors + static_cast<size_t>(i) * dim;
-            float best_dist = std::numeric_limits<float>::max();
-            float second_dist = std::numeric_limits<float>::max();
-            uint32_t best_cluster = std::numeric_limits<uint32_t>::max();
-            uint32_t second_cluster = std::numeric_limits<uint32_t>::max();
-
-            for (uint32_t k = 0; k < K; ++k) {
-                float d = simd::L2Sqr(vec,
-                                      centroids_.data() + static_cast<size_t>(k) * dim,
-                                      dim);
-                if (d < best_dist) {
-                    second_dist = best_dist;
-                    second_cluster = best_cluster;
-                    best_dist = d;
-                    best_cluster = k;
-                } else if (d < second_dist) {
-                    second_dist = d;
-                    second_cluster = k;
-                }
-            }
-
-            if (best_cluster == std::numeric_limits<uint32_t>::max()) {
-                continue;
-            }
-
-            const uint32_t primary = assignments_[static_cast<size_t>(i)];
-            if (assignment_mode_ == AssignmentMode::RedundantTop2Naive) {
-                if (primary == best_cluster) {
-                    secondary_assignments_[static_cast<size_t>(i)] = second_cluster;
-                } else if (primary == second_cluster) {
-                    secondary_assignments_[static_cast<size_t>(i)] = best_cluster;
-                } else {
-                    secondary_assignments_[static_cast<size_t>(i)] = best_cluster;
-                }
-                continue;
-            }
-
-            const float* primary_centroid =
-                centroids_.data() + static_cast<size_t>(primary) * dim;
-            float best_air_loss = std::numeric_limits<float>::max();
-            uint32_t best_air_cluster = std::numeric_limits<uint32_t>::max();
-
-            for (uint32_t k = 0; k < K; ++k) {
-                if (k == primary && rair_strict_second_choice_) {
-                    continue;
-                }
-
-                const float* cand_centroid =
-                    centroids_.data() + static_cast<size_t>(k) * dim;
-                float residual_ip = 0.0f;
-                float cand_dist = 0.0f;
-                for (Dim j = 0; j < dim; ++j) {
-                    const float r = primary_centroid[j] - vec[j];
-                    const float rp = cand_centroid[j] - vec[j];
-                    residual_ip += r * rp;
-                    cand_dist += rp * rp;
-                }
-                const float loss = cand_dist + rair_lambda_ * residual_ip;
-                if (loss < best_air_loss) {
-                    best_air_loss = loss;
-                    best_air_cluster = k;
-                }
-            }
-
-            if (!rair_strict_second_choice_ && best_air_cluster == primary) {
-                continue;
-            }
-            secondary_assignments_[static_cast<size_t>(i)] = best_air_cluster;
-        }
-    }
-
-    if (!config_.save_secondary_assignments_path.empty()) {
-        std::ofstream f(config_.save_secondary_assignments_path, std::ios::binary);
-        if (!f.is_open()) {
-            return Status::IOError(
-                "Failed to create " + config_.save_secondary_assignments_path);
-        }
-        const uint32_t one = 1;
-        for (uint32_t i = 0; i < N; ++i) {
-            int32_t value = static_cast<int32_t>(
-                secondary_assignments_[i] == std::numeric_limits<uint32_t>::max()
-                    ? -1
-                    : static_cast<int32_t>(secondary_assignments_[i]));
-            f.write(reinterpret_cast<const char*>(&one), 4);
-            f.write(reinterpret_cast<const char*>(&value), 4);
         }
     }
 
@@ -854,31 +687,21 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
     std::filesystem::create_directories(output_dir);
 
     // --- Generate rotation matrix ---
-    // Prefer Hadamard rotation when dim is a power of 2 (O(L log L) Apply via
-    // FWHT). Falls back to random Gaussian QR for non-power-of-2 dims.
-    // Matches the selection strategy in bench_vector_search and aligns
-    // bench_e2e recall with the direct-memory benchmark.
+    // Power-of-two dimensions use the Hadamard fast path. Non-power-of-two
+    // dimensions use FHT-Kac; any required padding was applied before build.
     rabitq::RotationMatrix rotation(dim);
     bool used_hadamard = false;
     if (dim > 0 && (dim & (dim - 1)) == 0) {
         used_hadamard = rotation.GenerateHadamard(config_.seed,
                                                   /*use_fast_transform=*/true);
         if (used_hadamard) {
-            rotation_mode_ = (logical_dim_ != dim) ? "hadamard_padded" : "hadamard";
+            rotation_mode_ = "hadamard";
         }
-    } else if (!config_.pad_non_power_of_two_to_pow2 &&
-               config_.use_fht_kac_rotator) {
+    } else {
         used_hadamard = rotation.GenerateFhtKacRotator(
             config_.seed, /*use_fast_transform=*/true);
         if (used_hadamard) {
             rotation_mode_ = "fht_kac_rotator";
-        }
-    } else if (!config_.pad_non_power_of_two_to_pow2 &&
-               config_.use_blocked_hadamard_permuted) {
-        used_hadamard = rotation.GenerateBlockedHadamardPermuted(
-            config_.seed, /*use_fast_transform=*/true);
-        if (used_hadamard) {
-            rotation_mode_ = "blocked_hadamard_permuted";
         }
     }
 
@@ -926,11 +749,6 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
     std::vector<std::vector<uint32_t>> cluster_members(K);
     for (uint32_t i = 0; i < N; ++i) {
         cluster_members[assignments_[i]].push_back(i);
-        if (config_.assignment_factor == 2 &&
-            secondary_assignments_[i] != std::numeric_limits<uint32_t>::max() &&
-            secondary_assignments_[i] != assignments_[i]) {
-            cluster_members[secondary_assignments_[i]].push_back(i);
-        }
     }
 
     // --- Build encoder ---
@@ -1059,17 +877,13 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
         config_.max_iterations,    // kmeans_iterations
         0, 0, 0.0f,               // min/max/avg list size (not computed here)
         0.0f,                      // balance_factor (deprecated, always 0)
-        assignment_mode_ == AssignmentMode::RedundantTop2Rair
-            ? vdb::schema::AssignmentMode::REDUNDANT_TOP2_RAIR
-            : assignment_mode_ == AssignmentMode::RedundantTop2Naive
-                ? vdb::schema::AssignmentMode::REDUNDANT_TOP2
-                : vdb::schema::AssignmentMode::SINGLE,
-        config_.assignment_factor,
+        vdb::schema::AssignmentMode::SINGLE,
+        1,
         clustering_source_ == ClusteringSource::Precomputed
             ? vdb::schema::ClusteringSource::PRECOMPUTED
             : vdb::schema::ClusteringSource::AUTO,
-        rair_lambda_,
-        rair_strict_second_choice_
+        0.0f,
+        false
     );
 
     // RaBitQParams
@@ -1194,8 +1008,8 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
             << "  \"rotation_trunc_dim\": " << rotation.fht_kac_trunc_dim() << ",\n"
             << "  \"rotation_num_rounds\": " << rotation.fht_kac_num_rounds() << ",\n"
             << "  \"nlist\": " << K << ",\n"
-            << "  \"assignment_mode\": \"" << AssignmentModeName(assignment_mode_) << "\",\n"
-            << "  \"assignment_factor\": " << config_.assignment_factor << ",\n"
+            << "  \"assignment_mode\": \"single\",\n"
+            << "  \"assignment_factor\": 1,\n"
             << "  \"clustering_source\": \"" << ClusteringSourceName(clustering_source_) << "\",\n"
             << "  \"faiss_train_size\": " << std::min(config_.faiss_train_size, N) << ",\n"
             << "  \"faiss_niter\": " << ((config_.faiss_niter == 0) ? kDefaultFaissNiter : config_.faiss_niter) << ",\n"

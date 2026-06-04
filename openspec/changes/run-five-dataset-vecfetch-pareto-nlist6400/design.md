@@ -8,9 +8,9 @@
 | --- | --- | ---: | --- |
 | `coco_100k` | `/home/zcq/VDB/test/data/COCO100k/index_fkmeans_2048_bits4_eps0.90` | 2048 | Appendix/sanity 数据集；需用正式 `gt_top100.npy` 重跑。 |
 | `msmarco_passage` | `/home/zcq/VDB/test/data/MSMARCO/fht_kac_rotator` | 16384 | 现有 adapter 需要先通过 1000-query 正式 gate，再进入 full sweep。 |
-| `amazon_esci` | `/home/zcq/VDB/test/data/amazon_esci/vecfetch_nlist8192_np64_bits4_raw_payload/index` | 8192 | Raw FlatStor payload 索引已写入 build metadata。 |
+| `amazon_esci` | `/home/zcq/VDB/test/data/amazon_esci/vecfetch_nlist8192_np64_bits4_raw_payload_fht_kac/amazon_esci_20260603T190113/index` | 8192 | Raw FlatStor payload FHT-Kac 索引；旧 blocked Hadamard 索引保留但不得进入正式运行。 |
 | `imagenet1k` | `/home/zcq/VDB/test/data/imagenet1k_split_v1/vecfetch_nlist6400_np64_bits4_raw_payload/index` | 6400 | 这是新的方法索引；IVF baseline 必须使用相同 `nlist`。 |
-| `voxceleb2_ecapa_150k` | `/home/zcq/VDB/test/data/voxceleb2_ecapa_150k/vecfetch_nlist2048_np64_bits4_audio_payload_split_v1/index` | 2048 | Audio payload split-v1 索引。 |
+| `voxceleb2_ecapa_150k` | `/home/zcq/VDB/test/data/voxceleb2_ecapa_150k/vecfetch_nlist2048_np64_bits4_audio_payload_split_v1_fht_kac/voxceleb2_ecapa_150k_split_v1_20260603T190033/index` | 2048 | Audio payload split-v1 FHT-Kac 索引；旧 blocked Hadamard 索引保留但不得进入正式运行。 |
 
 DiskANN baseline 行已经引用被接受的 raw-vector 索引，不属于本次重跑范围。本 change 唯一需要补跑的 baseline 是 ImageNet1K 的 IVF+PQ / IVF+RQ，且 `nlist=6400`。
 
@@ -41,6 +41,8 @@ runner 应在代码或可检查 artifact 中维护 dataset-to-index map，并在
 
 这比 glob 自动发现更稳妥，因为 `/home/zcq/VDB/test/` 下有多个 COCO 索引和旧 ImageNet 运行。显式 map 可以避免 runner 误选 ablation 索引或历史 `nlist=4096` 索引。
 
+对于 Amazon ESCI 和 VoxCeleb2，旧的 accepted candidate index 记录为 `blocked_hadamard_permuted`，已经不满足 `remove-legacy-search-modes` 后的 formal path；因此本 change 使用新构建的 FHT-Kac 索引作为 accepted index，旧索引只保留在磁盘上作历史记录。
+
 ### Decision 2: adapter readiness 是 full sweep 前置 gate
 
 Amazon ESCI、ImageNet1K split-v1 和 VoxCeleb2 split-v1 已经具备正式 `bench_e2e` adapter。COCO 和 MS MARCO 需要 preflight gate，因为它们现有方法索引和 benchmark 数据路径不完全统一：
@@ -70,13 +72,12 @@ dynamic_safein_stable_probes=1
 dynamic_safein_rel_tol=0.005
 dynamic_safein_defer_initial_clusters=4
 dynamic_safein_defer_until_ready=1
-clu_read_mode=full_preload
-use_resident_clusters=1
-prefetch_depth=16
 io_queue_depth=64
 fixed_vec_buffer_count=1024
 bits=4
 ```
+
+`clu_read_mode`、`use_resident_clusters` 和 `prefetch_depth` 不再作为命令行控制项传入；`bench_e2e` 的正式路径已经固定为 resident full-preload，并会在输出中记录 `cluster_loading=resident_full_preload`、preload bytes 和 resident memory。
 
 `fixed_vec_buffer_count=1024` 属于当前优化方向，且相对数据集/索引规模内存成本较小。每个输出行都应记录该设置，便于后续图区分本次正式运行和此前使用隐式默认值的 probe。
 
@@ -140,7 +141,7 @@ Pareto 绘图应在 Full VecFetch sweep、ImageNet1K `nlist=6400` IVF 重跑和 
 - `{dataset}_recall10_pareto.png`
 - `{dataset}_recall100_pareto.png`
 
-如果绘图工具支持 PDF，也可以同时输出同名 `.pdf`，但 `.png` 是必须产物，便于快速查看。图中横轴为 recall，纵轴为 query latency，图例必须区分 Full VecFetch、IVF+PQ+FlatStor、IVF+PQ+Lance、IVF+RQ+FlatStor、IVF+RQ+Lance、DiskANN+FlatStor 和 DiskANN+Lance。ImageNet1K IVF 图中只允许使用 `nlist=6400` 行。
+如果绘图工具支持 PDF，也可以同时输出同名 `.pdf`，但 `.png` 是必须产物，便于快速查看。图中横轴为 recall，纵轴为 QPS（`1000 / avg_ms`），图例必须区分 Full VecFetch、IVF+PQ+FlatStor、IVF+PQ+Lance、IVF+RQ+FlatStor、IVF+RQ+Lance、DiskANN+FlatStor 和 DiskANN+Lance。Full VecFetch 曲线必须保留全部有效 `nprobe` 点，包括在 QPS/recall Pareto 意义下被 dominated 的点，方便审计 sweep 形状。DiskANN 行必须使用全部 accepted raw-vector 参数组合，先取 QPS Pareto frontier；如果某条 DiskANN frontier 超过 8 个点，则按相近 recall 区间降采样，在每个区间内保留 QPS 最高的代表点，并保留最低/最高 recall 端点。严格 frontier 少于 5 个点时，保留全部 frontier 点，不补入被支配点。ImageNet1K IVF 图中只允许使用 `nlist=6400` 行。
 
 ## Risks / Trade-offs
 

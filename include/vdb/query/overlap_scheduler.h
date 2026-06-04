@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
-#include <unordered_map>
 #include <vector>
 
 #include "vdb/common/status.h"
@@ -23,11 +22,10 @@ class OverlapSchedulerTest;
 namespace vdb {
 namespace query {
 
-/// Single-threaded query scheduler with async cluster prefetch.
+/// Single-threaded resident-cluster query scheduler.
 ///
 /// Pipeline:
-///   PrefetchClusters (sliding window io_uring batch) →
-///   ProbeAndDrainInterleaved (unified event loop: probe CPU + rerank CQE) →
+///   ProbeResidentClusters (resident cluster probe + raw-data submit) →
 ///   FinalDrain → FetchMissingPayloads → AssembleResults.
 class OverlapScheduler {
  public:
@@ -53,11 +51,9 @@ class OverlapScheduler {
 
     struct PendingIO {
         enum class Type : uint8_t {
-            CLUSTER_BLOCK, VEC_ONLY, VEC_ALL, PAYLOAD
+            VEC_ONLY, VEC_ALL, PAYLOAD
         };
         Type type;
-        uint32_t cluster_id = 0;   // CLUSTER_BLOCK
-        uint32_t block_size = 0;   // CLUSTER_BLOCK
         AddressEntry addr;          // VEC_ONLY / VEC_ALL / PAYLOAD
         uint64_t read_offset = 0;
         uint32_t read_length = 0;
@@ -71,18 +67,12 @@ class OverlapScheduler {
         PendingIO io;
     };
 
-    void PrefetchClusters(SearchContext& ctx,
-                          const std::vector<ClusterID>& sorted_clusters);
-    void ProbeAndDrainInterleaved(SearchContext& ctx,
-                                   class RerankConsumer& reranker,
-                                   const std::vector<ClusterID>& sorted_clusters);
-    void ProbeResidentThinPath(SearchContext& ctx,
+    void ProbeResidentClusters(SearchContext& ctx,
                                class RerankConsumer& reranker,
                                const std::vector<ClusterID>& sorted_clusters);
     void FinalDrain(SearchContext& ctx, class RerankConsumer& reranker);
     void DispatchCompletion(uint64_t slot_token, SearchContext& ctx,
                             class RerankConsumer& reranker);
-    void SubmitClusterRead(uint32_t cluster_id);
     const ParsedCluster* GetResidentParsedCluster(uint32_t cluster_id) const;
     void ProbeCluster(const ParsedCluster& pc, uint32_t cluster_id,
                       SearchContext& ctx, class RerankConsumer& reranker);
@@ -207,8 +197,7 @@ class OverlapScheduler {
                                                      rabitq::PrepareTimingBreakdown* timing = nullptr);
     QueryWrapper query_wrapper_;
 
-    // Sliding window state (reset per Search() call)
-    std::unordered_map<uint32_t, ParsedCluster> ready_clusters_;
+    // Query-local state (reset per Search() call)
     QueryDedupSet submitted_candidate_offsets_;
     SubmitScratch submit_scratch_;
     std::deque<ReadPlanEntry> pending_all_plans_;
@@ -216,8 +205,6 @@ class OverlapScheduler {
     std::vector<DeferredSafeInPlan> deferred_safein_plans_;
     std::vector<BudgetedReadPlan> budgeted_read_plan_heap_;
     size_t pending_vec_only_head_ = 0;
-    uint32_t next_to_submit_ = 0;
-    uint32_t inflight_clusters_ = 0;
 
     uint32_t vec_bytes_;
     uint32_t aligned_vec_bytes_ = 0;

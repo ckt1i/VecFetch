@@ -1,5 +1,6 @@
 #include "vdb/simd/ip_exrabitq.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -343,6 +344,172 @@ VDB_FORCE_INLINE float IPExRaBitQGenericAvx2(const float* VDB_RESTRICT query,
 #endif
 
 }  // namespace
+
+uint32_t ExRaBitQPackedMagnitudeBytes(uint32_t dim_block, uint8_t bits) {
+    if (bits != 2 && bits != 4) {
+        return 0;
+    }
+    return (dim_block * static_cast<uint32_t>(bits) + 7u) / 8u;
+}
+
+bool ExRaBitQPackMagnitudes(const uint8_t* VDB_RESTRICT decoded,
+                            uint32_t count,
+                            uint8_t bits,
+                            uint8_t* VDB_RESTRICT packed,
+                            uint32_t packed_bytes) {
+    if (decoded == nullptr || packed == nullptr) {
+        return false;
+    }
+    const uint32_t expected_bytes = ExRaBitQPackedMagnitudeBytes(count, bits);
+    if (expected_bytes == 0 || packed_bytes < expected_bytes) {
+        return false;
+    }
+    std::memset(packed, 0, packed_bytes);
+    if (bits == 2) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint8_t v = decoded[i];
+            if (v > 3u) return false;
+            packed[i / 4u] |= static_cast<uint8_t>(v << ((i % 4u) * 2u));
+        }
+        return true;
+    }
+    if (bits == 4) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint8_t v = decoded[i];
+            if (v > 15u) return false;
+            packed[i / 2u] |= static_cast<uint8_t>(v << ((i % 2u) * 4u));
+        }
+        return true;
+    }
+    return false;
+}
+
+namespace {
+
+inline void UnpackMagnitudesScalar(const uint8_t* VDB_RESTRICT packed,
+                                   uint32_t start,
+                                   uint32_t count,
+                                   uint8_t bits,
+                                   uint8_t* VDB_RESTRICT decoded) {
+    if (bits == 2) {
+        for (uint32_t i = start; i < count; ++i) {
+            decoded[i] = static_cast<uint8_t>(
+                (packed[i / 4u] >> ((i % 4u) * 2u)) & 0x03u);
+        }
+        return;
+    }
+    for (uint32_t i = start; i < count; ++i) {
+        decoded[i] = static_cast<uint8_t>(
+            (packed[i / 2u] >> ((i % 2u) * 4u)) & 0x0Fu);
+    }
+}
+
+#if defined(VDB_USE_AVX512) || defined(VDB_USE_AVX2)
+inline uint32_t UnpackBits4Simd(const uint8_t* VDB_RESTRICT packed,
+                                uint32_t count,
+                                uint8_t* VDB_RESTRICT decoded) {
+    const __m128i mask = _mm_set1_epi8(0x0F);
+    uint32_t out = 0;
+    uint32_t in = 0;
+    for (; out + 32u <= count; out += 32u, in += 16u) {
+        const __m128i bytes =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed + in));
+        const __m128i lo = _mm_and_si128(bytes, mask);
+        const __m128i hi = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(decoded + out),
+                         _mm_unpacklo_epi8(lo, hi));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(decoded + out + 16),
+                         _mm_unpackhi_epi8(lo, hi));
+    }
+    return out;
+}
+
+inline uint32_t UnpackBits2Simd(const uint8_t* VDB_RESTRICT packed,
+                                uint32_t count,
+                                uint8_t* VDB_RESTRICT decoded) {
+    const __m128i mask = _mm_set1_epi8(0x03);
+    uint32_t out = 0;
+    uint32_t in = 0;
+    for (; out + 64u <= count; out += 64u, in += 16u) {
+        const __m128i bytes =
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed + in));
+        const __m128i v0 = _mm_and_si128(bytes, mask);
+        const __m128i v1 = _mm_and_si128(_mm_srli_epi16(bytes, 2), mask);
+        const __m128i v2 = _mm_and_si128(_mm_srli_epi16(bytes, 4), mask);
+        const __m128i v3 = _mm_and_si128(_mm_srli_epi16(bytes, 6), mask);
+
+        const __m128i a01_lo = _mm_unpacklo_epi8(v0, v1);
+        const __m128i a01_hi = _mm_unpackhi_epi8(v0, v1);
+        const __m128i a23_lo = _mm_unpacklo_epi8(v2, v3);
+        const __m128i a23_hi = _mm_unpackhi_epi8(v2, v3);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(decoded + out),
+                         _mm_unpacklo_epi16(a01_lo, a23_lo));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(decoded + out + 16),
+                         _mm_unpackhi_epi16(a01_lo, a23_lo));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(decoded + out + 32),
+                         _mm_unpacklo_epi16(a01_hi, a23_hi));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(decoded + out + 48),
+                         _mm_unpackhi_epi16(a01_hi, a23_hi));
+    }
+    return out;
+}
+#endif
+
+}  // namespace
+
+bool ExRaBitQUnpackMagnitudes(const uint8_t* VDB_RESTRICT packed,
+                              uint32_t count,
+                              uint8_t bits,
+                              uint8_t* VDB_RESTRICT decoded) {
+    if (packed == nullptr || decoded == nullptr || (bits != 2 && bits != 4)) {
+        return false;
+    }
+    uint32_t decoded_count = 0;
+#if defined(VDB_USE_AVX512) || defined(VDB_USE_AVX2)
+    if (bits == 4) {
+        decoded_count = UnpackBits4Simd(packed, count, decoded);
+    } else {
+        decoded_count = UnpackBits2Simd(packed, count, decoded);
+    }
+#endif
+    if (decoded_count < count) {
+        UnpackMagnitudesScalar(packed, decoded_count, count, bits, decoded);
+    }
+    return true;
+}
+
+bool ExRaBitQDecodePackedBatchBlockMagnitudes(
+    const uint8_t* VDB_RESTRICT packed_abs_blocks,
+    uint32_t num_dim_blocks,
+    uint32_t batch_size,
+    uint32_t dim_block,
+    uint32_t abs_bytes_per_lane_dim_block,
+    uint8_t bits,
+    uint8_t* VDB_RESTRICT decoded_abs_blocks) {
+    if (packed_abs_blocks == nullptr || decoded_abs_blocks == nullptr ||
+        num_dim_blocks == 0 || batch_size == 0 || dim_block == 0) {
+        return false;
+    }
+    if (ExRaBitQPackedMagnitudeBytes(dim_block, bits) !=
+        abs_bytes_per_lane_dim_block) {
+        return false;
+    }
+    for (uint32_t db = 0; db < num_dim_blocks; ++db) {
+        for (uint32_t lane = 0; lane < batch_size; ++lane) {
+            const uint8_t* packed =
+                packed_abs_blocks +
+                (static_cast<size_t>(db) * batch_size + lane) *
+                    abs_bytes_per_lane_dim_block;
+            uint8_t* decoded =
+                decoded_abs_blocks +
+                (static_cast<size_t>(db) * batch_size + lane) * dim_block;
+            if (!ExRaBitQUnpackMagnitudes(packed, dim_block, bits, decoded)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 float IPExRaBitQPackedSign(const float* VDB_RESTRICT query,
                            const uint8_t* VDB_RESTRICT code_abs,

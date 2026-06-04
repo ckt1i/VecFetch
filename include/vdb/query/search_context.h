@@ -16,11 +16,6 @@ enum class SubmissionMode : uint8_t {
     Isolated = 1,
 };
 
-enum class CluReadMode : uint8_t {
-    Window = 0,
-    FullPreload = 1,
-};
-
 enum class DynamicSafeInMode : uint8_t {
     Static = 0,
     Frontier = 1,
@@ -38,12 +33,6 @@ struct SearchConfig {
     bool use_sqpoll = false;
     SubmissionMode submission_mode = SubmissionMode::Shared;
 
-    // Phase 8: Async cluster prefetch
-    uint32_t prefetch_depth = 16;      // Initial cluster block prefetch count
-    uint32_t refill_threshold = 2;     // Refill when inflight_clusters drops below
-    uint32_t refill_count = 2;         // Number of clusters to refill per check
-    CluReadMode clu_read_mode = CluReadMode::Window;
-    bool use_resident_clusters = false;
     bool enable_fine_grained_timing = true;
     bool enable_hotpath_detailed_timing = false;
 
@@ -76,10 +65,6 @@ struct SearchConfig {
     bool enable_rerank_batched_distance_simd = true;
     bool enable_coarse_select_simd = true;
     bool enable_coarse_select_phase2 = false;
-    bool enable_hnsw_coarse_routing = false;
-    uint32_t hnsw_coarse_m = 32;
-    uint32_t hnsw_coarse_ef_construction = 128;
-    uint32_t hnsw_coarse_ef_search = 512;
     bool enable_two_level_coarse_routing = false;
     uint32_t two_level_coarse_threshold = 4096;
     uint32_t two_level_coarse_super_count = 0;
@@ -158,7 +143,7 @@ struct SearchStats {
     double coarse_select_ms = 0;
     double coarse_score_ms = 0;
     double coarse_topn_ms = 0;
-    uint32_t coarse_routing_mode = 0;  // 0=exact, 1=two_level, 2=hnsw
+    uint32_t coarse_routing_mode = 0;  // 0=exact, 1=two_level
     uint32_t coarse_super_count = 0;
     uint32_t coarse_super_probes = 0;
     uint32_t coarse_child_candidates_scored = 0;
@@ -166,13 +151,6 @@ struct SearchStats {
     uint32_t coarse_exact_fallback = 0;
     uint32_t coarse_exact_overlap = 0;
     double coarse_hierarchy_build_ms = 0;
-    double coarse_hnsw_graph_build_ms = 0;
-    uint32_t coarse_hnsw_m = 0;
-    uint32_t coarse_hnsw_ef_search = 0;
-    uint32_t coarse_hnsw_returned_clusters = 0;
-    uint32_t coarse_hnsw_visited_nodes = 0;
-    uint32_t coarse_hnsw_distance_computations = 0;
-    uint32_t coarse_hnsw_hops = 0;
     double probe_time_ms = 0;
     double probe_prepare_ms = 0;
     double probe_prepare_rotation_ms = 0;
@@ -194,6 +172,7 @@ struct SearchStats {
     double probe_stage2_kernel_abs_fma_ms = 0;
     double probe_stage2_kernel_tail_ms = 0;
     double probe_stage2_kernel_reduce_ms = 0;
+    double probe_stage2_decode_ms = 0;
     uint32_t stage1_fused_blocks = 0;
     uint32_t stage1_fused_safeout_lanes = 0;
     uint32_t stage1_fused_safein_lanes = 0;
@@ -201,6 +180,9 @@ struct SearchStats {
     uint64_t stage2_lanes_requested = 0;
     uint64_t stage2_lanes_skipped = 0;
     uint64_t stage2_lanes_total_valid = 0;
+    uint64_t stage2_decode_blocks = 0;
+    uint64_t stage2_decode_input_bytes = 0;
+    uint64_t stage2_decode_output_bytes = 0;
     double probe_classify_ms = 0;
     double probe_submit_ms = 0;
     double probe_submit_prepare_vec_only_ms = 0;
@@ -224,10 +206,7 @@ struct SearchStats {
     // Fine-grained timing breakdown (ms)
     double uring_prep_ms = 0;    // io_uring PrepRead() calls in AsyncIOSink batch submit path
     double uring_submit_ms = 0;  // reader_.Submit() calls in pipeline
-    double parse_cluster_ms = 0; // ParseClusterBlock() in DispatchCompletion()
     double fetch_missing_ms = 0; // FetchMissingPayloads() wall time
-    double prefetch_submit_ms = 0;          // Reserved field: disabled in low-overhead benchmark path
-    double prefetch_wait_ms = 0;            // Reserved field: disabled in low-overhead benchmark path
     double safein_payload_prefetch_ms = 0;  // Reserved field: disabled in low-overhead benchmark path
     double candidate_collect_ms = 0;        // Organize buffered candidates before batch rerank
     double pool_vector_read_ms = 0;         // Batch read/visit of prefetched vectors from memory pool

@@ -16,7 +16,7 @@
 ///       [--safein-dk-samples-input /path/to/samples.npy]
 ///       [--safein-dk-samples-output /path/to/samples.npy]
 ///       [--safein-dk-space exact_l2|rabitq_s2]
-///       [--pad-to-pow2 1] [--index-dir /path/to/existing/index]
+///       [--index-dir /path/to/existing/index]
 ///       [--tmp-dir /tmp/bench_vs] [--keep-index]
 
 #include <algorithm>
@@ -58,30 +58,6 @@ using namespace vdb::index;
 using namespace vdb::query;
 
 namespace fs = std::filesystem;
-
-// ============================================================================
-// Power-of-2 padding helpers (kept for --pad-to-pow2 / Deep1M dim=96→128)
-// ============================================================================
-static inline bool IsPowerOf2(uint32_t n) {
-    return n > 0 && (n & (n - 1)) == 0;
-}
-static inline uint32_t NextPowerOf2(uint32_t n) {
-    if (n == 0) return 1;
-    if (IsPowerOf2(n)) return n;
-    uint32_t p = 1; while (p < n) p <<= 1;
-    return p;
-}
-static void PadVectors(std::vector<float>& data, uint32_t N,
-                       uint32_t old_dim, uint32_t new_dim) {
-    if (new_dim == old_dim) return;
-    std::vector<float> padded(static_cast<size_t>(N) * new_dim, 0.0f);
-    for (uint32_t i = 0; i < N; ++i) {
-        std::memcpy(padded.data() + static_cast<size_t>(i) * new_dim,
-                    data.data() + static_cast<size_t>(i) * old_dim,
-                    old_dim * sizeof(float));
-    }
-    data = std::move(padded);
-}
 
 // ============================================================================
 // CLI helpers
@@ -258,10 +234,15 @@ int main(int argc, char* argv[]) {
     std::string centroids_path   = GetArg(argc, argv, "--centroids", "");
     std::string assignments_path = GetArg(argc, argv, "--assignments", "");
     std::string image_ids_path   = GetArg(argc, argv, "--image-ids", "");
-    bool pad_to_pow2 = GetIntArg(argc, argv, "--pad-to-pow2", 0) != 0;
     std::string arg_index_dir = GetArg(argc, argv, "--index-dir", "");
     std::string arg_tmp_dir   = GetArg(argc, argv, "--tmp-dir", "");
     bool keep_index           = HasFlag(argc, argv, "--keep-index");
+    if (HasFlag(argc, argv, "--pad-to-pow2")) {
+        std::fprintf(stderr,
+                     "Unsupported legacy option --pad-to-pow2: non-power-of-two "
+                     "dimensions use the builder's automatic FHT-Kac path.\n");
+        return 1;
+    }
 
     if (base_path.empty() || query_path.empty()) {
         std::fprintf(stderr,
@@ -279,7 +260,6 @@ int main(int argc, char* argv[]) {
             "[--dynamic-safein static|off|frontier] "
             "[--safein-all-threshold-bytes N] "
             "[--per-query-stats-output path] "
-            "[--pad-to-pow2 1] "
             "[--enable-stage1-safein 0|1] "
             "[--index-dir <path>] [--tmp-dir <path>] [--keep-index]\n");
         return 1;
@@ -356,44 +336,6 @@ int main(int argc, char* argv[]) {
             }
         }
         Log("  Loaded image ids: %zu\n", image_ids.size());
-    }
-
-    // Pad to next power of 2 if requested (e.g. Deep1M dim=96→128)
-    uint32_t orig_dim = dim;
-    std::string padded_centroids_path;  // temp file if centroids need padding
-    if (pad_to_pow2 && !IsPowerOf2(dim)) {
-        uint32_t new_dim = NextPowerOf2(dim);
-        Log("  [Padding] dim %u -> %u (next power of 2)\n", dim, new_dim);
-        PadVectors(base.data, N, dim, new_dim);
-        PadVectors(qry.data, qry.rows, dim, new_dim);
-
-        // Also pad pre-computed centroids if provided
-        if (!centroids_path.empty()) {
-            auto cents_or = io::LoadVectors(centroids_path);
-            if (cents_or.ok()) {
-                auto& cents = cents_or.value();
-                if (cents.cols == dim) {  // original dim before update
-                    PadVectors(cents.data, cents.rows, dim, new_dim);
-                    // Write padded centroids to a temp file
-                    padded_centroids_path = "/tmp/padded_centroids_bench.fvecs";
-                    std::ofstream pf(padded_centroids_path, std::ios::binary);
-                    for (uint32_t i = 0; i < cents.rows; ++i) {
-                        uint32_t d32 = new_dim;
-                        pf.write(reinterpret_cast<const char*>(&d32), 4);
-                        pf.write(reinterpret_cast<const char*>(
-                                     cents.data.data() + static_cast<size_t>(i) * new_dim),
-                                 new_dim * sizeof(float));
-                    }
-                    centroids_path = padded_centroids_path;
-                    Log("  [Padding] Centroids padded: %u×%u → %u×%u\n",
-                        cents.rows, dim, cents.rows, new_dim);
-                }
-            }
-        }
-
-        dim = static_cast<Dim>(new_dim);
-        base.cols = new_dim;
-        qry.cols = new_dim;
     }
 
     // GT loading
@@ -856,10 +798,7 @@ int main(int argc, char* argv[]) {
         dynamic_safein_defer_max_candidates;
     search_cfg.safein_all_threshold =
         static_cast<uint32_t>(safein_all_threshold_bytes);
-    search_cfg.prefetch_depth = 16;
     search_cfg.io_queue_depth = 64;
-    search_cfg.refill_threshold = 4;
-    search_cfg.refill_count = 8;
     search_cfg.enable_stage1_safein = enable_stage1_safein;
     if (safein_epsilon_percentile >= 0.0f) {
         search_cfg.safein_epsilon_override = runtime_safein_eps;
@@ -1236,7 +1175,7 @@ int main(int argc, char* argv[]) {
         jf << "  \"query\": \"" << query_path << "\",\n";
         jf << "  \"N\": " << N << ",\n";
         jf << "  \"Q\": " << Q << ",\n";
-        jf << "  \"dim\": " << orig_dim << ",\n";
+        jf << "  \"dim\": " << dim << ",\n";
         jf << "  \"nlist\": " << nlist << ",\n";
         jf << "  \"nprobe\": " << nprobe << ",\n";
         jf << "  \"top_k\": " << top_k << ",\n";

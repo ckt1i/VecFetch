@@ -15,6 +15,30 @@ struct IPExRaBitQBatchPackedSignCompactTiming {
     double reduce_ms = 0;
 };
 
+/// Pack/unpack ExRaBitQ Stage2 magnitude codes for the v12 packed `.clu`
+/// layout. Supported packed widths in this change are 2 and 4 bits.
+uint32_t ExRaBitQPackedMagnitudeBytes(uint32_t dim_block, uint8_t bits);
+
+bool ExRaBitQPackMagnitudes(const uint8_t* VDB_RESTRICT decoded,
+                            uint32_t count,
+                            uint8_t bits,
+                            uint8_t* VDB_RESTRICT packed,
+                            uint32_t packed_bytes);
+
+bool ExRaBitQUnpackMagnitudes(const uint8_t* VDB_RESTRICT packed,
+                              uint32_t count,
+                              uint8_t bits,
+                              uint8_t* VDB_RESTRICT decoded);
+
+bool ExRaBitQDecodePackedBatchBlockMagnitudes(
+    const uint8_t* VDB_RESTRICT packed_abs_blocks,
+    uint32_t num_dim_blocks,
+    uint32_t batch_size,
+    uint32_t dim_block,
+    uint32_t abs_bytes_per_lane_dim_block,
+    uint8_t bits,
+    uint8_t* VDB_RESTRICT decoded_abs_blocks);
+
 /// Compute the signed inner product for ExRaBitQ Stage 2:
 ///
 ///   result = Σ query[i] * sign[i] * (code_abs[i] + 0.5)

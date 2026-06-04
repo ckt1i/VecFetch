@@ -47,11 +47,14 @@ struct ParsedCluster {
     };
 
     struct ExRaBitQBatchBlockView {
-        const uint8_t* abs_blocks = nullptr;   // [dim_block_count][8][64]
+        const uint8_t* abs_blocks = nullptr;   // v11: [dim_block_count][8][64]; v12: packed
         const uint8_t* sign_blocks = nullptr;  // [dim_block_count][8][8B]
         const float* xipnorms = nullptr;       // [8]
         uint32_t valid_count = 0;
         uint32_t batch_block_id = 0;
+        uint32_t abs_bytes_per_lane_dim_block = 0;
+        uint8_t magnitude_bits = 0;
+        bool abs_packed = false;
     };
 
     struct ExRaBitQBatchParallelBlockView {
@@ -82,6 +85,9 @@ struct ParsedCluster {
     uint32_t exrabitq_dim_block = 0;
     uint32_t exrabitq_num_dim_blocks = 0;
     uint32_t exrabitq_num_batch_blocks = 0;
+    uint32_t exrabitq_abs_bytes_per_lane_dim_block = 0;
+    uint8_t exrabitq_magnitude_bits = 0;
+    bool exrabitq_magnitude_packed = false;
     const uint8_t* exrabitq_parallel_abs_blocks = nullptr;
     const uint16_t* exrabitq_parallel_sign_words = nullptr;
     uint32_t exrabitq_parallel_abs_block_size = 0;
@@ -95,6 +101,18 @@ struct ParsedCluster {
     uint32_t address_page_size = 0;
     bool addresses_are_raw_v2 = false;
     std::vector<AddressEntry> decoded_addresses;
+    const AddressEntry* decoded_addresses_data = nullptr;
+    uint32_t decoded_address_count = 0;
+
+    // Layout offsets inside the original cluster block. Resident preload uses
+    // these to retain only the code region and drop address/trailer bytes.
+    uint64_t fastscan_region_offset = 0;
+    uint64_t exrabitq_region_offset = 0;
+    uint64_t code_region_bytes = 0;
+    uint64_t address_payload_offset = 0;
+    uint64_t address_payload_bytes = 0;
+    uint64_t mini_trailer_offset = 0;
+    uint32_t mini_trailer_size = 0;
 
     // --- Legacy (kept for compatibility during transition) ---
     const uint8_t* codes_start = nullptr;  // Zero-copy into block_buf
@@ -140,8 +158,12 @@ struct ParsedCluster {
         const uint8_t* block =
             exrabitq_batch_blocks +
             static_cast<size_t>(batch_block_id) * exrabitq_batch_block_size;
+        const uint32_t abs_lane_bytes =
+            exrabitq_abs_bytes_per_lane_dim_block != 0
+                ? exrabitq_abs_bytes_per_lane_dim_block
+                : exrabitq_dim_block;
         const uint32_t abs_total_bytes =
-            exrabitq_num_dim_blocks * exrabitq_batch_size * exrabitq_dim_block;
+            exrabitq_num_dim_blocks * exrabitq_batch_size * abs_lane_bytes;
         view.batch_block_id = batch_block_id;
         std::memcpy(&view.valid_count, block, sizeof(uint32_t));
         const uint8_t* payload = block + sizeof(uint32_t);
@@ -149,6 +171,9 @@ struct ParsedCluster {
         view.sign_blocks = payload + abs_total_bytes;
         view.xipnorms = reinterpret_cast<const float*>(
             block + exrabitq_batch_block_size - exrabitq_batch_size * sizeof(float));
+        view.abs_bytes_per_lane_dim_block = abs_lane_bytes;
+        view.magnitude_bits = exrabitq_magnitude_bits;
+        view.abs_packed = exrabitq_magnitude_packed;
         return view;
     }
 
@@ -210,22 +235,43 @@ struct ParsedCluster {
     }
 
     AddressEntry AddressAt(uint32_t vec_idx) const {
+        const AddressEntry* decoded = decoded_address_base();
+        if (decoded != nullptr) {
+            return decoded[vec_idx];
+        }
         if (addresses_are_raw_v2 && raw_addresses != nullptr) {
             return storage::AddressColumn::DecodeRawEntryV2(
                 raw_addresses[vec_idx], address_page_size);
         }
-        return decoded_addresses[vec_idx];
+        return AddressEntry{0, 0};
     }
 
     void DecodeAddressBatch(const uint32_t* vec_idxs,
                             uint32_t count,
                             AddressEntry* out) const {
+        if (count == 0) return;
+        const AddressEntry* decoded = decoded_address_base();
+        if (decoded != nullptr) {
+            simd::DecodeAddressBatch(decoded, vec_idxs, count, out);
+            return;
+        }
         if (addresses_are_raw_v2 && raw_addresses != nullptr) {
             simd::DecodeAddressBatch(raw_addresses, vec_idxs, count,
                                      address_page_size, out);
             return;
         }
-        simd::DecodeAddressBatch(decoded_addresses.data(), vec_idxs, count, out);
+        std::memset(out, 0, sizeof(AddressEntry) * count);
+    }
+
+    const AddressEntry* decoded_address_base() const {
+        if (decoded_addresses_data != nullptr) return decoded_addresses_data;
+        if (!decoded_addresses.empty()) return decoded_addresses.data();
+        return nullptr;
+    }
+
+    uint32_t decoded_address_size() const {
+        if (decoded_addresses_data != nullptr) return decoded_address_count;
+        return static_cast<uint32_t>(decoded_addresses.size());
     }
 };
 

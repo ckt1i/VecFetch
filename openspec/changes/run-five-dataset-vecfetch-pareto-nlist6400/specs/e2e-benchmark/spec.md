@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: 正式 VecFetch E2E 运行必须使用外部 top-100 ground truth
-E2E benchmark 工作流必须支持正式 Full VecFetch 查询运行，并且 `topk=10` 和 `topk=100` 都使用该数据集的外部 `gt_top100.npy` 文件作为 recall 来源。
+E2E benchmark 工作流 MUST 支持正式 Full VecFetch 查询运行，并且 `topk=10` 和 `topk=100` 都使用该数据集的外部 `gt_top100.npy` 文件作为 recall 来源。
 
 #### Scenario: top-k 10 使用 top-100 GT
 - **WHEN** 调度 `topk=10` 的正式 VecFetch E2E 运行
@@ -21,7 +21,7 @@ E2E benchmark 工作流必须支持正式 Full VecFetch 查询运行，并且 `t
 - **AND** 不得提升到本 change 的正式 Pareto CSV 或 threshold-selected summary。
 
 ### Requirement: 正式 VecFetch E2E 命令必须复用 accepted indexes
-E2E benchmark 工作流必须通过加载预先存在的索引来运行正式 Full VecFetch 点，而不是在查询测量期间构建索引。
+E2E benchmark 工作流 MUST 通过加载预先存在的索引来运行正式 Full VecFetch 点，而不是在查询测量期间构建索引。
 
 #### Scenario: 必须提供已有索引路径
 - **WHEN** 生成正式 Full VecFetch E2E 命令
@@ -35,7 +35,7 @@ E2E benchmark 工作流必须通过加载预先存在的索引来运行正式 Fu
 - **AND** 任何 `index_source=rebuilt` 的 `results.json` 都必须被视为本次正式 Pareto 结果面的无效行，除非显式标记为本 change 之外的历史 probe。
 
 ### Requirement: 正式 VecFetch E2E 输出必须保留 Pareto 归因所需机制和资源字段
-E2E benchmark 输出必须保留解释 recall-latency 点和支持后续资源分析所需的机制级字段。
+E2E benchmark 输出 MUST 保留解释 recall-latency 点和支持后续资源分析所需的机制级字段。
 
 #### Scenario: 输出 query latency 和 recall 字段
 - **WHEN** 一个正式 Full VecFetch E2E 运行完成
@@ -54,7 +54,7 @@ E2E benchmark 输出必须保留解释 recall-latency 点和支持后续资源�
 - **THEN** 输出必须包含 preload time、preload bytes、resident cluster memory bytes，以及查询路径是否使用 resident clusters。
 
 ### Requirement: 正式 VecFetch E2E 控制项必须可从 config 输出重建
-E2E benchmark 的配置输出必须让可复现实验所需的每个正式控制项都出现在 `config.json` 或 aggregate row 中。
+E2E benchmark 的配置输出 MUST 让可复现实验所需的每个正式控制项都出现在 `config.json` 或 aggregate row 中。
 
 #### Scenario: 记录 dynamic boundary 控制项
 - **WHEN** 一个正式 Full VecFetch E2E 运行完成
@@ -62,7 +62,9 @@ E2E benchmark 的配置输出必须让可复现实验所需的每个正式控制
 
 #### Scenario: 记录 serving-mode 控制项
 - **WHEN** 一个正式 Full VecFetch E2E 运行完成
-- **THEN** 输出必须记录 `clu_read_mode`、resident-cluster usage、`prefetch_depth`、`io_queue_depth`、`fixed_vec_buffer_count`、`submission_mode` 和 `cluster_submit_reserve`。
+- **THEN** 输出必须记录 `cluster_loading=resident_full_preload` 或等价 resident-cluster usage metadata
+- **AND** 输出必须记录 `io_queue_depth`、`fixed_vec_buffer_count`、`submission_mode` 和 `cluster_submit_reserve`
+- **AND** 正式命令不得依赖已删除的 `clu_read_mode`、`use_resident_clusters` 或 `prefetch_depth` CLI。
 
 #### Scenario: 记录索引和 payload 控制项
 - **WHEN** 一个正式 Full VecFetch E2E 运行完成

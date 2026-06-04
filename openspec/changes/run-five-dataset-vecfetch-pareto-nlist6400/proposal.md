@@ -14,6 +14,7 @@
 - 聚合 Pareto-ready 输出，使 ImageNet1K IVF 对比只使用新的 `nlist=6400` baseline 结果；旧 `nlist=4096` ImageNet1K IVF 行保留在磁盘上，但从本次对比中排除。
 - 保留已经接受的 raw-vector DiskANN baseline 结果面；本 change 不重建 DiskANN 索引。
 - 在 formal-study 输出树下生成结果摘要和 Pareto 输入，并对未达到的 recall 目标显式标记 `best-effort`。
+- 在正式实验结束并完成 combined Pareto CSV 验证后，绘制五个数据集的 `Recall@10` / `Recall@100` Pareto 曲线图表，供后续查看和论文图表筛选。
 
 ## Capabilities
 
@@ -24,7 +25,7 @@
 ### Modified Capabilities
 
 - `formal-baseline-execution`：增加五数据集 Full VecFetch Pareto 执行面，以及 ImageNet1K IVF `nlist=6400` 重跑要求。
-- `formal-baseline-result-tracking`：增加复用索引身份、ImageNet1K `nlist=6400` 过滤、top-k/GT 一致性与 Pareto-ready 聚合的结果追踪要求。
+- `formal-baseline-result-tracking`：增加复用索引身份、ImageNet1K `nlist=6400` 过滤、top-k/GT 一致性、Pareto-ready 聚合与五数据集 Pareto 图表生成的结果追踪要求。
 - `e2e-benchmark`：要求正式 VecFetch E2E 运行复用已有索引，从 top-100 GT 导出 `Recall@10` / `Recall@100`，并保留 Pareto 与机制归因所需字段。
 
 ## Impact

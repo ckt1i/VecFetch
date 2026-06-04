@@ -9,7 +9,8 @@ This directory now contains a thin experiment harness for `bench_e2e`.
 - The current plan-v1 control variants also include:
   - `fixed-probe-submit-batch-0`
   - `fixed-probe-submit-batch-32`
-- The older exploratory matrix is still available via `--mode legacy-baseline`.
+- The older exploratory matrix is still available via `--mode legacy-baseline`,
+  but cluster loading is always resident full-preload.
 - Heavier `Stage2 compute-ready` variants are intentionally left out because
   they require future code support and are not the current priority.
 

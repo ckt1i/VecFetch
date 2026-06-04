@@ -1,16 +1,16 @@
 ## ADDED Requirements
 
 ### Requirement: 正式执行必须用复用索引运行五数据集 Full VecFetch Pareto
-正式实验工作流必须只使用已接受的预先存在 VecFetch 索引，为 `coco_100k`、`msmarco_passage`、`amazon_esci`、`imagenet1k` 和 `voxceleb2_ecapa_150k` 执行 Full VecFetch Pareto sweep。
+正式实验工作流 MUST 只使用已接受的预先存在 VecFetch 索引，为 `coco_100k`、`msmarco_passage`、`amazon_esci`、`imagenet1k` 和 `voxceleb2_ecapa_150k` 执行 Full VecFetch Pareto sweep。
 
 #### Scenario: 调度前验证 accepted VecFetch 索引
 - **WHEN** 五数据集 VecFetch Pareto 工作流启动
 - **THEN** runner 必须在调度任何 benchmark 命令前验证以下 dataset-to-index map：
   - `coco_100k`: `/home/zcq/VDB/test/data/COCO100k/index_fkmeans_2048_bits4_eps0.90`
   - `msmarco_passage`: `/home/zcq/VDB/test/data/MSMARCO/fht_kac_rotator`
-  - `amazon_esci`: `/home/zcq/VDB/test/data/amazon_esci/vecfetch_nlist8192_np64_bits4_raw_payload/index`
+  - `amazon_esci`: `/home/zcq/VDB/test/data/amazon_esci/vecfetch_nlist8192_np64_bits4_raw_payload_fht_kac/amazon_esci_20260603T190113/index`
   - `imagenet1k`: `/home/zcq/VDB/test/data/imagenet1k_split_v1/vecfetch_nlist6400_np64_bits4_raw_payload/index`
-  - `voxceleb2_ecapa_150k`: `/home/zcq/VDB/test/data/voxceleb2_ecapa_150k/vecfetch_nlist2048_np64_bits4_audio_payload_split_v1/index`
+  - `voxceleb2_ecapa_150k`: `/home/zcq/VDB/test/data/voxceleb2_ecapa_150k/vecfetch_nlist2048_np64_bits4_audio_payload_split_v1_fht_kac/voxceleb2_ecapa_150k_split_v1_20260603T190033/index`
 - **AND** 如果任何必需索引缺失、为空或 `nlist` metadata 不匹配，runner 必须在 benchmark 执行前失败。
 
 #### Scenario: VecFetch 查询运行不得构建索引
@@ -20,7 +20,7 @@
 - **AND** 命令不得删除、覆盖或重建 accepted index directory。
 
 ### Requirement: Full VecFetch Pareto sweep 必须使用固定方法控制项和数据集专属 nprobe 网格
-正式 Full VecFetch Pareto sweep 必须只改变 `topk` 和 `nprobe`，并固定已接受的方法控制项。
+正式 Full VecFetch Pareto sweep MUST 只改变 `topk` 和 `nprobe`，并固定已接受的方法控制项。
 
 #### Scenario: 每个 Full VecFetch 行固定方法控制项
 - **WHEN** 运行一个正式 Full VecFetch 行
@@ -31,9 +31,8 @@
 - **AND** 必须使用 `dynamic_safein_rel_tol=0.005`
 - **AND** 必须使用 `dynamic_safein_defer_initial_clusters=4`
 - **AND** 必须使用 `dynamic_safein_defer_until_ready=1`
-- **AND** 必须使用 `clu_read_mode=full_preload`
-- **AND** 必须使用 resident clusters
-- **AND** 必须使用 `prefetch_depth=16`
+- **AND** 不得传入已删除的 `--clu-read-mode`、`--use-resident-clusters` 或 `--prefetch-depth`
+- **AND** 输出必须报告 `cluster_loading=resident_full_preload` 或等价 resident full-preload metadata
 - **AND** 必须使用 `io_queue_depth=64`
 - **AND** 必须使用 `fixed_vec_buffer_count=1024`
 - **AND** 必须使用 `bits=4`。
@@ -47,7 +46,7 @@
 - **AND** `voxceleb2_ecapa_150k` 必须使用 `nprobe={8,16,32,64,128,256}`。
 
 ### Requirement: ImageNet1K IVF baseline 必须以 nlist 6400 和六点 nprobe 网格重跑
-正式 baseline 工作流必须在 `nlist=6400` 下重跑 ImageNet1K IVF+PQ 和 IVF+RQ baseline，使 baseline search surface 与更新后的 ImageNet1K VecFetch 索引一致。
+正式 baseline 工作流 MUST 在 `nlist=6400` 下重跑 ImageNet1K IVF+PQ 和 IVF+RQ baseline，使 baseline search surface 与更新后的 ImageNet1K VecFetch 索引一致。
 
 #### Scenario: ImageNet1K IVF nlist 6400 重跑矩阵固定
 - **WHEN** 调度 ImageNet1K IVF baseline 重跑
@@ -69,7 +68,7 @@
 - **AND** baseline 必须使用 `total_bits=4` 和 `candidate_budget=topk*20`。
 
 ### Requirement: 正式执行必须在昂贵运行前执行 readiness 与 safety gates
-工作流必须在 full sweep 前检查 dataset readiness、CPU 空闲、磁盘容量和命令安全性。
+工作流 MUST 在 full sweep 前检查 dataset readiness、CPU 空闲、磁盘容量和命令安全性。
 
 #### Scenario: full execution 前 preflight 通过
 - **WHEN** 即将启动完整实验 batch

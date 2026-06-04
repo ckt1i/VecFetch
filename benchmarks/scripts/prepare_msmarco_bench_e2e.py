@@ -367,9 +367,14 @@ def main() -> int:
                 dst.write(json.dumps(record, ensure_ascii=False) + "\n")
         base_rows = int(passage_ids.size)
     else:
-        _save_npy_slice(base_emb, out_dir / "image_embeddings.npy", base_rows)
+        if limit_rows is None:
+            link_mode_base = _link_or_copy(
+                base_emb, out_dir / "image_embeddings.npy", args.prefer_symlink
+            )
+        else:
+            _save_npy_slice(base_emb, out_dir / "image_embeddings.npy", base_rows)
+            link_mode_base = f"slice_{base_rows}"
         _save_npy_slice(query_emb, out_dir / "query_embeddings.npy", query_rows)
-        link_mode_base = f"slice_{base_rows}"
         link_mode_query = f"slice_{query_rows}"
         passage_table = pq.read_table(passages_parquet, columns=["row_id", "pid"])
         query_table = pq.read_table(queries_parquet, columns=["qid"])

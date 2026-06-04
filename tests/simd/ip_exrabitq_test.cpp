@@ -92,6 +92,81 @@ void BuildParallelCompactLayout(uint32_t dim,
 
 }  // namespace
 
+TEST(IPExRaBitQTest, PackedMagnitudeRoundTripBits2And4) {
+    for (uint8_t bits : {2u, 4u}) {
+        const uint32_t max_value = (1u << bits) - 1u;
+        for (uint32_t dim : {1u, 7u, 16u, 63u, 64u, 70u, 512u}) {
+            std::vector<uint8_t> decoded(dim);
+            for (uint32_t i = 0; i < dim; ++i) {
+                decoded[i] = static_cast<uint8_t>((i * 13u + 5u) & max_value);
+            }
+            const uint32_t packed_bytes =
+                vdb::simd::ExRaBitQPackedMagnitudeBytes(dim, bits);
+            ASSERT_GT(packed_bytes, 0u);
+            std::vector<uint8_t> packed(packed_bytes, 0xA5u);
+            std::vector<uint8_t> unpacked(dim, 0);
+
+            ASSERT_TRUE(vdb::simd::ExRaBitQPackMagnitudes(
+                decoded.data(), dim, bits, packed.data(), packed_bytes));
+            ASSERT_TRUE(vdb::simd::ExRaBitQUnpackMagnitudes(
+                packed.data(), dim, bits, unpacked.data()));
+            EXPECT_EQ(unpacked, decoded) << "bits=" << static_cast<int>(bits)
+                                         << " dim=" << dim;
+        }
+    }
+}
+
+TEST(IPExRaBitQTest, PackedMagnitudeRejectsUnsupportedBitsAndOutOfRangeValues) {
+    uint8_t decoded[4] = {0, 1, 2, 3};
+    uint8_t packed[4] = {};
+    EXPECT_EQ(vdb::simd::ExRaBitQPackedMagnitudeBytes(64, 3), 0u);
+    EXPECT_FALSE(vdb::simd::ExRaBitQPackMagnitudes(
+        decoded, 4, 3, packed, sizeof(packed)));
+
+    decoded[3] = 4;
+    EXPECT_FALSE(vdb::simd::ExRaBitQPackMagnitudes(
+        decoded, 4, 2, packed, sizeof(packed)));
+}
+
+TEST(IPExRaBitQTest, PackedBatchBlockDecodeMatchesCompactLayout) {
+    constexpr uint32_t batch_size = 8;
+    constexpr uint32_t dim_block = 64;
+    constexpr uint32_t num_dim_blocks = 2;
+    for (uint8_t bits : {2u, 4u}) {
+        const uint32_t max_value = (1u << bits) - 1u;
+        const uint32_t packed_lane_bytes =
+            vdb::simd::ExRaBitQPackedMagnitudeBytes(dim_block, bits);
+        std::vector<uint8_t> decoded_compact(
+            static_cast<size_t>(num_dim_blocks) * batch_size * dim_block, 0);
+        std::vector<uint8_t> packed(
+            static_cast<size_t>(num_dim_blocks) * batch_size * packed_lane_bytes,
+            0);
+        for (uint32_t db = 0; db < num_dim_blocks; ++db) {
+            for (uint32_t lane = 0; lane < batch_size; ++lane) {
+                uint8_t* decoded_lane =
+                    decoded_compact.data() +
+                    (static_cast<size_t>(db) * batch_size + lane) * dim_block;
+                for (uint32_t d = 0; d < dim_block; ++d) {
+                    decoded_lane[d] = static_cast<uint8_t>(
+                        (db * 17u + lane * 7u + d * 3u) & max_value);
+                }
+                uint8_t* packed_lane =
+                    packed.data() +
+                    (static_cast<size_t>(db) * batch_size + lane) * packed_lane_bytes;
+                ASSERT_TRUE(vdb::simd::ExRaBitQPackMagnitudes(
+                    decoded_lane, dim_block, bits, packed_lane, packed_lane_bytes));
+            }
+        }
+
+        std::vector<uint8_t> unpacked(decoded_compact.size(), 0);
+        ASSERT_TRUE(vdb::simd::ExRaBitQDecodePackedBatchBlockMagnitudes(
+            packed.data(), num_dim_blocks, batch_size, dim_block,
+            packed_lane_bytes, bits, unpacked.data()));
+        EXPECT_EQ(unpacked, decoded_compact)
+            << "bits=" << static_cast<int>(bits);
+    }
+}
+
 TEST(IPExRaBitQTest, MatchesScalarAcrossDimsAndSignPatterns) {
     for (uint32_t dim : {16u, 32u, 64u, 70u, 512u}) {
         const auto query = MakeQuery(dim);

@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <random>
 #include <unistd.h>
@@ -11,6 +14,7 @@
 #include "vdb/query/parsed_cluster.h"
 #include "vdb/rabitq/rabitq_encoder.h"
 #include "vdb/rabitq/rabitq_rotation.h"
+#include "vdb/simd/ip_exrabitq.h"
 #include "vdb/storage/address_column.h"
 #include "vdb/storage/cluster_store.h"
 
@@ -1038,6 +1042,14 @@ TEST_F(ClusterStoreTest, FullPreload_MatchesEnsureClusterLoaded) {
     ASSERT_TRUE(reader.resident_preload_enabled());
     EXPECT_GT(reader.resident_preload_bytes(), 0u);
     EXPECT_GT(reader.resident_cluster_mem_bytes(), 0u);
+    EXPECT_EQ(reader.resident_preload_mode(), "compact_batched");
+    EXPECT_EQ(reader.resident_preload_batch_size(), 16u);
+    EXPECT_GT(reader.resident_file_size_bytes(), 0u);
+    EXPECT_EQ(reader.resident_file_buffer_bytes(), 0u);
+    EXPECT_GT(reader.resident_code_storage_bytes(), 0u);
+    EXPECT_GT(reader.resident_decoded_address_bytes(), 0u);
+    EXPECT_EQ(reader.resident_raw_address_bytes(), 0u);
+    EXPECT_EQ(reader.resident_parsed_address_duplicate_bytes(), 0u);
 
     for (uint32_t k = 0; k < K; ++k) {
         ASSERT_TRUE(reader.EnsureClusterLoaded(k).ok());
@@ -1049,12 +1061,39 @@ TEST_F(ClusterStoreTest, FullPreload_MatchesEnsureClusterLoaded) {
         EXPECT_EQ(resident->num_records, cluster_sizes[k]);
         EXPECT_EQ(resident->decoded_addresses.size(), cluster_sizes[k]);
         EXPECT_EQ(resident_pc->num_fastscan_blocks, (cluster_sizes[k] + 31) / 32);
+        EXPECT_EQ(resident_pc->decoded_addresses.size(), 0u);
+        EXPECT_EQ(resident_pc->decoded_address_size(), cluster_sizes[k]);
+        EXPECT_EQ(resident_pc->raw_addresses, nullptr);
+        EXPECT_FALSE(resident_pc->addresses_are_raw_v2);
+        if (cluster_sizes[k] > 0) {
+            EXPECT_EQ(resident_pc->decoded_address_base(),
+                      resident->decoded_addresses.data());
+        }
+
+        const auto storage_begin = reinterpret_cast<std::uintptr_t>(
+            resident->code_storage.data());
+        const auto storage_end = storage_begin + resident->code_storage.size();
+        auto points_into_code_storage = [&](const uint8_t* ptr) {
+            if (ptr == nullptr) return true;
+            const auto p = reinterpret_cast<std::uintptr_t>(ptr);
+            return p >= storage_begin && p < storage_end;
+        };
+        EXPECT_TRUE(points_into_code_storage(resident->fastscan_blocks));
+        EXPECT_TRUE(points_into_code_storage(resident_pc->fastscan_blocks));
+        EXPECT_TRUE(points_into_code_storage(resident->exrabitq_entries));
+        EXPECT_TRUE(points_into_code_storage(resident_pc->exrabitq_entries));
+        EXPECT_TRUE(points_into_code_storage(resident->exrabitq_batch_blocks));
+        EXPECT_TRUE(points_into_code_storage(resident_pc->exrabitq_batch_blocks));
 
         for (uint32_t i = 0; i < cluster_sizes[k]; ++i) {
             auto sync_addr = reader.GetAddress(k, i);
             EXPECT_EQ(resident->decoded_addresses[i].offset, sync_addr.offset)
                 << "cluster " << k << " record " << i;
             EXPECT_EQ(resident->decoded_addresses[i].size, sync_addr.size)
+                << "cluster " << k << " record " << i;
+            EXPECT_EQ(resident_pc->AddressAt(i).offset, sync_addr.offset)
+                << "cluster " << k << " record " << i;
+            EXPECT_EQ(resident_pc->AddressAt(i).size, sync_addr.size)
                 << "cluster " << k << " record " << i;
 
             uint32_t block_idx = i / 32;
@@ -1126,19 +1165,57 @@ TEST_F(ClusterStoreTest, ParseClusterBlock_Bits4MatchesLoadedData) {
     query::ParsedCluster parsed;
     ASSERT_TRUE(reader.ParseClusterBlock(0, std::move(block_buf), loc->size, parsed).ok());
     ASSERT_EQ(parsed.num_records, N);
-    ASSERT_NE(parsed.exrabitq_entries, nullptr);
+    ASSERT_EQ(reader.file_version(), 12u);
+    ASSERT_EQ(parsed.exrabitq_entries, nullptr);
+    ASSERT_NE(parsed.exrabitq_batch_blocks, nullptr);
+    EXPECT_TRUE(parsed.exrabitq_magnitude_packed);
+    EXPECT_EQ(parsed.exrabitq_magnitude_bits, 4u);
 
     for (uint32_t i = 0; i < N; ++i) {
         std::vector<RaBitQCode> loaded;
         ASSERT_TRUE(reader.LoadCodes(0, {i}, loaded).ok());
-        const auto ex_view = parsed.exrabitq_view(i, dim);
-        ASSERT_NE(ex_view.code_abs, nullptr);
-        ASSERT_NE(ex_view.sign, nullptr);
-        EXPECT_TRUE(std::equal(ex_view.code_abs, ex_view.code_abs + dim,
-                               loaded[0].ex_code.begin()));
-        EXPECT_TRUE(std::equal(ex_view.sign, ex_view.sign + dim,
-                               loaded[0].ex_sign_packed.begin()));
-        EXPECT_FLOAT_EQ(ex_view.xipnorm, loaded[0].xipnorm);
+        const uint32_t block_id = i / parsed.exrabitq_batch_size;
+        const uint32_t lane_id = i % parsed.exrabitq_batch_size;
+        const auto block_view = parsed.exrabitq_batch_block_view(block_id);
+        ASSERT_NE(block_view.abs_blocks, nullptr);
+        ASSERT_NE(block_view.sign_blocks, nullptr);
+        ASSERT_TRUE(block_view.abs_packed);
+        ASSERT_LT(lane_id, block_view.valid_count);
+
+        std::vector<uint8_t> unpacked(dim, 0);
+        for (uint32_t db = 0; db < parsed.exrabitq_num_dim_blocks; ++db) {
+            const uint32_t dim_start = db * parsed.exrabitq_dim_block;
+            const uint32_t copy = std::min(parsed.exrabitq_dim_block, dim - dim_start);
+            const uint8_t* packed_abs =
+                block_view.abs_blocks +
+                static_cast<size_t>(db) * parsed.exrabitq_batch_size *
+                    block_view.abs_bytes_per_lane_dim_block +
+                lane_id * block_view.abs_bytes_per_lane_dim_block;
+            uint8_t tmp[64] = {};
+            ASSERT_TRUE(vdb::simd::ExRaBitQUnpackMagnitudes(
+                packed_abs, parsed.exrabitq_dim_block, block_view.magnitude_bits, tmp));
+            std::memcpy(unpacked.data() + dim_start, tmp, copy);
+
+            const uint8_t* sign_ptr =
+                block_view.sign_blocks +
+                static_cast<size_t>(db) * parsed.exrabitq_batch_size *
+                    (parsed.exrabitq_dim_block / 8) +
+                lane_id * (parsed.exrabitq_dim_block / 8);
+            const uint32_t sign_offset = dim_start / 8;
+            const uint32_t sign_copy =
+                sign_offset < loaded[0].ex_sign_packed.size()
+                    ? std::min<uint32_t>(
+                          parsed.exrabitq_dim_block / 8,
+                          static_cast<uint32_t>(
+                              loaded[0].ex_sign_packed.size() - sign_offset))
+                    : 0;
+            EXPECT_TRUE(std::equal(
+                sign_ptr,
+                sign_ptr + sign_copy,
+                loaded[0].ex_sign_packed.begin() + sign_offset));
+        }
+        EXPECT_EQ(unpacked, loaded[0].ex_code);
+        EXPECT_FLOAT_EQ(block_view.xipnorms[lane_id], loaded[0].xipnorm);
         EXPECT_EQ(parsed.decoded_addresses[i].offset, addrs[i].offset);
         EXPECT_EQ(parsed.decoded_addresses[i].size, addrs[i].size);
     }
@@ -1180,7 +1257,7 @@ TEST_F(ClusterStoreTest, ParseClusterBlock_V9RawAddressTableSupportsGaps) {
 
     ClusterStoreReader reader;
     ASSERT_TRUE(reader.Open(path).ok());
-    EXPECT_EQ(reader.file_version(), 9u);
+    EXPECT_GE(reader.file_version(), 9u);
     ASSERT_TRUE(reader.EnsureClusterLoaded(0).ok());
     auto loc = reader.GetBlockLocation(0);
     ASSERT_TRUE(loc.has_value());

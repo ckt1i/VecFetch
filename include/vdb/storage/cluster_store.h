@@ -84,6 +84,7 @@ class ClusterStoreWriter {
 class ClusterStoreReader {
  public:
     struct ResidentClusterView {
+        std::vector<uint8_t> code_storage;
         const uint8_t* fastscan_blocks = nullptr;
         uint32_t fastscan_block_size = 0;
         uint32_t num_fastscan_blocks = 0;
@@ -98,6 +99,9 @@ class ClusterStoreReader {
         uint32_t exrabitq_dim_block = 0;
         uint32_t exrabitq_num_dim_blocks = 0;
         uint32_t exrabitq_num_batch_blocks = 0;
+        uint32_t exrabitq_abs_bytes_per_lane_dim_block = 0;
+        uint8_t exrabitq_magnitude_bits = 0;
+        bool exrabitq_magnitude_packed = false;
         std::vector<uint8_t> exrabitq_parallel_abs_blocks_storage;
         std::vector<uint16_t> exrabitq_parallel_sign_words_storage;
         uint32_t exrabitq_parallel_abs_block_size = 0;
@@ -109,6 +113,9 @@ class ClusterStoreReader {
         uint32_t address_page_size = 0;
         bool addresses_are_raw_v2 = false;
         std::vector<AddressEntry> decoded_addresses;
+        uint64_t code_storage_bytes = 0;
+        uint64_t decoded_address_bytes = 0;
+        uint64_t raw_address_bytes = 0;
 
         query::ParsedCluster ToParsedCluster() const {
             query::ParsedCluster pc;
@@ -126,6 +133,10 @@ class ClusterStoreReader {
             pc.exrabitq_dim_block = exrabitq_dim_block;
             pc.exrabitq_num_dim_blocks = exrabitq_num_dim_blocks;
             pc.exrabitq_num_batch_blocks = exrabitq_num_batch_blocks;
+            pc.exrabitq_abs_bytes_per_lane_dim_block =
+                exrabitq_abs_bytes_per_lane_dim_block;
+            pc.exrabitq_magnitude_bits = exrabitq_magnitude_bits;
+            pc.exrabitq_magnitude_packed = exrabitq_magnitude_packed;
             pc.exrabitq_parallel_abs_blocks =
                 exrabitq_parallel_abs_blocks_storage.empty()
                 ? nullptr
@@ -144,7 +155,19 @@ class ClusterStoreReader {
             pc.raw_addresses = raw_addresses;
             pc.address_page_size = address_page_size;
             pc.addresses_are_raw_v2 = addresses_are_raw_v2;
-            pc.decoded_addresses = decoded_addresses;
+            pc.decoded_addresses_data =
+                decoded_addresses.empty() ? nullptr : decoded_addresses.data();
+            pc.decoded_address_count =
+                static_cast<uint32_t>(decoded_addresses.size());
+            pc.fastscan_region_offset = 0;
+            pc.exrabitq_region_offset =
+                (exrabitq_entries != nullptr && fastscan_blocks != nullptr)
+                    ? static_cast<uint64_t>(exrabitq_entries - fastscan_blocks)
+                    : ((exrabitq_batch_blocks != nullptr && fastscan_blocks != nullptr)
+                           ? static_cast<uint64_t>(exrabitq_batch_blocks - fastscan_blocks)
+                           : 0);
+            pc.code_region_bytes = code_storage_bytes;
+            pc.address_payload_bytes = raw_address_bytes;
             pc.codes_start = fastscan_blocks;
             pc.code_entry_size = 0;
             return pc;
@@ -204,6 +227,16 @@ class ClusterStoreReader {
     const ResidentClusterView* GetResidentClusterView(uint32_t cluster_id) const;
     const query::ParsedCluster* GetResidentParsedCluster(uint32_t cluster_id) const;
     uint64_t resident_cluster_mem_bytes() const { return resident_cluster_mem_bytes_; }
+    uint64_t resident_file_size_bytes() const { return resident_file_size_bytes_; }
+    uint64_t resident_file_buffer_bytes() const { return resident_file_buffer_bytes_; }
+    uint64_t resident_code_storage_bytes() const { return resident_code_storage_bytes_; }
+    uint64_t resident_decoded_address_bytes() const { return resident_decoded_address_bytes_; }
+    uint64_t resident_raw_address_bytes() const { return resident_raw_address_bytes_; }
+    uint64_t resident_parsed_address_duplicate_bytes() const {
+        return resident_parsed_address_duplicate_bytes_;
+    }
+    uint32_t resident_preload_batch_size() const { return resident_preload_batch_size_; }
+    const std::string& resident_preload_mode() const { return resident_preload_mode_; }
     uint64_t resident_parallel_view_bytes() const { return resident_parallel_view_bytes_; }
     double resident_parallel_view_build_ms() const { return resident_parallel_view_build_ms_; }
     bool is_open() const { return fd_ >= 0; }
@@ -232,6 +265,14 @@ class ClusterStoreReader {
     bool resident_preload_ready_ = false;
     uint64_t resident_preload_bytes_ = 0;
     uint64_t resident_cluster_mem_bytes_ = 0;
+    uint64_t resident_file_size_bytes_ = 0;
+    uint64_t resident_file_buffer_bytes_ = 0;
+    uint64_t resident_code_storage_bytes_ = 0;
+    uint64_t resident_decoded_address_bytes_ = 0;
+    uint64_t resident_raw_address_bytes_ = 0;
+    uint64_t resident_parsed_address_duplicate_bytes_ = 0;
+    uint32_t resident_preload_batch_size_ = 0;
+    std::string resident_preload_mode_;
     double resident_preload_time_ms_ = 0.0;
     uint64_t resident_parallel_view_bytes_ = 0;
     double resident_parallel_view_build_ms_ = 0.0;
@@ -261,12 +302,24 @@ class ClusterStoreReader {
         const uint32_t db = exrabitq_dim_block();
         return db == 0 ? 0 : (info_.dim + db - 1) / db;
     }
+    bool exrabitq_magnitude_packed() const {
+        return info_.rabitq_config.bits > 1 && file_version_ >= 12;
+    }
+    uint32_t exrabitq_abs_bytes_per_lane_dim_block() const {
+        if (info_.rabitq_config.bits <= 1 || file_version_ < 11) return 0;
+        const uint32_t db = exrabitq_dim_block();
+        if (file_version_ >= 12) {
+            return (db * static_cast<uint32_t>(info_.rabitq_config.bits) + 7u) / 8u;
+        }
+        return db;
+    }
     uint32_t exrabitq_batch_block_size() const {
         if (info_.rabitq_config.bits <= 1 || file_version_ < 11) return 0;
         const uint32_t batch = exrabitq_batch_size();
         const uint32_t db = exrabitq_dim_block();
         const uint32_t blocks = exrabitq_dim_block_count();
-        const uint32_t abs_bytes = blocks * batch * db;
+        const uint32_t abs_bytes =
+            blocks * batch * exrabitq_abs_bytes_per_lane_dim_block();
         const uint32_t sign_bytes = blocks * batch * (db / 8);
         return sizeof(uint32_t) + abs_bytes + sign_bytes + batch * sizeof(float);
     }

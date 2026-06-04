@@ -210,6 +210,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
         double stage2_kernel_abs_fma_ms = 0.0;
         double stage2_kernel_tail_ms = 0.0;
         double stage2_kernel_reduce_ms = 0.0;
+        double stage2_decode_ms = 0.0;
 
         for (uint32_t s = 0; s < survivor_count; ++s) {
             const uint32_t j = survivor_lanes[s];
@@ -305,22 +306,79 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
             const float* const rotated_query = pq.rotated.data();
+            const uint32_t decoded_abs_block_bytes =
+                pc.exrabitq_num_dim_blocks * kStage2BatchSize * pc.exrabitq_dim_block;
+            uint8_t* decoded_abs_scratch_base = nullptr;
+            if (pc.exrabitq_magnitude_packed && decoded_abs_block_bytes > 0) {
+                static thread_local std::vector<uint8_t> stage2_decode_scratch;
+                const size_t needed =
+                    static_cast<size_t>(4) * decoded_abs_block_bytes;
+                if (stage2_decode_scratch.size() < needed) {
+                    stage2_decode_scratch.resize(needed);
+                }
+                decoded_abs_scratch_base = stage2_decode_scratch.data();
+            }
 
             for (uint32_t bi = 0; bi < 4; ++bi) {
                 const Stage2BlockScratch& block = stage2_blocks[bi];
                 if (!block.used) continue;
                 alignas(64) float ip_raw_batch[kStage2BatchSize] = {};
                 query::ParsedCluster::ExRaBitQBatchBlockView block_view;
-                auto kernel_start = enable_fine_grained_timing
-                    ? std::chrono::steady_clock::now()
-                    : std::chrono::steady_clock::time_point{};
                 simd::IPExRaBitQBatchPackedSignCompactTiming kernel_timing;
                 simd::IPExRaBitQBatchPackedSignCompactTiming* kernel_timing_ptr =
                     enable_fine_grained_timing ? &kernel_timing : nullptr;
+                double kernel_elapsed_ms = 0.0;
                 if (pc.exrabitq_storage_version >= 11) {
                     block_view = pc.exrabitq_batch_block_view(block.block_id);
+                    const uint8_t* kernel_abs_blocks = block_view.abs_blocks;
+                    if (block_view.abs_packed) {
+                        if (decoded_abs_scratch_base == nullptr ||
+                            decoded_abs_block_bytes == 0) {
+                            std::fprintf(stderr,
+                                "FATAL: packed Stage2 decode scratch is unavailable\n");
+                            std::abort();
+                        }
+                        uint8_t* decoded_abs_blocks =
+                            decoded_abs_scratch_base +
+                            static_cast<size_t>(bi) * decoded_abs_block_bytes;
+                        const auto decode_start = enable_fine_grained_timing
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+                        if (!simd::ExRaBitQDecodePackedBatchBlockMagnitudes(
+                                block_view.abs_blocks,
+                                pc.exrabitq_num_dim_blocks,
+                                pc.exrabitq_batch_size,
+                                pc.exrabitq_dim_block,
+                                block_view.abs_bytes_per_lane_dim_block,
+                                block_view.magnitude_bits,
+                                decoded_abs_blocks)) {
+                            std::fprintf(stderr,
+                                "FATAL: failed to decode packed Stage2 magnitude block "
+                                "(block=%u bits=%u abs_lane_bytes=%u)\n",
+                                block.block_id,
+                                static_cast<uint32_t>(block_view.magnitude_bits),
+                                block_view.abs_bytes_per_lane_dim_block);
+                            std::abort();
+                        }
+                        kernel_abs_blocks = decoded_abs_blocks;
+                        stats.stage2_decode_blocks += 1;
+                        stats.stage2_decode_input_bytes +=
+                            static_cast<uint64_t>(pc.exrabitq_num_dim_blocks) *
+                            pc.exrabitq_batch_size *
+                            block_view.abs_bytes_per_lane_dim_block;
+                        stats.stage2_decode_output_bytes += decoded_abs_block_bytes;
+                        if (enable_fine_grained_timing) {
+                            stage2_decode_ms += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - decode_start).count();
+                        }
+                    }
+                    auto kernel_start = enable_fine_grained_timing
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
                     const auto parallel_view =
-                        pc.exrabitq_batch_parallel_block_view(block.block_id);
+                        block_view.abs_packed
+                            ? query::ParsedCluster::ExRaBitQBatchParallelBlockView{}
+                            : pc.exrabitq_batch_parallel_block_view(block.block_id);
                     if (parallel_view.abs_slices != nullptr &&
                         parallel_view.sign_words != nullptr) {
                         const uint32_t full_valid_mask =
@@ -350,13 +408,17 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                     } else {
                         simd::IPExRaBitQBatchPackedSignCompact(
                             rotated_query,
-                            block_view.abs_blocks,
+                            kernel_abs_blocks,
                             block_view.sign_blocks,
                             block_view.valid_count,
                             dim_,
                             pc.exrabitq_dim_block,
                             ip_raw_batch,
                             kernel_timing_ptr);
+                    }
+                    if (enable_fine_grained_timing) {
+                        kernel_elapsed_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - kernel_start).count();
                     }
                     if (DebugCompareCompactStage2Enabled()) {
                         const uint32_t sign_block_bytes = pc.exrabitq_dim_block / 8;
@@ -373,7 +435,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                                 const uint32_t dim_start = db * pc.exrabitq_dim_block;
                                 const uint32_t copy = std::min(pc.exrabitq_dim_block, dim_ - dim_start);
                                 const uint8_t* abs_ptr =
-                                    block_view.abs_blocks +
+                                    kernel_abs_blocks +
                                     static_cast<size_t>(db) * pc.exrabitq_batch_size * pc.exrabitq_dim_block +
                                     lane * pc.exrabitq_dim_block;
                                 std::memcpy(ref_abs.data() + dim_start, abs_ptr, copy);
@@ -381,7 +443,18 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                                     block_view.sign_blocks +
                                     static_cast<size_t>(db) * pc.exrabitq_batch_size * sign_block_bytes +
                                     lane * sign_block_bytes;
-                                std::memcpy(ref_sign.data() + dim_start / 8, sign_ptr, sign_block_bytes);
+                                const uint32_t sign_offset = dim_start / 8;
+                                const uint32_t sign_copy =
+                                    sign_offset < ref_sign.size()
+                                        ? std::min<uint32_t>(
+                                              sign_block_bytes,
+                                              static_cast<uint32_t>(
+                                                  ref_sign.size() - sign_offset))
+                                        : 0;
+                                if (sign_copy > 0) {
+                                    std::memcpy(ref_sign.data() + sign_offset,
+                                                sign_ptr, sign_copy);
+                                }
                             }
                             const float ref_ip = simd::IPExRaBitQPackedSign(
                                 rotated_query, ref_abs.data(), ref_sign.data(), dim_);
@@ -412,6 +485,9 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                         sign_ptrs[chunk] = entry.sign;
                         ++chunk;
                     }
+                    auto kernel_start = enable_fine_grained_timing
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
                     if (all_packed) {
                         simd::IPExRaBitQBatchPackedSign(
                             rotated_query, code_abs_ptrs, sign_ptrs, chunk, dim_, ip_raw_batch);
@@ -424,10 +500,13 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                                 rotated_query, entry.code_abs, entry.sign, entry.sign_packed, dim_);
                         }
                     }
+                    if (enable_fine_grained_timing) {
+                        kernel_elapsed_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - kernel_start).count();
+                    }
                 }
                 if (enable_fine_grained_timing) {
-                    stage2_kernel_ms += std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - kernel_start).count();
+                    stage2_kernel_ms += kernel_elapsed_ms;
                     stage2_kernel_sign_flip_ms += kernel_timing.sign_flip_ms;
                     stage2_kernel_abs_fma_ms += kernel_timing.abs_fma_ms;
                     stage2_kernel_tail_ms += kernel_timing.tail_ms;
@@ -582,12 +661,14 @@ void ClusterProber::Probe(const query::ParsedCluster& pc,
                 stats.stage2_kernel_abs_fma_ms += stage2_kernel_abs_fma_ms;
                 stats.stage2_kernel_tail_ms += stage2_kernel_tail_ms;
                 stats.stage2_kernel_reduce_ms += stage2_kernel_reduce_ms;
+                stats.stage2_decode_ms += stage2_decode_ms;
                 stats.num_stage2_block_lookups += stage2_block_lookups;
                 stats.num_stage2_block_reuses += stage2_block_reuses;
                 const double stage2_wall_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - stage2_start).count();
                 const double stage2_breakdown_ms =
-                    stage2_collect_ms + stage2_kernel_ms + stage2_scatter_ms;
+                    stage2_collect_ms + stage2_decode_ms +
+                    stage2_kernel_ms + stage2_scatter_ms;
                 stats.stage2_ms += std::max(stage2_wall_ms, stage2_breakdown_ms);
             }
         }

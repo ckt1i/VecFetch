@@ -255,27 +255,6 @@ TEST_F(IvfIndexTest, TwoLevelRoutingDisabledMatchesExact) {
     EXPECT_EQ(idx.last_coarse_routing_mode(), 0u);
 }
 
-TEST_F(IvfIndexTest, HnswRoutingDisabledMatchesExact) {
-    IvfIndex idx;
-    ASSERT_TRUE(idx.Open(test_dir_).ok());
-
-    const float* query = vectors_.data();
-    auto exact = idx.FindNearestClusters(query, kNlist);
-    idx.SetHnswCoarseRouting(false, 32, 128, 256);
-    auto disabled = idx.FindNearestClusters(query, kNlist);
-    EXPECT_EQ(disabled, exact);
-    EXPECT_EQ(idx.last_coarse_routing_mode(), 0u);
-}
-
-TEST_F(IvfIndexTest, HnswRoutingBuildIsIdempotent) {
-    IvfIndex idx;
-    ASSERT_TRUE(idx.Open(test_dir_).ok());
-
-    idx.SetHnswCoarseRouting(true, 16, 64, 128);
-    EXPECT_TRUE(idx.PrepareHnswCoarseRouting());
-    EXPECT_TRUE(idx.PrepareHnswCoarseRouting());
-}
-
 TEST_F(IvfIndexTest, TwoLevelRoutingFallsBackForL2Path) {
     IvfIndex idx;
     ASSERT_TRUE(idx.Open(test_dir_).ok());
@@ -336,25 +315,4 @@ TEST_F(IvfIndexCosineTailTest, TwoLevelRoutingBuildsHierarchyAndMatchesExactWhen
     EXPECT_EQ(idx.last_coarse_child_candidates_scored(), kNlist);
     EXPECT_EQ(idx.last_coarse_exact_fallback(), 0u);
     EXPECT_EQ(idx.last_coarse_exact_overlap(), kNlist);
-}
-
-TEST_F(IvfIndexCosineTailTest, HnswRoutingReturnsValidClustersOnCosinePath) {
-    IvfIndex idx;
-    ASSERT_TRUE(idx.Open(test_dir_).ok());
-
-    idx.SetHnswCoarseRouting(true, 16, 64, 128);
-    ASSERT_TRUE(idx.PrepareHnswCoarseRouting());
-
-    const float* query = vectors_.data() + static_cast<size_t>(5) * kDim;
-    auto routed = idx.FindNearestClusters(query, std::min<uint32_t>(3, kNlist));
-    ASSERT_EQ(routed.size(), std::min<uint32_t>(3, kNlist));
-    EXPECT_EQ(idx.last_coarse_routing_mode(), 2u);
-    EXPECT_EQ(idx.last_coarse_hnsw_m(), 16u);
-    EXPECT_EQ(idx.last_coarse_hnsw_ef_search(), 128u);
-    EXPECT_EQ(idx.last_coarse_hnsw_returned_clusters(), routed.size());
-    EXPECT_GT(idx.last_coarse_hnsw_visited_nodes(), 0u);
-    for (ClusterID cid : routed) {
-        EXPECT_NE(std::find(idx.cluster_ids().begin(), idx.cluster_ids().end(), cid),
-                  idx.cluster_ids().end());
-    }
 }

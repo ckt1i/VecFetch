@@ -42,15 +42,6 @@ inline void CheckPrepRead(const Status& s, const char* context) {
     }
 }
 
-inline const char* CluReadModeName(CluReadMode mode) {
-    switch (mode) {
-        case CluReadMode::Window:
-            return "window";
-        case CluReadMode::FullPreload:
-            return "full_preload";
-    }
-    return "unknown";
-}
 }  // namespace
 
 void OverlapScheduler::QueryDedupSet::Reserve(size_t expected) {
@@ -115,7 +106,6 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
     }
     query_wrapper_.scratch.quant_query.reserve(index.dim());
     query_wrapper_.scratch.fastscan_lut.reserve(static_cast<size_t>(index.dim()) * 8 + 63);
-    ready_clusters_.reserve(std::max(1u, config_.prefetch_depth));
     submitted_candidate_offsets_.Reserve(
         static_cast<size_t>(std::max(1u, config_.nprobe)) * 256);
     resident_scratch_.completions.resize(128);
@@ -505,7 +495,6 @@ void OverlapScheduler::FlushDeferredSafeInPlans(SearchContext& ctx,
 
 SearchResults OverlapScheduler::Search(const float* query_vec) {
     // Reset per-query state
-    ready_clusters_.clear();
     submitted_candidate_offsets_.Clear();
     CleanupPendingSlots();
     pending_all_plans_.clear();
@@ -513,8 +502,6 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     deferred_safein_plans_.clear();
     budgeted_read_plan_heap_.clear();
     pending_vec_only_head_ = 0;
-    next_to_submit_ = 0;
-    inflight_clusters_ = 0;
     safeout_frontier_heap_.clear();
     safein_frontier_heap_.clear();
     dynamic_safein_probes_seen_ = 0;
@@ -534,19 +521,11 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
         effective_query_vec = query_wrapper_.padded_q.data();
     }
 
-    if (config_.use_resident_clusters) {
-        if (!index_.segment().resident_preload_enabled()) {
-            std::fprintf(stderr,
-                         "FATAL: resident cluster mode requires preloaded clusters before search\n");
-            std::abort();
-        }
-    } else if (config_.clu_read_mode == CluReadMode::FullPreload &&
-               !index_.segment().resident_preload_enabled()) {
+    if (!index_.segment().resident_preload_enabled()) {
         Status s = index_.segment().PreloadAllClusters();
         if (!s.ok()) {
             std::fprintf(stderr,
-                         "FATAL: failed to enable %s mode: %s\n",
-                         CluReadModeName(config_.clu_read_mode),
+                         "FATAL: failed to preload resident clusters before search: %s\n",
                          s.ToString().c_str());
             std::abort();
         }
@@ -554,10 +533,6 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
 
     index_.SetUseCoarseSelectSimd(config_.enable_coarse_select_simd);
     index_.SetUseCoarseSelectPhase2(config_.enable_coarse_select_phase2);
-    index_.SetHnswCoarseRouting(config_.enable_hnsw_coarse_routing,
-                                config_.hnsw_coarse_m,
-                                config_.hnsw_coarse_ef_construction,
-                                config_.hnsw_coarse_ef_search);
     index_.SetTwoLevelCoarseRouting(config_.enable_two_level_coarse_routing,
                                     config_.two_level_coarse_threshold,
                                     config_.two_level_coarse_super_count,
@@ -590,27 +565,10 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     ctx.stats().coarse_exact_overlap = index_.last_coarse_exact_overlap();
     ctx.stats().coarse_hierarchy_build_ms =
         index_.last_coarse_hierarchy_build_ms();
-    ctx.stats().coarse_hnsw_graph_build_ms =
-        index_.last_coarse_hnsw_graph_build_ms();
-    ctx.stats().coarse_hnsw_m = index_.last_coarse_hnsw_m();
-    ctx.stats().coarse_hnsw_ef_search = index_.last_coarse_hnsw_ef_search();
-    ctx.stats().coarse_hnsw_returned_clusters =
-        index_.last_coarse_hnsw_returned_clusters();
-    ctx.stats().coarse_hnsw_visited_nodes =
-        index_.last_coarse_hnsw_visited_nodes();
-    ctx.stats().coarse_hnsw_distance_computations =
-        index_.last_coarse_hnsw_distance_computations();
-    ctx.stats().coarse_hnsw_hops = index_.last_coarse_hnsw_hops();
     ctx.stats().coarse_select_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - coarse_start).count();
 
-    PrefetchClusters(ctx, sorted_clusters);
-    if (config_.use_resident_clusters &&
-        config_.clu_read_mode == CluReadMode::FullPreload) {
-        ProbeResidentThinPath(ctx, reranker, sorted_clusters);
-    } else {
-        ProbeAndDrainInterleaved(ctx, reranker, sorted_clusters);
-    }
+    ProbeResidentClusters(ctx, reranker, sorted_clusters);
     FinalDrain(ctx, reranker);
     reranker.ExecuteBuffered();
 
@@ -780,7 +738,7 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
         ctx.stats().probe_submit_ms;
 }
 
-void OverlapScheduler::ProbeResidentThinPath(
+void OverlapScheduler::ProbeResidentClusters(
     SearchContext& ctx, RerankConsumer& reranker,
     const std::vector<ClusterID>& sorted_clusters) {
     static constexpr uint32_t kCrossClusterSubmitInterval = 4;
@@ -1128,74 +1086,8 @@ void OverlapScheduler::InitializeDataBufferSlab() {
         index_.segment().data_reader().fd());
 }
 
-// ============================================================================
-// SubmitClusterRead + PrefetchClusters
-// ============================================================================
-
-void OverlapScheduler::SubmitClusterRead(uint32_t cluster_id) {
-    auto loc = index_.segment().GetBlockLocation(cluster_id);
-    if (!loc.has_value()) return;
-
-    int clu_fd = index_.segment().clu_fd();
-    uint32_t size32 = static_cast<uint32_t>(loc->size);
-    // Round up read length to 4KB for O_DIRECT compatibility
-    uint32_t read_size = (size32 + 4095u) & ~4095u;
-    // 4KB-aligned buffer allocation for O_DIRECT compatibility
-    uint8_t* buf = static_cast<uint8_t*>(
-        std::aligned_alloc(4096, read_size));
-    if (!buf) {
-        std::fprintf(stderr, "FATAL: aligned_alloc failed for cluster block (%u bytes)\n", read_size);
-        std::abort();
-    }
-    PendingIO io;
-    io.type = PendingIO::Type::CLUSTER_BLOCK;
-    io.cluster_id = cluster_id;
-    io.block_size = size32;  // original size for parsing
-    uint32_t slot_id = AllocatePendingSlot(std::move(io), buf,
-                                           PendingBufferCleanup::Free);
-    CheckPrepRead(cluster_reader_.PrepReadTagged(
-                      clu_fd, buf, read_size, loc->offset, slot_id),
-                  "cluster block");
-    inflight_clusters_++;
-}
-
-void OverlapScheduler::PrefetchClusters(
-    SearchContext& ctx,
-    const std::vector<ClusterID>& sorted_clusters) {
-    if (config_.clu_read_mode == CluReadMode::FullPreload) {
-        next_to_submit_ = static_cast<uint32_t>(sorted_clusters.size());
-        inflight_clusters_ = 0;
-        (void)ctx;
-        return;
-    }
-    uint32_t initial = std::min(
-        config_.prefetch_depth, static_cast<uint32_t>(sorted_clusters.size()));
-    for (uint32_t i = 0; i < initial; ++i) {
-        SubmitClusterRead(sorted_clusters[i]);
-    }
-    next_to_submit_ = initial;
-
-    if (initial > 0) {
-        auto ts0 = std::chrono::steady_clock::now();
-        uint32_t submitted = cluster_reader_.Submit();
-        ctx.stats().uring_submit_ms += std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - ts0).count();
-        ctx.stats().total_io_submitted += submitted;
-        if (submitted > 0) {
-            ctx.stats().total_submit_calls++;
-        }
-    }
-}
-
 const ParsedCluster* OverlapScheduler::GetResidentParsedCluster(
     uint32_t cluster_id) const {
-    if (config_.use_resident_clusters) {
-        return index_.segment().GetResidentParsedCluster(cluster_id);
-    }
-    const auto* resident = index_.segment().GetResidentClusterView(cluster_id);
-    if (resident == nullptr) {
-        return nullptr;
-    }
     return index_.segment().GetResidentParsedCluster(cluster_id);
 }
 
@@ -1204,7 +1096,7 @@ const ParsedCluster* OverlapScheduler::GetResidentParsedCluster(
 // ============================================================================
 
 void OverlapScheduler::DispatchCompletion(
-    uint64_t slot_token, SearchContext& ctx, RerankConsumer& reranker) {
+    uint64_t slot_token, SearchContext&, RerankConsumer& reranker) {
     PendingSlot* slot = GetPendingSlot(slot_token);
     if (slot == nullptr) return;
 
@@ -1214,25 +1106,6 @@ void OverlapScheduler::DispatchCompletion(
     bool release_slot = true;
 
     switch (io.type) {
-        case PendingIO::Type::CLUSTER_BLOCK: {
-            inflight_clusters_--;
-            auto block_buf = AlignedBufPtr(buf);
-            slot->buffer = nullptr;
-            slot->cleanup = PendingBufferCleanup::None;
-            ParsedCluster pc;
-            {
-                auto tp0 = std::chrono::steady_clock::now();
-                auto s = index_.segment().ParseClusterBlock(
-                    io.cluster_id, std::move(block_buf), io.block_size, pc);
-                ctx.stats().parse_cluster_ms += std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - tp0).count();
-                if (s.ok()) {
-                    ready_clusters_[io.cluster_id] = std::move(pc);
-                }
-            }
-            // Do NOT Release to BufferPool — ownership moved to ParsedCluster
-            break;
-        }
         case PendingIO::Type::VEC_ONLY: {
             reranker.ConsumeVec(buf, io.addr);
             ReleaseVectorOnlyPendingSlot(slot_id);
@@ -1268,9 +1141,7 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
         : sched_(sched), ctx_(ctx), dat_fd_(dat_fd),
           cluster_id_(cluster_id),
           safein_prefetch_threshold_(safein_prefetch_threshold),
-          skip_dedup_(sched.config_.use_resident_clusters &&
-                      sched.config_.clu_read_mode == CluReadMode::FullPreload &&
-                      sched.index_.assignment_mode() == index::AssignmentMode::Single),
+          skip_dedup_(sched.index_.assignment_mode() == index::AssignmentMode::Single),
           scratch_(sched.submit_scratch_) {
         candidate_estimates_.reserve(256);
     }
@@ -1577,6 +1448,7 @@ void OverlapScheduler::ProbeCluster(
         ctx.stats().probe_stage2_kernel_abs_fma_ms += local_stats.stage2_kernel_abs_fma_ms;
         ctx.stats().probe_stage2_kernel_tail_ms += local_stats.stage2_kernel_tail_ms;
         ctx.stats().probe_stage2_kernel_reduce_ms += local_stats.stage2_kernel_reduce_ms;
+        ctx.stats().probe_stage2_decode_ms += local_stats.stage2_decode_ms;
     } else {
         const double stage1_unit =
             static_cast<double>(local_stats.num_stage1_blocks);
@@ -1597,6 +1469,9 @@ void OverlapScheduler::ProbeCluster(
     ctx.stats().stage2_lanes_requested += local_stats.stage2_lanes_requested;
     ctx.stats().stage2_lanes_skipped += local_stats.stage2_lanes_skipped;
     ctx.stats().stage2_lanes_total_valid += local_stats.stage2_lanes_total_valid;
+    ctx.stats().stage2_decode_blocks += local_stats.stage2_decode_blocks;
+    ctx.stats().stage2_decode_input_bytes += local_stats.stage2_decode_input_bytes;
+    ctx.stats().stage2_decode_output_bytes += local_stats.stage2_decode_output_bytes;
     sink.FinalizeCluster();
     UpdateDynamicSafeInState(ctx, /*advance_probe=*/false);
     if (!ShouldHoldDeferredSafeInPlans()) {
@@ -1628,259 +1503,6 @@ void OverlapScheduler::ProbeCluster(
     ctx.stats().s2_false_safe_out += local_stats.s2_false_safeout;
     ctx.stats().total_uncertain +=
         local_stats.s1_uncertain - local_stats.s2_safein - local_stats.s2_safeout;
-}
-
-// ============================================================================
-// ProbeAndDrainInterleaved — unified event loop
-// ============================================================================
-
-void OverlapScheduler::ProbeAndDrainInterleaved(
-    SearchContext& ctx, RerankConsumer& reranker,
-    const std::vector<ClusterID>& sorted_clusters) {
-    static constexpr uint32_t kPendingRequestFlushThreshold = 32;
-
-    std::vector<IoCompletion> comps(128);
-    const uint32_t reserve_slots = std::min(
-        config_.cluster_submit_reserve,
-        config_.io_queue_depth > 0 ? config_.io_queue_depth - 1 : 0);
-    uint32_t vec_flush_threshold =
-        (config_.submit_batch_size == 0)
-            ? std::numeric_limits<uint32_t>::max()
-            : config_.submit_batch_size;
-    if (config_.io_queue_depth > 0) {
-        const uint32_t capacity_for_vec =
-            std::max(1u, config_.io_queue_depth - reserve_slots);
-        vec_flush_threshold = std::min(vec_flush_threshold, capacity_for_vec);
-    }
-    uint32_t clusters_since_data_submit = 0;
-    float ema_req_per_cluster = static_cast<float>(vec_flush_threshold);
-    auto record_submit = [&](AsyncReader& reader) {
-        auto ts0 = std::chrono::steady_clock::now();
-        uint32_t submitted = reader.Submit();
-        ctx.stats().uring_submit_ms += std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - ts0).count();
-        ctx.stats().total_io_submitted += submitted;
-        if (submitted > 0) {
-            ctx.stats().total_submit_calls++;
-        }
-    };
-
-    auto drain_completions = [&](AsyncReader& reader, bool wait_for_one) {
-        uint32_t n = 0;
-        auto tw0 = std::chrono::steady_clock::now();
-        if (wait_for_one) {
-            n = reader.WaitAndPoll(comps.data(),
-                                   static_cast<uint32_t>(comps.size()));
-            ctx.stats().io_wait_time_ms += std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - tw0).count();
-        } else {
-            n = reader.Poll(comps.data(), static_cast<uint32_t>(comps.size()));
-        }
-        for (uint32_t j = 0; j < n; ++j) {
-            DispatchCompletion(comps[j].user_data, ctx, reranker);
-        }
-    };
-
-    auto flush_shared_reader = [&](bool force,
-                                  bool prioritize_cluster_reads,
-                                  bool vec_batch_ready) {
-        if (cluster_reader_.prepped() == 0) return;
-        if (!force && !prioritize_cluster_reads && !vec_batch_ready) return;
-        record_submit(cluster_reader_);
-    };
-
-    auto flush_isolated_readers = [&](bool force,
-                                      bool prioritize_cluster_reads,
-                                      bool vec_batch_ready) {
-        if (cluster_reader_.prepped() > 0 &&
-            (force || prioritize_cluster_reads)) {
-            record_submit(cluster_reader_);
-        }
-        if (data_reader_.prepped() > 0 &&
-            (force || vec_batch_ready)) {
-            record_submit(data_reader_);
-        }
-    };
-
-    enum class PendingFlushReason : uint8_t {
-        Hard,
-        Soft,
-        Tail,
-        Final,
-    };
-
-    auto emit_pending_with_reason = [&](PendingFlushReason reason) {
-        const uint32_t pending = PendingDataRequestCount();
-        if (pending == 0) return false;
-        EmitPendingDataRequests(ctx, pending);
-        ctx.stats().total_submit_window_flushes++;
-        if (reason == PendingFlushReason::Tail ||
-            reason == PendingFlushReason::Final) {
-            ctx.stats().total_submit_window_tail_flushes++;
-        }
-        return true;
-    };
-
-    auto apply_submit_policy = [&](bool prepared_cluster_reads,
-                                   bool final_cluster,
-                                   uint32_t remaining_clusters) {
-        const uint32_t pending = PendingDataRequestCount();
-        uint32_t dynamic_flush_threshold = vec_flush_threshold;
-        uint32_t dynamic_interval_limit = kSubmitIntervalLimit;
-        if (config_.enable_online_submit_tuning) {
-            const uint32_t tuned = static_cast<uint32_t>(std::lround(
-                2.0f * std::max(1.0f, ema_req_per_cluster)));
-            dynamic_flush_threshold = std::clamp(
-                tuned, config_.submit_batch_min, config_.submit_batch_max);
-            if (config_.io_queue_depth > 0) {
-                const uint32_t capacity_for_vec =
-                    std::max(1u, config_.io_queue_depth - reserve_slots);
-                dynamic_flush_threshold =
-                    std::min(dynamic_flush_threshold, capacity_for_vec);
-            }
-            if (ema_req_per_cluster < 8.0f) {
-                dynamic_interval_limit = 2;
-            } else if (ema_req_per_cluster < 16.0f) {
-                dynamic_interval_limit = 3;
-            }
-        }
-        const bool hard_flush =
-            pending >= kPendingRequestFlushThreshold;
-        const bool soft_flush = pending >= dynamic_flush_threshold;
-        const bool likely_cannot_fill_next_batch =
-            config_.enable_online_submit_tuning &&
-            pending > 0 &&
-            (static_cast<float>(pending) +
-             ema_req_per_cluster * static_cast<float>(remaining_clusters) <
-             static_cast<float>(dynamic_flush_threshold));
-        const bool tail_flush =
-            (final_cluster && pending > 0) ||
-            (pending >= kSubmitTailMinBatch &&
-             clusters_since_data_submit >= dynamic_interval_limit &&
-             likely_cannot_fill_next_batch);
-
-        bool emitted = false;
-        if (hard_flush) {
-            emitted = emit_pending_with_reason(PendingFlushReason::Hard);
-        } else if (soft_flush) {
-            emitted = emit_pending_with_reason(PendingFlushReason::Soft);
-        } else if (tail_flush) {
-            emitted = emit_pending_with_reason(PendingFlushReason::Tail);
-        }
-
-        if (isolated_submission_mode_) {
-            const bool vec_batch_ready = hard_flush || soft_flush || tail_flush;
-            flush_isolated_readers(/*force=*/hard_flush || final_cluster,
-                                   /*prioritize_cluster_reads=*/prepared_cluster_reads,
-                                   vec_batch_ready);
-            if (emitted && data_reader_.prepped() == 0) {
-                clusters_since_data_submit = 0;
-            }
-        } else {
-            const bool force_submit = hard_flush || final_cluster;
-            flush_shared_reader(/*force=*/force_submit,
-                                /*prioritize_cluster_reads=*/prepared_cluster_reads,
-                                /*vec_batch_ready=*/hard_flush || soft_flush || tail_flush);
-            if (emitted && cluster_reader_.prepped() == 0) {
-                clusters_since_data_submit = 0;
-            }
-        }
-    };
-
-    for (size_t i = 0; i < sorted_clusters.size(); ++i) {
-        uint32_t cid = sorted_clusters[i];
-
-        const ParsedCluster* cluster_to_probe = nullptr;
-        if (config_.clu_read_mode == CluReadMode::FullPreload) {
-            cluster_to_probe = GetResidentParsedCluster(cid);
-            if (cluster_to_probe == nullptr) {
-                std::fprintf(stderr,
-                             "FATAL: resident cluster view missing for cluster %u\n",
-                             cid);
-                std::abort();
-            }
-        } else {
-            // 1. Wait until target cluster is ready (consuming other CQEs meanwhile).
-            while (ready_clusters_.find(cid) == ready_clusters_.end()) {
-                if (isolated_submission_mode_) {
-                    emit_pending_with_reason(PendingFlushReason::Final);
-                    flush_isolated_readers(/*force=*/true,
-                                           /*prioritize_cluster_reads=*/false,
-                                           /*vec_batch_ready=*/true);
-                    if (cluster_reader_.InFlight() > 0) {
-                        drain_completions(cluster_reader_, /*wait_for_one=*/true);
-                    } else {
-                        drain_completions(cluster_reader_, /*wait_for_one=*/false);
-                    }
-                    drain_completions(data_reader_, /*wait_for_one=*/false);
-                } else {
-                    emit_pending_with_reason(PendingFlushReason::Final);
-                    flush_shared_reader(/*force=*/true,
-                                        /*prioritize_cluster_reads=*/false,
-                                        /*vec_batch_ready=*/true);
-                    drain_completions(cluster_reader_, /*wait_for_one=*/true);
-                }
-            }
-            cluster_to_probe = &ready_clusters_[cid];
-        }
-
-        {
-            auto tp0 = std::chrono::steady_clock::now();
-            ProbeCluster(*cluster_to_probe, cid, ctx, reranker);
-            (void)tp0;
-        }
-        ++clusters_since_data_submit;
-
-        if (config_.clu_read_mode != CluReadMode::FullPreload) {
-            ready_clusters_.erase(cid);
-        }
-
-        // 4. Sliding window refill — cluster reads are prepared first, then
-        // coalesced with vec reads into a single submit when possible.
-        bool prepared_cluster_reads = false;
-        if (config_.clu_read_mode != CluReadMode::FullPreload) {
-            if (inflight_clusters_ < config_.refill_threshold &&
-                next_to_submit_ < sorted_clusters.size()) {
-                uint32_t refill = std::min(
-                    config_.refill_count,
-                    static_cast<uint32_t>(sorted_clusters.size()) -
-                        next_to_submit_);
-                if (reserve_slots > 0) {
-                    refill = std::min(refill, reserve_slots);
-                }
-                for (uint32_t r = 0; r < refill; ++r) {
-                    SubmitClusterRead(sorted_clusters[next_to_submit_++]);
-                }
-                prepared_cluster_reads = refill > 0;
-            }
-        }
-        const bool final_cluster = (i + 1 == sorted_clusters.size());
-        const uint32_t pending_before_policy = PendingDataRequestCount();
-        apply_submit_policy(prepared_cluster_reads,
-                            final_cluster,
-                            static_cast<uint32_t>(sorted_clusters.size() - 1 - i));
-        if (config_.enable_online_submit_tuning) {
-            const float alpha = std::clamp(config_.submit_ema_alpha, 0.0f, 1.0f);
-            ema_req_per_cluster =
-                (1.0f - alpha) * ema_req_per_cluster +
-                alpha * static_cast<float>(pending_before_policy);
-        }
-    }
-
-    FlushDeferredSafeInPlans(ctx, SafeInThresholdForProbe(), /*force=*/true);
-    MaterializeBudgetedReadPlans(ctx);
-
-    if (isolated_submission_mode_) {
-        emit_pending_with_reason(PendingFlushReason::Final);
-        flush_isolated_readers(/*force=*/true,
-                               /*prioritize_cluster_reads=*/false,
-                               /*vec_batch_ready=*/true);
-    } else {
-        emit_pending_with_reason(PendingFlushReason::Final);
-            flush_shared_reader(/*force=*/true,
-                                /*prioritize_cluster_reads=*/false,
-                                /*vec_batch_ready=*/true);
-    }
 }
 
 // ============================================================================

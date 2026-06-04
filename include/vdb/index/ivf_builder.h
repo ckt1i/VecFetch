@@ -26,10 +26,6 @@ struct IvfBuilderConfig {
     /// HierarchicalSuperKMeans for K >= 128 and SuperKMeans otherwise.
     CoarseBuilder coarse_builder = CoarseBuilder::Auto;
 
-    /// Explicit assignment mode. Legacy behavior is preserved when this is
-    /// left as Single and assignment_factor is set to 2.
-    AssignmentMode assignment_mode = AssignmentMode::Single;
-
     /// Number of IVF clusters (nlist).
     uint32_t nlist = 16;
 
@@ -112,19 +108,6 @@ struct IvfBuilderConfig {
     /// for reuse in future builds. Ignored when loading precomputed files.
     std::string save_centroids_path;
     std::string save_assignments_path;
-    std::string save_secondary_assignments_path;
-
-    /// Assignment factor for IVF membership. `1` keeps the current
-    /// single-assignment behavior; `2` enables top-2 redundant assignment.
-    uint32_t assignment_factor = 1;
-
-    /// RAIR lambda for AIR-style secondary assignment.
-    float rair_lambda = 0.75f;
-
-    /// When true, force a distinct secondary cluster even if the primary
-    /// cluster minimizes the AIR loss.
-    bool rair_strict_second_choice = false;
-
     /// Metric label for build metadata sidecar. The current segment metadata
     /// remains L2-oriented; this string is written to build_metadata.json for
     /// offline diagnostics and experiment bookkeeping.
@@ -141,18 +124,9 @@ struct IvfBuilderConfig {
     /// Number of Faiss k-means restarts.
     uint32_t faiss_nredo = 1;
 
-    /// Experimental mode: for non-power-of-two dimensions, zero-pad vectors
-    /// to the next power of two so the build path can use Hadamard rotation.
-    bool pad_non_power_of_two_to_pow2 = false;
-
-    /// When true, non-power-of-two dimensions can use blocked Hadamard with a
-    /// deterministic permutation instead of falling back to a dense random matrix.
-    bool use_blocked_hadamard_permuted = true;
-
-    /// When true, non-power-of-two dimensions can use the fixed-round
-    /// FHT+Kac rotator. For non-64-multiple dimensions, this path pads only
+    /// Non-power-of-two dimensions are automatically served by the fixed-round
+    /// FHT+Kac rotator. For non-64-multiple dimensions, the builder pads only
     /// to the next multiple of 64.
-    bool use_fht_kac_rotator = false;
 };
 
 // ============================================================================
@@ -217,16 +191,7 @@ class IvfBuilder {
     /// assignments[i] = primary cluster index [0, nlist) for vector i.
     const std::vector<uint32_t>& assignments() const { return assignments_; }
 
-    /// Get the secondary assignments from the last Build() call.
-    /// Values are UINT32_MAX when redundant assignment is disabled or when a
-    /// secondary cluster is not present.
-    const std::vector<uint32_t>& secondary_assignments() const {
-        return secondary_assignments_;
-    }
-
     AssignmentMode assignment_mode() const { return assignment_mode_; }
-    float rair_lambda() const { return rair_lambda_; }
-    bool rair_strict_second_choice() const { return rair_strict_second_choice_; }
     ClusteringSource clustering_source() const { return clustering_source_; }
     CoarseBuilder coarse_builder() const { return coarse_builder_used_; }
     Dim logical_dim() const { return logical_dim_; }
@@ -261,10 +226,6 @@ class IvfBuilder {
                            Dim dim,
                            const rabitq::RotationMatrix& rotation);
 
-    /// Derive secondary assignments from final centroids for top-2
-    /// redundant-assignment mode.
-    Status DeriveSecondaryAssignments(const float* vectors, uint32_t N, Dim dim);
-
     /// Phase C+D: write per-cluster files + global metadata.
     Status WriteIndex(const float* raw_vectors,
                       const float* encoded_vectors,
@@ -275,14 +236,11 @@ class IvfBuilder {
 
     IvfBuilderConfig config_;
     std::vector<uint32_t> assignments_;  // vector → cluster index
-    std::vector<uint32_t> secondary_assignments_;
     std::vector<float> centroids_;       // nlist × dim row-major
     float calibrated_dk_ = 0.0f;
     float calibrated_safein_dk_ = 0.0f;
     float calibrated_eps_ip_ = 0.0f;
     AssignmentMode assignment_mode_ = AssignmentMode::Single;
-    float rair_lambda_ = 0.75f;
-    bool rair_strict_second_choice_ = false;
     ClusteringSource clustering_source_ = ClusteringSource::Auto;
     CoarseBuilder coarse_builder_used_ = CoarseBuilder::Auto;
     std::string effective_metric_ = "l2";

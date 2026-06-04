@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <filesystem>
 #include <numeric>
 #include <random>
@@ -50,6 +51,11 @@ static std::string ReadFileToString(const std::string& path) {
     std::ifstream input(path, std::ios::binary);
     return std::string((std::istreambuf_iterator<char>(input)),
                        std::istreambuf_iterator<char>());
+}
+
+static void WriteStringToFile(const std::string& path, const std::string& contents) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
 }
 
 // ============================================================================
@@ -348,7 +354,7 @@ TEST_F(IvfBuilderTest, CalibrationQueries_ChangeDk) {
     EXPECT_GT(dk2, dk1);
 }
 
-TEST_F(IvfBuilderTest, RedundantAssignmentBuild_PreservesPrimaryAndSecondaryState) {
+TEST_F(IvfBuilderTest, SingleAssignmentBuild_PersistsSingleAssignmentMetadata) {
     constexpr uint32_t N = 96;
     constexpr Dim dim = 32;
     constexpr uint32_t nlist = 8;
@@ -363,83 +369,23 @@ TEST_F(IvfBuilderTest, RedundantAssignmentBuild_PreservesPrimaryAndSecondaryStat
     cfg.calibration_samples = 10;
     cfg.calibration_topk = 5;
     cfg.page_size = 1;
-    cfg.assignment_factor = 2;
-    cfg.assignment_mode = AssignmentMode::RedundantTop2Naive;
 
     IvfBuilder builder(cfg);
     ASSERT_TRUE(builder.Build(vecs.data(), N, dim, test_dir_).ok());
 
-    EXPECT_EQ(builder.assignment_mode(), AssignmentMode::RedundantTop2Naive);
+    EXPECT_EQ(builder.assignment_mode(), AssignmentMode::Single);
     EXPECT_EQ(builder.clustering_source(), ClusteringSource::Auto);
     ASSERT_EQ(builder.assignments().size(), N);
-    ASSERT_EQ(builder.secondary_assignments().size(), N);
 
-    uint32_t distinct_secondary = 0;
     for (uint32_t i = 0; i < N; ++i) {
         EXPECT_LT(builder.assignments()[i], nlist);
-        EXPECT_LT(builder.secondary_assignments()[i], nlist);
-        if (builder.secondary_assignments()[i] != builder.assignments()[i]) {
-            distinct_secondary++;
-        }
     }
-    EXPECT_GT(distinct_secondary, 0u);
 
     IvfIndex idx;
     ASSERT_TRUE(idx.Open(test_dir_).ok());
-    EXPECT_EQ(idx.assignment_mode(), AssignmentMode::RedundantTop2Naive);
-    EXPECT_EQ(idx.assignment_factor(), 2u);
-    EXPECT_FLOAT_EQ(idx.rair_lambda(), 0.75f);
-    EXPECT_FALSE(idx.rair_strict_second_choice());
+    EXPECT_EQ(idx.assignment_mode(), AssignmentMode::Single);
+    EXPECT_EQ(idx.assignment_factor(), 1u);
     EXPECT_EQ(idx.clustering_source(), ClusteringSource::Auto);
-}
-
-TEST_F(IvfBuilderTest, RairAssignmentBuild_DiffersFromNaiveAndPersistsMetadata) {
-    constexpr uint32_t N = 96;
-    constexpr Dim dim = 32;
-    constexpr uint32_t nlist = 8;
-
-    auto vecs = GenerateVectors(N, dim, 2026);
-
-    IvfBuilderConfig naive_cfg;
-    naive_cfg.nlist = nlist;
-    naive_cfg.max_iterations = 10;
-    naive_cfg.seed = 2026;
-    naive_cfg.rabitq = {1, 64, 5.75f};
-    naive_cfg.calibration_samples = 10;
-    naive_cfg.calibration_topk = 5;
-    naive_cfg.page_size = 1;
-    naive_cfg.assignment_factor = 2;
-    naive_cfg.assignment_mode = AssignmentMode::RedundantTop2Naive;
-
-    auto naive_dir = (fs::path(test_dir_) / "naive").string();
-    IvfBuilder naive_builder(naive_cfg);
-    ASSERT_TRUE(naive_builder.Build(vecs.data(), N, dim, naive_dir).ok());
-
-    IvfBuilderConfig rair_cfg = naive_cfg;
-    rair_cfg.assignment_mode = AssignmentMode::RedundantTop2Rair;
-    rair_cfg.rair_lambda = 0.75f;
-    rair_cfg.rair_strict_second_choice = false;
-
-    auto rair_dir = (fs::path(test_dir_) / "rair").string();
-    IvfBuilder rair_builder(rair_cfg);
-    ASSERT_TRUE(rair_builder.Build(vecs.data(), N, dim, rair_dir).ok());
-
-    size_t differing_secondary = 0;
-    for (uint32_t i = 0; i < N; ++i) {
-        EXPECT_EQ(naive_builder.assignments()[i], rair_builder.assignments()[i]);
-        if (naive_builder.secondary_assignments()[i] !=
-            rair_builder.secondary_assignments()[i]) {
-            differing_secondary++;
-        }
-    }
-    EXPECT_GT(differing_secondary, 0u);
-
-    IvfIndex idx;
-    ASSERT_TRUE(idx.Open(rair_dir).ok());
-    EXPECT_EQ(idx.assignment_mode(), AssignmentMode::RedundantTop2Rair);
-    EXPECT_EQ(idx.assignment_factor(), 2u);
-    EXPECT_FLOAT_EQ(idx.rair_lambda(), 0.75f);
-    EXPECT_FALSE(idx.rair_strict_second_choice());
 }
 
 TEST_F(IvfBuilderTest, FaissKMeansBuild_AutoTrainingPersistsMetadata) {
@@ -644,53 +590,6 @@ TEST_F(IvfBuilderTest, SuperKMeansCosineIndex_UsesMetricAwareCentroidProbing) {
     EXPECT_EQ(nearest[0], static_cast<ClusterID>(vertical_cluster));
 }
 
-TEST_F(IvfBuilderTest, BlockedHadamardPermutedBuildAndOpen_768D_NoPadding) {
-    constexpr uint32_t N = 96;
-    constexpr Dim dim = 768;
-    constexpr uint32_t nlist = 4;
-
-    auto vecs = GenerateVectors(N, dim, 4040);
-
-    IvfBuilderConfig cfg;
-    cfg.nlist = nlist;
-    cfg.max_iterations = 5;
-    cfg.seed = 4040;
-    cfg.rabitq = {1, 64, 5.75f};
-    cfg.calibration_samples = 8;
-    cfg.calibration_topk = 4;
-    cfg.page_size = 1;
-    cfg.pad_non_power_of_two_to_pow2 = false;
-    cfg.use_blocked_hadamard_permuted = true;
-
-    IvfBuilder builder(cfg);
-    auto s = builder.Build(vecs.data(), N, dim, test_dir_);
-    ASSERT_TRUE(s.ok()) << s.message();
-
-    EXPECT_EQ(builder.logical_dim(), dim);
-    EXPECT_EQ(builder.effective_dim(), dim);
-    EXPECT_EQ(builder.padding_mode(), "none");
-    EXPECT_EQ(builder.rotation_mode(), "blocked_hadamard_permuted");
-    EXPECT_TRUE(fs::exists(test_dir_ + "/rotated_centroids.bin"));
-
-    const std::string sidecar = ReadFileToString(test_dir_ + "/build_metadata.json");
-    EXPECT_NE(sidecar.find("\"rotation_mode\": \"blocked_hadamard_permuted\""),
-              std::string::npos);
-    EXPECT_NE(sidecar.find("\"padding_mode\": \"none\""), std::string::npos);
-    EXPECT_NE(sidecar.find("\"logical_dim\": 768"), std::string::npos);
-    EXPECT_NE(sidecar.find("\"effective_dim\": 768"), std::string::npos);
-    EXPECT_NE(sidecar.find("\"rotation_seed\": 4040"), std::string::npos);
-    EXPECT_NE(sidecar.find("\"rotation_block_sizes\": [512, 256]"), std::string::npos);
-
-    IvfIndex idx;
-    ASSERT_TRUE(idx.Open(test_dir_).ok());
-    EXPECT_EQ(idx.logical_dim(), dim);
-    EXPECT_EQ(idx.effective_dim(), dim);
-    EXPECT_EQ(idx.padding_mode(), "none");
-    EXPECT_EQ(idx.rotation_mode(), "blocked_hadamard_permuted");
-    EXPECT_TRUE(idx.used_hadamard());
-    EXPECT_FALSE(idx.uses_padded_hadamard());
-}
-
 TEST_F(IvfBuilderTest, FhtKacRotatorBuildAndOpen_768D_NoPadding) {
     constexpr uint32_t N = 96;
     constexpr Dim dim = 768;
@@ -706,9 +605,6 @@ TEST_F(IvfBuilderTest, FhtKacRotatorBuildAndOpen_768D_NoPadding) {
     cfg.calibration_samples = 8;
     cfg.calibration_topk = 4;
     cfg.page_size = 1;
-    cfg.pad_non_power_of_two_to_pow2 = false;
-    cfg.use_fht_kac_rotator = true;
-    cfg.use_blocked_hadamard_permuted = false;
 
     IvfBuilder builder(cfg);
     auto s = builder.Build(vecs.data(), N, dim, test_dir_);
@@ -723,6 +619,9 @@ TEST_F(IvfBuilderTest, FhtKacRotatorBuildAndOpen_768D_NoPadding) {
     const std::string sidecar = ReadFileToString(test_dir_ + "/build_metadata.json");
     EXPECT_NE(sidecar.find("\"rotation_mode\": \"fht_kac_rotator\""),
               std::string::npos);
+    EXPECT_EQ(sidecar.find("blocked_hadamard_permuted"), std::string::npos);
+    EXPECT_EQ(sidecar.find("hadamard_padded"), std::string::npos);
+    EXPECT_EQ(sidecar.find("random_matrix"), std::string::npos);
     EXPECT_NE(sidecar.find("\"padding_mode\": \"none\""), std::string::npos);
     EXPECT_NE(sidecar.find("\"logical_dim\": 768"), std::string::npos);
     EXPECT_NE(sidecar.find("\"effective_dim\": 768"), std::string::npos);
@@ -739,4 +638,40 @@ TEST_F(IvfBuilderTest, FhtKacRotatorBuildAndOpen_768D_NoPadding) {
     EXPECT_EQ(idx.rotation_mode(), "fht_kac_rotator");
     EXPECT_TRUE(idx.used_hadamard());
     EXPECT_FALSE(idx.uses_padded_hadamard());
+}
+
+TEST_F(IvfBuilderTest, OpenRejectsLegacyBlockedHadamardMetadata) {
+    constexpr uint32_t N = 96;
+    constexpr Dim dim = 768;
+    constexpr uint32_t nlist = 4;
+
+    auto vecs = GenerateVectors(N, dim, 6060);
+
+    IvfBuilderConfig cfg;
+    cfg.nlist = nlist;
+    cfg.max_iterations = 5;
+    cfg.seed = 6060;
+    cfg.rabitq = {1, 64, 5.75f};
+    cfg.calibration_samples = 8;
+    cfg.calibration_topk = 4;
+    cfg.page_size = 1;
+
+    IvfBuilder builder(cfg);
+    auto s = builder.Build(vecs.data(), N, dim, test_dir_);
+    ASSERT_TRUE(s.ok()) << s.message();
+
+    const std::string sidecar_path = test_dir_ + "/build_metadata.json";
+    std::string sidecar = ReadFileToString(sidecar_path);
+    const std::string current = "\"rotation_mode\": \"fht_kac_rotator\"";
+    const std::string legacy = "\"rotation_mode\": \"blocked_hadamard_permuted\"";
+    const size_t pos = sidecar.find(current);
+    ASSERT_NE(pos, std::string::npos);
+    sidecar.replace(pos, current.size(), legacy);
+    WriteStringToFile(sidecar_path, sidecar);
+
+    IvfIndex idx;
+    auto open_status = idx.Open(test_dir_);
+    EXPECT_FALSE(open_status.ok());
+    EXPECT_NE(open_status.message().find("Legacy rotation mode"),
+              std::string::npos);
 }

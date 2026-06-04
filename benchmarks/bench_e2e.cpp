@@ -132,6 +132,54 @@ static bool RejectDeletedDynamicSafeInFlag(int argc, char* argv[]) {
     return false;
 }
 
+static bool RejectDeletedClusterLoadingFlag(int argc, char* argv[]) {
+    static constexpr const char* kDeletedFlags[] = {
+        "--clu-read-mode",
+        "--use-resident-clusters",
+        "--prefetch-depth",
+        "--refill-threshold",
+        "--refill-count",
+    };
+    for (const char* flag : kDeletedFlags) {
+        if (HasFlag(argc, argv, flag)) {
+            std::fprintf(stderr,
+                         "Unsupported cluster loading option %s: "
+                         "cluster.clu is always served from resident full preload.\n",
+                         flag);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool RejectDeletedLegacySearchModeFlag(int argc, char* argv[]) {
+    static constexpr const char* kDeletedFlags[] = {
+        "--hnsw-coarse-routing",
+        "--hnsw-coarse-m",
+        "--hnsw-coarse-ef-construction",
+        "--hnsw-coarse-ef-search",
+        "--assignment-mode",
+        "--assignment-factor",
+        "--rair-lambda",
+        "--rair-strict-second-choice",
+        "--save-secondary-assignments",
+        "--pad-to-pow2",
+        "--blocked-hadamard-permuted",
+        "--fht-kac-rotator",
+    };
+    for (const char* flag : kDeletedFlags) {
+        if (HasFlag(argc, argv, flag)) {
+            std::fprintf(stderr,
+                         "Unsupported legacy search/build option %s: "
+                         "formal runs use single assignment, exact/two-level "
+                         "coarse routing, and automatic Hadamard/FHT-Kac rotation.\n",
+                         flag);
+            return true;
+        }
+    }
+    return false;
+}
+
 // ============================================================================
 // Timestamp + dataset name
 // ============================================================================
@@ -159,8 +207,6 @@ static std::string ResolveBenchIndexDir(const std::string& dataset_name,
                                         int nlist,
                                         int bits,
                                         float epsilon_percentile,
-                                        const std::string& assignment_mode_tag,
-                                        float rair_lambda,
                                         const std::string& requested_index_dir) {
     if (!requested_index_dir.empty()) {
         return requested_index_dir;
@@ -169,15 +215,6 @@ static std::string ResolveBenchIndexDir(const std::string& dataset_name,
         std::string dir = "/home/zcq/VDB/test/data/COCO100k/index_fkmeans_2048_bits" +
                std::to_string(bits) + "_eps" +
                FormatEpsilonTag(epsilon_percentile);
-        if (!assignment_mode_tag.empty() && assignment_mode_tag != "single") {
-            dir += "_" + assignment_mode_tag;
-            if (assignment_mode_tag == "redundant_top2_rair") {
-                std::ostringstream oss;
-                oss << "_lambda" << std::fixed << std::setprecision(2)
-                    << rair_lambda;
-                dir += oss.str();
-            }
-        }
         return dir;
     }
     return output_dir + "/index";
@@ -372,6 +409,7 @@ static StatusOr<std::vector<std::vector<int64_t>>> LoadExternalGroundTruth(
 }
 
 static const char* ExRaBitQStorageFormatName(uint32_t clu_file_version) {
+    if (clu_file_version >= 12) return "compact_blocked_packed_magnitude";
     if (clu_file_version >= 11) return "compact_blocked";
     if (clu_file_version >= 10) return "packed_sign";
     return "legacy_byte_sign";
@@ -527,13 +565,6 @@ struct QueryResult {
     uint32_t coarse_exact_fallback = 0;
     uint32_t coarse_exact_overlap = 0;
     double coarse_hierarchy_build_ms = 0;
-    double coarse_hnsw_graph_build_ms = 0;
-    uint32_t coarse_hnsw_m = 0;
-    uint32_t coarse_hnsw_ef_search = 0;
-    uint32_t coarse_hnsw_returned_clusters = 0;
-    uint32_t coarse_hnsw_visited_nodes = 0;
-    uint32_t coarse_hnsw_distance_computations = 0;
-    uint32_t coarse_hnsw_hops = 0;
     double probe_time_ms;
     double probe_prepare_ms = 0;
     double probe_prepare_rotation_ms = 0;
@@ -555,6 +586,7 @@ struct QueryResult {
     double probe_stage2_kernel_abs_fma_ms = 0;
     double probe_stage2_kernel_tail_ms = 0;
     double probe_stage2_kernel_reduce_ms = 0;
+    double probe_stage2_decode_ms = 0;
     uint32_t stage1_fused_blocks = 0;
     uint32_t stage1_fused_safeout_lanes = 0;
     uint32_t stage1_fused_safein_lanes = 0;
@@ -562,6 +594,9 @@ struct QueryResult {
     uint64_t stage2_lanes_requested = 0;
     uint64_t stage2_lanes_skipped = 0;
     uint64_t stage2_lanes_total_valid = 0;
+    uint64_t stage2_decode_blocks = 0;
+    uint64_t stage2_decode_input_bytes = 0;
+    uint64_t stage2_decode_output_bytes = 0;
     double probe_classify_ms = 0;
     double probe_submit_ms = 0;
     double probe_submit_prepare_vec_only_ms = 0;
@@ -571,8 +606,6 @@ struct QueryResult {
     double probe_submit_pending_slot_alloc_ms = 0;
     double probe_submit_prep_read_ms = 0;
     double rerank_cpu_ms = 0;
-    double prefetch_submit_ms = 0;
-    double prefetch_wait_ms = 0;
     double safein_payload_prefetch_ms = 0;
     double candidate_collect_ms = 0;
     double pool_vector_read_ms = 0;
@@ -582,7 +615,6 @@ struct QueryResult {
     double remaining_payload_fetch_ms = 0;
     double uring_prep_ms = 0;
     double uring_submit_ms = 0;
-    double parse_cluster_ms = 0;
     double fetch_missing_ms = 0;
     uint32_t submit_calls = 0;
     uint32_t submit_window_flushes = 0;
@@ -660,13 +692,6 @@ struct RoundMetrics {
     double avg_coarse_exact_fallback = 0;
     double avg_coarse_exact_overlap = 0;
     double avg_coarse_hierarchy_build_ms = 0;
-    double avg_coarse_hnsw_graph_build_ms = 0;
-    double avg_coarse_hnsw_m = 0;
-    double avg_coarse_hnsw_ef_search = 0;
-    double avg_coarse_hnsw_returned_clusters = 0;
-    double avg_coarse_hnsw_visited_nodes = 0;
-    double avg_coarse_hnsw_distance_computations = 0;
-    double avg_coarse_hnsw_hops = 0;
     double avg_probe = 0;
     double avg_probe_prepare = 0;
     double avg_probe_prepare_rotation = 0;
@@ -688,6 +713,7 @@ struct RoundMetrics {
     double avg_probe_stage2_kernel_abs_fma = 0;
     double avg_probe_stage2_kernel_tail = 0;
     double avg_probe_stage2_kernel_reduce = 0;
+    double avg_probe_stage2_decode = 0;
     double avg_stage1_fused_blocks = 0;
     double avg_stage1_fused_safeout_lanes = 0;
     double avg_stage1_fused_safein_lanes = 0;
@@ -696,6 +722,9 @@ struct RoundMetrics {
     double avg_stage2_lanes_skipped = 0;
     double avg_stage2_lanes_total_valid = 0;
     double avg_stage2_lane_density = 0;
+    double avg_stage2_decode_blocks = 0;
+    double avg_stage2_decode_input_bytes = 0;
+    double avg_stage2_decode_output_bytes = 0;
     double avg_probe_classify = 0;
     double avg_probe_submit = 0;
     double avg_probe_submit_prepare_vec_only = 0;
@@ -705,8 +734,6 @@ struct RoundMetrics {
     double avg_probe_submit_pending_slot_alloc = 0;
     double avg_probe_submit_prep_read = 0;
     double avg_rerank_cpu = 0;
-    double avg_prefetch_submit = 0;
-    double avg_prefetch_wait = 0;
     double avg_safein_payload_prefetch = 0;
     double avg_candidate_collect = 0;
     double avg_pool_vector_read = 0;
@@ -716,7 +743,6 @@ struct RoundMetrics {
     double avg_remaining_payload_fetch = 0;
     double avg_uring_prep = 0;
     double avg_uring_submit = 0;
-    double avg_parse_cluster = 0;
     double avg_fetch_missing = 0;
     double avg_submit_calls = 0;
     double avg_submit_window_flushes = 0;
@@ -773,6 +799,13 @@ struct RoundMetrics {
     double overlap_ratio = 0;
     double preload_time_ms = 0;
     double preload_bytes = 0;
+    double resident_file_size_bytes = 0;
+    double resident_file_buffer_bytes = 0;
+    double resident_code_storage_bytes = 0;
+    double resident_decoded_address_bytes = 0;
+    double resident_raw_address_bytes = 0;
+    double resident_parsed_address_duplicate_bytes = 0;
+    double resident_preload_batch_size = 0;
     double resident_cluster_mem_bytes = 0;
     double resident_parallel_view_build_ms = 0;
     double resident_parallel_view_bytes = 0;
@@ -781,7 +814,6 @@ struct RoundMetrics {
     double index_data_dat_bytes = 0;
     double index_rotation_bytes = 0;
     double index_rotated_centroids_bytes = 0;
-    bool query_uses_resident_clusters = false;
 };
 
 // ============================================================================
@@ -801,9 +833,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
 
     Log("\n[%s] Querying %u vectors...\n", label, Q);
 
-    if (!search_cfg.use_resident_clusters &&
-        search_cfg.clu_read_mode == CluReadMode::FullPreload &&
-        !index.segment().resident_preload_enabled()) {
+    if (!index.segment().resident_preload_enabled()) {
         auto preload_status = index.segment().PreloadAllClusters();
         if (!preload_status.ok()) {
             std::fprintf(stderr,
@@ -822,14 +852,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
                                        search_cfg.enable_two_level_coarse_exact_overlap);
         (void)index.PrepareTwoLevelCoarseRouting(search_cfg.nprobe);
     }
-    if (search_cfg.enable_hnsw_coarse_routing) {
-        index.SetHnswCoarseRouting(search_cfg.enable_hnsw_coarse_routing,
-                                   search_cfg.hnsw_coarse_m,
-                                   search_cfg.hnsw_coarse_ef_construction,
-                                   search_cfg.hnsw_coarse_ef_search);
-        (void)index.PrepareHnswCoarseRouting();
-    }
-
     std::unique_ptr<OverlapScheduler> scheduler;
     if (data_reader != nullptr) {
         scheduler = std::make_unique<OverlapScheduler>(
@@ -860,15 +882,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.coarse_exact_fallback = results.stats().coarse_exact_fallback;
         qr.coarse_exact_overlap = results.stats().coarse_exact_overlap;
         qr.coarse_hierarchy_build_ms = results.stats().coarse_hierarchy_build_ms;
-        qr.coarse_hnsw_graph_build_ms = results.stats().coarse_hnsw_graph_build_ms;
-        qr.coarse_hnsw_m = results.stats().coarse_hnsw_m;
-        qr.coarse_hnsw_ef_search = results.stats().coarse_hnsw_ef_search;
-        qr.coarse_hnsw_returned_clusters =
-            results.stats().coarse_hnsw_returned_clusters;
-        qr.coarse_hnsw_visited_nodes = results.stats().coarse_hnsw_visited_nodes;
-        qr.coarse_hnsw_distance_computations =
-            results.stats().coarse_hnsw_distance_computations;
-        qr.coarse_hnsw_hops = results.stats().coarse_hnsw_hops;
         qr.probe_time_ms = results.stats().probe_time_ms;
         qr.probe_prepare_ms = results.stats().probe_prepare_ms;
         qr.probe_prepare_rotation_ms = results.stats().probe_prepare_rotation_ms;
@@ -890,6 +903,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.probe_stage2_kernel_abs_fma_ms = results.stats().probe_stage2_kernel_abs_fma_ms;
         qr.probe_stage2_kernel_tail_ms = results.stats().probe_stage2_kernel_tail_ms;
         qr.probe_stage2_kernel_reduce_ms = results.stats().probe_stage2_kernel_reduce_ms;
+        qr.probe_stage2_decode_ms = results.stats().probe_stage2_decode_ms;
         qr.stage1_fused_blocks = results.stats().stage1_fused_blocks;
         qr.stage1_fused_safeout_lanes = results.stats().stage1_fused_safeout_lanes;
         qr.stage1_fused_safein_lanes = results.stats().stage1_fused_safein_lanes;
@@ -897,6 +911,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.stage2_lanes_requested = results.stats().stage2_lanes_requested;
         qr.stage2_lanes_skipped = results.stats().stage2_lanes_skipped;
         qr.stage2_lanes_total_valid = results.stats().stage2_lanes_total_valid;
+        qr.stage2_decode_blocks = results.stats().stage2_decode_blocks;
+        qr.stage2_decode_input_bytes = results.stats().stage2_decode_input_bytes;
+        qr.stage2_decode_output_bytes = results.stats().stage2_decode_output_bytes;
         qr.probe_classify_ms = results.stats().probe_classify_ms;
         qr.probe_submit_ms = results.stats().probe_submit_ms;
         qr.probe_submit_prepare_vec_only_ms =
@@ -911,8 +928,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.probe_submit_prep_read_ms =
             results.stats().probe_submit_prep_read_ms;
         qr.rerank_cpu_ms = results.stats().rerank_cpu_ms;
-        qr.prefetch_submit_ms = results.stats().prefetch_submit_ms;
-        qr.prefetch_wait_ms = results.stats().prefetch_wait_ms;
         qr.safein_payload_prefetch_ms = results.stats().safein_payload_prefetch_ms;
         qr.candidate_collect_ms = results.stats().candidate_collect_ms;
         qr.pool_vector_read_ms = results.stats().pool_vector_read_ms;
@@ -922,7 +937,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.remaining_payload_fetch_ms = results.stats().remaining_payload_fetch_ms;
         qr.uring_prep_ms = results.stats().uring_prep_ms;
         qr.uring_submit_ms = results.stats().uring_submit_ms;
-        qr.parse_cluster_ms = results.stats().parse_cluster_ms;
         qr.fetch_missing_ms = results.stats().fetch_missing_ms;
         qr.submit_calls = results.stats().total_submit_calls;
         qr.submit_window_flushes = results.stats().total_submit_window_flushes;
@@ -1083,13 +1097,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_coarse_exact_fallback = 0;
     double sum_coarse_exact_overlap = 0;
     double sum_coarse_hierarchy_build = 0;
-    double sum_coarse_hnsw_graph_build = 0;
-    double sum_coarse_hnsw_m = 0;
-    double sum_coarse_hnsw_ef_search = 0;
-    double sum_coarse_hnsw_returned_clusters = 0;
-    double sum_coarse_hnsw_visited_nodes = 0;
-    double sum_coarse_hnsw_distance_computations = 0;
-    double sum_coarse_hnsw_hops = 0;
     double sum_probe = 0, sum_probe_prepare = 0;
     double sum_probe_prepare_rotation = 0;
     double sum_probe_prepare_subtract = 0;
@@ -1107,6 +1114,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_probe_stage2_kernel_abs_fma = 0;
     double sum_probe_stage2_kernel_tail = 0;
     double sum_probe_stage2_kernel_reduce = 0;
+    double sum_probe_stage2_decode = 0;
     double sum_stage1_fused_blocks = 0;
     double sum_stage1_fused_safeout_lanes = 0;
     double sum_stage1_fused_safein_lanes = 0;
@@ -1114,6 +1122,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_stage2_lanes_requested = 0;
     double sum_stage2_lanes_skipped = 0;
     double sum_stage2_lanes_total_valid = 0;
+    double sum_stage2_decode_blocks = 0;
+    double sum_stage2_decode_input_bytes = 0;
+    double sum_stage2_decode_output_bytes = 0;
     double sum_probe_classify = 0, sum_probe_submit = 0;
     double sum_probe_submit_prepare_vec_only = 0;
     double sum_probe_submit_prepare_all = 0;
@@ -1122,13 +1133,12 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_probe_submit_pending_slot_alloc = 0;
     double sum_probe_submit_prep_read = 0;
     double sum_rerank_cpu = 0;
-    double sum_prefetch_submit = 0, sum_prefetch_wait = 0;
     double sum_safein_payload_prefetch = 0, sum_candidate_collect = 0;
     double sum_pool_vector_read = 0, sum_rerank_compute = 0;
     double sum_rerank_vec_alloc = 0, sum_rerank_vec_copy = 0;
     double sum_remaining_payload_fetch = 0;
     double sum_uring_prep = 0, sum_uring_submit = 0;
-    double sum_parse_cluster = 0, sum_fetch_missing = 0;
+    double sum_fetch_missing = 0;
     double sum_submit_calls = 0;
     double sum_submit_window_flushes = 0;
     double sum_submit_window_tail_flushes = 0;
@@ -1190,14 +1200,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_coarse_exact_fallback += qresults[qi].coarse_exact_fallback;
         sum_coarse_exact_overlap += qresults[qi].coarse_exact_overlap;
         sum_coarse_hierarchy_build += qresults[qi].coarse_hierarchy_build_ms;
-        sum_coarse_hnsw_graph_build += qresults[qi].coarse_hnsw_graph_build_ms;
-        sum_coarse_hnsw_m += qresults[qi].coarse_hnsw_m;
-        sum_coarse_hnsw_ef_search += qresults[qi].coarse_hnsw_ef_search;
-        sum_coarse_hnsw_returned_clusters += qresults[qi].coarse_hnsw_returned_clusters;
-        sum_coarse_hnsw_visited_nodes += qresults[qi].coarse_hnsw_visited_nodes;
-        sum_coarse_hnsw_distance_computations +=
-            qresults[qi].coarse_hnsw_distance_computations;
-        sum_coarse_hnsw_hops += qresults[qi].coarse_hnsw_hops;
         sum_probe += qresults[qi].probe_time_ms;
         sum_probe_prepare += qresults[qi].probe_prepare_ms;
         sum_probe_prepare_rotation += qresults[qi].probe_prepare_rotation_ms;
@@ -1219,6 +1221,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_probe_stage2_kernel_abs_fma += qresults[qi].probe_stage2_kernel_abs_fma_ms;
         sum_probe_stage2_kernel_tail += qresults[qi].probe_stage2_kernel_tail_ms;
         sum_probe_stage2_kernel_reduce += qresults[qi].probe_stage2_kernel_reduce_ms;
+        sum_probe_stage2_decode += qresults[qi].probe_stage2_decode_ms;
         sum_stage1_fused_blocks += qresults[qi].stage1_fused_blocks;
         sum_stage1_fused_safeout_lanes += qresults[qi].stage1_fused_safeout_lanes;
         sum_stage1_fused_safein_lanes += qresults[qi].stage1_fused_safein_lanes;
@@ -1226,6 +1229,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_stage2_lanes_requested += qresults[qi].stage2_lanes_requested;
         sum_stage2_lanes_skipped += qresults[qi].stage2_lanes_skipped;
         sum_stage2_lanes_total_valid += qresults[qi].stage2_lanes_total_valid;
+        sum_stage2_decode_blocks += qresults[qi].stage2_decode_blocks;
+        sum_stage2_decode_input_bytes += qresults[qi].stage2_decode_input_bytes;
+        sum_stage2_decode_output_bytes += qresults[qi].stage2_decode_output_bytes;
         sum_probe_classify += qresults[qi].probe_classify_ms;
         sum_probe_submit += qresults[qi].probe_submit_ms;
         sum_probe_submit_prepare_vec_only +=
@@ -1240,8 +1246,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_probe_submit_prep_read +=
             qresults[qi].probe_submit_prep_read_ms;
         sum_rerank_cpu += qresults[qi].rerank_cpu_ms;
-        sum_prefetch_submit += qresults[qi].prefetch_submit_ms;
-        sum_prefetch_wait += qresults[qi].prefetch_wait_ms;
         sum_safein_payload_prefetch += qresults[qi].safein_payload_prefetch_ms;
         sum_candidate_collect += qresults[qi].candidate_collect_ms;
         sum_pool_vector_read += qresults[qi].pool_vector_read_ms;
@@ -1251,7 +1255,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_remaining_payload_fetch += qresults[qi].remaining_payload_fetch_ms;
         sum_uring_prep += qresults[qi].uring_prep_ms;
         sum_uring_submit += qresults[qi].uring_submit_ms;
-        sum_parse_cluster += qresults[qi].parse_cluster_ms;
         sum_fetch_missing += qresults[qi].fetch_missing_ms;
         sum_submit_calls += qresults[qi].submit_calls;
         sum_submit_window_flushes += qresults[qi].submit_window_flushes;
@@ -1315,14 +1318,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_coarse_exact_fallback = sum_coarse_exact_fallback / Q;
     m.avg_coarse_exact_overlap = sum_coarse_exact_overlap / Q;
     m.avg_coarse_hierarchy_build_ms = sum_coarse_hierarchy_build / Q;
-    m.avg_coarse_hnsw_graph_build_ms = sum_coarse_hnsw_graph_build / Q;
-    m.avg_coarse_hnsw_m = sum_coarse_hnsw_m / Q;
-    m.avg_coarse_hnsw_ef_search = sum_coarse_hnsw_ef_search / Q;
-    m.avg_coarse_hnsw_returned_clusters = sum_coarse_hnsw_returned_clusters / Q;
-    m.avg_coarse_hnsw_visited_nodes = sum_coarse_hnsw_visited_nodes / Q;
-    m.avg_coarse_hnsw_distance_computations =
-        sum_coarse_hnsw_distance_computations / Q;
-    m.avg_coarse_hnsw_hops = sum_coarse_hnsw_hops / Q;
     m.avg_probe = sum_probe / Q;
     m.avg_probe_prepare = sum_probe_prepare / Q;
     m.avg_probe_prepare_rotation = sum_probe_prepare_rotation / Q;
@@ -1344,6 +1339,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_probe_stage2_kernel_abs_fma = sum_probe_stage2_kernel_abs_fma / Q;
     m.avg_probe_stage2_kernel_tail = sum_probe_stage2_kernel_tail / Q;
     m.avg_probe_stage2_kernel_reduce = sum_probe_stage2_kernel_reduce / Q;
+    m.avg_probe_stage2_decode = sum_probe_stage2_decode / Q;
     m.avg_stage1_fused_blocks = sum_stage1_fused_blocks / Q;
     m.avg_stage1_fused_safeout_lanes = sum_stage1_fused_safeout_lanes / Q;
     m.avg_stage1_fused_safein_lanes = sum_stage1_fused_safein_lanes / Q;
@@ -1354,6 +1350,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_stage2_lane_density = sum_stage2_lanes_total_valid > 0.0
         ? sum_stage2_lanes_requested / sum_stage2_lanes_total_valid
         : 0.0;
+    m.avg_stage2_decode_blocks = sum_stage2_decode_blocks / Q;
+    m.avg_stage2_decode_input_bytes = sum_stage2_decode_input_bytes / Q;
+    m.avg_stage2_decode_output_bytes = sum_stage2_decode_output_bytes / Q;
     m.avg_probe_classify = sum_probe_classify / Q;
     m.avg_probe_submit = sum_probe_submit / Q;
     m.avg_probe_submit_prepare_vec_only = sum_probe_submit_prepare_vec_only / Q;
@@ -1364,8 +1363,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_probe_submit_pending_slot_alloc / Q;
     m.avg_probe_submit_prep_read = sum_probe_submit_prep_read / Q;
     m.avg_rerank_cpu = sum_rerank_cpu / Q;
-    m.avg_prefetch_submit = sum_prefetch_submit / Q;
-    m.avg_prefetch_wait = sum_prefetch_wait / Q;
     m.avg_safein_payload_prefetch = sum_safein_payload_prefetch / Q;
     m.avg_candidate_collect = sum_candidate_collect / Q;
     m.avg_pool_vector_read = sum_pool_vector_read / Q;
@@ -1375,7 +1372,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_remaining_payload_fetch = sum_remaining_payload_fetch / Q;
     m.avg_uring_prep = sum_uring_prep / Q;
     m.avg_uring_submit = sum_uring_submit / Q;
-    m.avg_parse_cluster = sum_parse_cluster / Q;
     m.avg_fetch_missing = sum_fetch_missing / Q;
     m.avg_submit_calls = sum_submit_calls / Q;
     m.avg_submit_window_flushes = sum_submit_window_flushes / Q;
@@ -1446,6 +1442,20 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.overlap_ratio = (sum_total > 0) ? 1.0 - sum_io_wait / sum_total : 0.0;
     m.preload_time_ms = index.segment().resident_preload_time_ms();
     m.preload_bytes = static_cast<double>(index.segment().resident_preload_bytes());
+    m.resident_file_size_bytes =
+        static_cast<double>(index.segment().resident_file_size_bytes());
+    m.resident_file_buffer_bytes =
+        static_cast<double>(index.segment().resident_file_buffer_bytes());
+    m.resident_code_storage_bytes =
+        static_cast<double>(index.segment().resident_code_storage_bytes());
+    m.resident_decoded_address_bytes =
+        static_cast<double>(index.segment().resident_decoded_address_bytes());
+    m.resident_raw_address_bytes =
+        static_cast<double>(index.segment().resident_raw_address_bytes());
+    m.resident_parsed_address_duplicate_bytes =
+        static_cast<double>(index.segment().resident_parsed_address_duplicate_bytes());
+    m.resident_preload_batch_size =
+        static_cast<double>(index.segment().resident_preload_batch_size());
     m.resident_cluster_mem_bytes =
         static_cast<double>(index.segment().resident_cluster_mem_bytes());
     m.resident_parallel_view_build_ms =
@@ -1462,7 +1472,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         FileSizeBytesOrZero(index.dir() + "/centroids.bin") +
         FileSizeBytesOrZero(index.dir() + "/segment.meta") +
         FileSizeBytesOrZero(index.dir() + "/build_metadata.json");
-    m.query_uses_resident_clusters = search_cfg.use_resident_clusters;
 
     if (m.recall_available) {
         Log("  %s: recall@1=%.4f @5=%.4f @10=%.4f @k=%.4f (k=%u)\n",
@@ -1493,14 +1502,13 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     Log("  %s: stage1_estimate=%.3f ms  stage1_mask=%.3f ms  stage1_iterate=%.3f ms  stage1_classify=%.3f ms\n",
         label, m.avg_probe_stage1_estimate, m.avg_probe_stage1_mask,
         m.avg_probe_stage1_iterate, m.avg_probe_stage1_classify_only);
-    Log("  %s: prefetch_submit=%.3f ms  prefetch_wait=%.3f ms  safein_payload_prefetch=%.3f ms\n",
-        label, m.avg_prefetch_submit, m.avg_prefetch_wait,
-        m.avg_safein_payload_prefetch);
+    Log("  %s: safein_payload_prefetch=%.3f ms\n",
+        label, m.avg_safein_payload_prefetch);
     Log("  %s: candidate_collect=%.3f ms  pool_vector_read=%.3f ms  rerank_compute=%.3f ms  remaining_payload_fetch=%.3f ms\n",
         label, m.avg_candidate_collect, m.avg_pool_vector_read,
         m.avg_rerank_compute, m.avg_remaining_payload_fetch);
-    Log("  %s: uring_prep=%.3f ms  uring_submit=%.3f ms  parse_cluster=%.3f ms  fetch_missing=%.3f ms\n",
-        label, m.avg_uring_prep, m.avg_uring_submit, m.avg_parse_cluster, m.avg_fetch_missing);
+    Log("  %s: uring_prep=%.3f ms  uring_submit=%.3f ms  fetch_missing=%.3f ms\n",
+        label, m.avg_uring_prep, m.avg_uring_submit, m.avg_fetch_missing);
     Log("  %s: submit_calls=%.1f\n", label, m.avg_submit_calls);
     Log("  %s: submit_window_flushes=%.1f  submit_window_tail_flushes=%.1f  submit_window_requests=%.1f\n",
         label, m.avg_submit_window_flushes,
@@ -1560,18 +1568,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     return {std::move(qresults), m};
 }
 
-static const char* AssignmentModeName(index::AssignmentMode mode) {
-    switch (mode) {
-        case index::AssignmentMode::Single:
-            return "single";
-        case index::AssignmentMode::RedundantTop2Naive:
-            return "redundant_top2_naive";
-        case index::AssignmentMode::RedundantTop2Rair:
-            return "redundant_top2_rair";
-    }
-    return "unknown";
-}
-
 static const char* ClusteringSourceName(index::ClusteringSource source) {
     switch (source) {
         case index::ClusteringSource::Auto:
@@ -1623,6 +1619,12 @@ int main(int argc, char* argv[]) {
     if (RejectDeletedDynamicSafeInFlag(argc, argv)) {
         return 1;
     }
+    if (RejectDeletedClusterLoadingFlag(argc, argv)) {
+        return 1;
+    }
+    if (RejectDeletedLegacySearchModeFlag(argc, argv)) {
+        return 1;
+    }
     int arg_dynamic_safein_min_probes =
         GetIntArg(argc, argv, "--dynamic-safein-min-probes", 0);
     int arg_dynamic_safein_stable_probes =
@@ -1648,15 +1650,12 @@ int main(int argc, char* argv[]) {
     int arg_seed       = GetIntArg(argc, argv, "--seed", 42);
     int arg_page_size  = GetIntArg(argc, argv, "--page-size", 4096);
     int arg_p_for_dk   = GetIntArg(argc, argv, "--p-for-dk", 99);
-    int arg_assignment_factor = GetIntArg(argc, argv, "--assignment-factor", 1);
-    std::string arg_assignment_mode =
-        GetStringArg(argc, argv, "--assignment-mode", "");
     std::string arg_coarse_builder =
         GetStringArg(argc, argv, "--coarse-builder", "auto");
-    bool arg_build_only = HasFlag(argc, argv, "--build-only");
-    float arg_rair_lambda = GetFloatArg(argc, argv, "--rair-lambda", 0.75f);
-    int arg_rair_strict_second_choice =
-        GetIntArg(argc, argv, "--rair-strict-second-choice", 0);
+    const bool invoked_as_build_index =
+        fs::path(argv[0]).filename() == "bench_build_index";
+    bool arg_build_only = HasFlag(argc, argv, "--build-only") ||
+                          invoked_as_build_index;
     int arg_epsilon_samples = GetIntArg(argc, argv, "--epsilon-samples", 100);
     auto epsilon_sampling_mode_or = ParseEpsilonSamplingModeArg(
         GetStringArg(argc, argv, "--epsilon-sampling-mode",
@@ -1676,12 +1675,12 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--cluster-submit-reserve", 8);
     std::string arg_submission_mode =
         GetStringArg(argc, argv, "--submission-mode", "shared");
-    std::string arg_clu_read_mode =
-        GetStringArg(argc, argv, "--clu-read-mode", "window");
-    int arg_use_resident_clusters =
-        GetIntArg(argc, argv, "--use-resident-clusters", 1);
     int arg_query_only = GetIntArg(argc, argv, "--query-only", 0);
     int arg_skip_gt = GetIntArg(argc, argv, "--skip-gt", 0);
+    if (invoked_as_build_index) {
+        arg_query_only = 1;
+        arg_skip_gt = 1;
+    }
     int arg_skip_false_stats = GetIntArg(argc, argv, "--skip-false-stats", 0);
     std::string arg_gt_file = GetStringArg(argc, argv, "--gt-file", "");
     std::string arg_payload_mode =
@@ -1705,14 +1704,6 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--coarse-select-simd", 1);
     int arg_coarse_select_phase2 =
         GetIntArg(argc, argv, "--coarse-select-phase2", 0);
-    int arg_hnsw_coarse_routing =
-        GetIntArg(argc, argv, "--hnsw-coarse-routing", 0);
-    int arg_hnsw_coarse_m =
-        GetIntArg(argc, argv, "--hnsw-coarse-m", 32);
-    int arg_hnsw_coarse_ef_construction =
-        GetIntArg(argc, argv, "--hnsw-coarse-ef-construction", 128);
-    int arg_hnsw_coarse_ef_search =
-        GetIntArg(argc, argv, "--hnsw-coarse-ef-search", 512);
     int arg_two_level_coarse_routing =
         GetIntArg(argc, argv, "--two-level-coarse-routing", 0);
     int arg_two_level_coarse_threshold =
@@ -1729,21 +1720,13 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--stage2-block-first", 1);
     int arg_stage2_batch_classify =
         GetIntArg(argc, argv, "--stage2-batch-classify", 1);
-    int arg_pad_to_pow2 =
-        GetIntArg(argc, argv, "--pad-to-pow2", 0);
-    int arg_blocked_hadamard_permuted =
-        GetIntArg(argc, argv, "--blocked-hadamard-permuted", 1);
-    int arg_fht_kac_rotator =
-        GetIntArg(argc, argv, "--fht-kac-rotator", 0);
-
     bool arg_cold = HasFlag(argc, argv, "--cold");
     bool arg_direct_io = HasFlag(argc, argv, "--direct-io");
     bool arg_iopoll = HasFlag(argc, argv, "--iopoll");
     bool arg_sqpoll = HasFlag(argc, argv, "--sqpoll");
     const bool query_only_mode = (arg_query_only != 0);
     const bool skip_gt = query_only_mode || (arg_skip_gt != 0);
-    if ((arg_two_level_coarse_routing != 0 || arg_hnsw_coarse_routing != 0) &&
-        skip_gt) {
+    if (arg_two_level_coarse_routing != 0 && skip_gt) {
         Log("WARNING: approximate coarse routing is running without real GT recall; do not use this run as final performance evidence.\n");
     }
     const bool external_gt_requested = !arg_gt_file.empty();
@@ -1753,20 +1736,6 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
                      "Error: unsupported --submission-mode=%s (expected 'shared' or 'isolated')\n",
                      arg_submission_mode.c_str());
-        return 1;
-    }
-    if (arg_clu_read_mode != "window" &&
-        arg_clu_read_mode != "full_preload") {
-        std::fprintf(stderr,
-                     "Invalid --clu-read-mode: %s (expected window or full_preload)\n",
-                     arg_clu_read_mode.c_str());
-        return 1;
-    }
-    if (arg_use_resident_clusters != 0 &&
-        arg_use_resident_clusters != 1) {
-        std::fprintf(stderr,
-                     "Invalid --use-resident-clusters: %d (expected 0 or 1)\n",
-                     arg_use_resident_clusters);
         return 1;
     }
     if (arg_safein_all_threshold_bytes < 0) {
@@ -1803,21 +1772,6 @@ int main(int argc, char* argv[]) {
                arg_payload_mode == "flatstor-payload") {
         arg_payload_mode = "raw-flatstor";
     }
-    if (arg_assignment_factor != 1 && arg_assignment_factor != 2) {
-        std::fprintf(stderr,
-                     "Invalid --assignment-factor: %d (expected 1 or 2)\n",
-                     arg_assignment_factor);
-        return 1;
-    }
-    if (!arg_assignment_mode.empty() &&
-        arg_assignment_mode != "single" &&
-        arg_assignment_mode != "redundant_top2_naive" &&
-        arg_assignment_mode != "redundant_top2_rair") {
-        std::fprintf(stderr,
-                     "Invalid --assignment-mode: %s (expected single, redundant_top2_naive, or redundant_top2_rair)\n",
-                     arg_assignment_mode.c_str());
-        return 1;
-    }
     if (arg_coarse_builder != "auto" &&
         arg_coarse_builder != "superkmeans" &&
         arg_coarse_builder != "hierarchical_superkmeans" &&
@@ -1825,13 +1779,6 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
                      "Invalid --coarse-builder: %s (expected auto, superkmeans, hierarchical_superkmeans, or faiss_kmeans)\n",
                      arg_coarse_builder.c_str());
-        return 1;
-    }
-    if (arg_rair_strict_second_choice != 0 &&
-        arg_rair_strict_second_choice != 1) {
-        std::fprintf(stderr,
-                     "Invalid --rair-strict-second-choice: %d (expected 0 or 1)\n",
-                     arg_rair_strict_second_choice);
         return 1;
     }
     if (external_gt_requested && skip_gt) {
@@ -1876,8 +1823,6 @@ int main(int argc, char* argv[]) {
         GetStringArg(argc, argv, "--save-centroids", "");
     std::string arg_save_assignments =
         GetStringArg(argc, argv, "--save-assignments", "");
-    std::string arg_save_secondary_assignments =
-        GetStringArg(argc, argv, "--save-secondary-assignments", "");
 
     // Pre-built index directory (skip Phase C build if specified)
     std::string arg_index_dir = GetStringArg(argc, argv, "--index-dir", "");
@@ -1963,12 +1908,6 @@ int main(int argc, char* argv[]) {
 
     std::string ds_name = DatasetName(data_dir);
     std::string ts = Timestamp();
-    std::string resolved_assignment_mode = arg_assignment_mode;
-    if (resolved_assignment_mode.empty()) {
-        resolved_assignment_mode =
-            (arg_assignment_factor == 2) ? "redundant_top2_naive" : "single";
-    }
-
     Log("=== VDB E2E Benchmark ===\n");
     Log("Dataset: %s\n", data_dir.c_str());
     Log("Calibration samples: %d\n", arg_calibration_samples);
@@ -2146,8 +2085,7 @@ int main(int argc, char* argv[]) {
     std::string output_dir = output_base + "/" + ds_name + "_" + ts;
     std::string index_dir = ResolveBenchIndexDir(
         ds_name, output_dir, arg_nlist, arg_bits,
-        arg_epsilon_percentile, resolved_assignment_mode,
-        arg_rair_lambda, arg_index_dir);
+        arg_epsilon_percentile, arg_index_dir);
     const std::string index_source =
         arg_index_dir.empty() ? "rebuilt" : "reused";
     const std::string resolved_index_dir = NormalizePath(index_dir);
@@ -2182,18 +2120,6 @@ int main(int argc, char* argv[]) {
             std::min(static_cast<uint32_t>(arg_calibration_samples), N);
         cfg.epsilon_samples = static_cast<uint32_t>(arg_epsilon_samples);
         cfg.epsilon_percentile = arg_epsilon_percentile;
-        cfg.assignment_factor = static_cast<uint32_t>(arg_assignment_factor);
-        if (arg_assignment_mode == "redundant_top2_naive") {
-            cfg.assignment_mode = index::AssignmentMode::RedundantTop2Naive;
-            cfg.assignment_factor = 2;
-        } else if (arg_assignment_mode == "redundant_top2_rair") {
-            cfg.assignment_mode = index::AssignmentMode::RedundantTop2Rair;
-            cfg.assignment_factor = 2;
-        } else {
-            cfg.assignment_mode = index::AssignmentMode::Single;
-        }
-        cfg.rair_lambda = arg_rair_lambda;
-        cfg.rair_strict_second_choice = (arg_rair_strict_second_choice != 0);
         cfg.calibration_topk = GT_K;
         cfg.calibration_percentile = static_cast<float>(arg_p_for_dk) / 100.0f;
         cfg.page_size = static_cast<uint32_t>(arg_page_size);
@@ -2203,11 +2129,6 @@ int main(int argc, char* argv[]) {
         cfg.assignments_path = arg_assignments;
         cfg.save_centroids_path = arg_save_centroids;
         cfg.save_assignments_path = arg_save_assignments;
-        cfg.save_secondary_assignments_path = arg_save_secondary_assignments;
-        cfg.pad_non_power_of_two_to_pow2 = (arg_pad_to_pow2 != 0);
-        cfg.use_blocked_hadamard_permuted =
-            (arg_blocked_hadamard_permuted != 0);
-        cfg.use_fht_kac_rotator = (arg_fht_kac_rotator != 0);
         if (use_flatstor_payload) {
             const char* payload_field =
                 (arg_payload_mode == "audio-flatstor") ? "audio_payload"
@@ -2550,22 +2471,19 @@ int main(int argc, char* argv[]) {
         Log("  Runtime SafeIn threshold: dynamic_frontier (no static safein_d_k loaded)\n");
     }
 
-    if ((arg_use_resident_clusters != 0) ||
-        arg_clu_read_mode == "full_preload") {
-        if (!index.segment().resident_preload_enabled()) {
-            Log("\n[Phase C.5] Prewarming resident/full-preload clusters...\n");
-            auto preload_status = index.segment().PreloadAllClusters();
-            if (!preload_status.ok()) {
-                std::fprintf(stderr,
-                             "Failed to preload resident clusters: %s\n",
-                             preload_status.ToString().c_str());
-                return 1;
-            }
-            Log("  Prewarm done: preload_time=%.3f ms  preload_bytes=%llu\n",
-                index.segment().resident_preload_time_ms(),
-                static_cast<unsigned long long>(
-                    index.segment().resident_preload_bytes()));
+    if (!index.segment().resident_preload_enabled()) {
+        Log("\n[Phase C.5] Prewarming resident/full-preload clusters...\n");
+        auto preload_status = index.segment().PreloadAllClusters();
+        if (!preload_status.ok()) {
+            std::fprintf(stderr,
+                         "Failed to preload resident clusters: %s\n",
+                         preload_status.ToString().c_str());
+            return 1;
         }
+        Log("  Prewarm done: preload_time=%.3f ms  preload_bytes=%llu\n",
+            index.segment().resident_preload_time_ms(),
+            static_cast<unsigned long long>(
+                index.segment().resident_preload_bytes()));
     }
 
     // ================================================================
@@ -2641,8 +2559,6 @@ int main(int argc, char* argv[]) {
         static_cast<uint32_t>(arg_non_safeout_candidate_budget);
     search_cfg.safein_all_threshold =
         static_cast<uint32_t>(arg_safein_all_threshold_bytes);
-    search_cfg.prefetch_depth = static_cast<uint32_t>(
-        GetIntArg(argc, argv, "--prefetch-depth", 16));
     search_cfg.io_queue_depth = static_cast<uint32_t>(arg_io_queue_depth);
     search_cfg.fixed_vec_buffer_count =
         static_cast<uint32_t>(std::max(arg_fixed_vec_buffer_count, 0));
@@ -2653,18 +2569,9 @@ int main(int argc, char* argv[]) {
         (arg_submission_mode == "isolated")
             ? SubmissionMode::Isolated
             : SubmissionMode::Shared;
-    search_cfg.clu_read_mode =
-        (arg_clu_read_mode == "full_preload")
-            ? CluReadMode::FullPreload
-            : CluReadMode::Window;
-    search_cfg.use_resident_clusters = (arg_use_resident_clusters != 0);
     search_cfg.enable_fine_grained_timing = (arg_fine_grained_timing != 0);
     search_cfg.enable_hotpath_detailed_timing =
         (arg_hotpath_detailed_timing != 0);
-    search_cfg.refill_threshold = static_cast<uint32_t>(
-        GetIntArg(argc, argv, "--refill-threshold", 4));
-    search_cfg.refill_count = static_cast<uint32_t>(
-        GetIntArg(argc, argv, "--refill-count", 8));
     search_cfg.submit_batch_size = static_cast<uint32_t>(
         GetIntArg(argc, argv, "--submit-batch", 32));
     search_cfg.enable_online_submit_tuning = (arg_submit_online != 0);
@@ -2674,13 +2581,6 @@ int main(int argc, char* argv[]) {
         (arg_rerank_batched_distance_simd != 0);
     search_cfg.enable_coarse_select_simd = (arg_coarse_select_simd != 0);
     search_cfg.enable_coarse_select_phase2 = (arg_coarse_select_phase2 != 0);
-    search_cfg.enable_hnsw_coarse_routing = (arg_hnsw_coarse_routing != 0);
-    search_cfg.hnsw_coarse_m =
-        static_cast<uint32_t>(std::max(1, arg_hnsw_coarse_m));
-    search_cfg.hnsw_coarse_ef_construction =
-        static_cast<uint32_t>(std::max(1, arg_hnsw_coarse_ef_construction));
-    search_cfg.hnsw_coarse_ef_search =
-        static_cast<uint32_t>(std::max(1, arg_hnsw_coarse_ef_search));
     search_cfg.enable_two_level_coarse_routing =
         (arg_two_level_coarse_routing != 0);
     search_cfg.two_level_coarse_threshold =
@@ -2709,20 +2609,13 @@ int main(int argc, char* argv[]) {
         search_cfg.false_stats_cluster_members = &cluster_members_for_stats;
     }
 
-    if (search_cfg.use_resident_clusters) {
-        if (search_cfg.clu_read_mode != CluReadMode::FullPreload) {
+    if (!index.segment().resident_preload_enabled()) {
+        auto preload_status = index.segment().PreloadAllClusters();
+        if (!preload_status.ok()) {
             std::fprintf(stderr,
-                         "Resident cluster mode requires --clu-read-mode full_preload\n");
+                         "Failed to preload resident clusters before benchmark: %s\n",
+                         preload_status.ToString().c_str());
             return 1;
-        }
-        if (!index.segment().resident_preload_enabled()) {
-            auto preload_status = index.segment().PreloadAllClusters();
-            if (!preload_status.ok()) {
-                std::fprintf(stderr,
-                             "Failed to preload resident clusters before benchmark: %s\n",
-                             preload_status.ToString().c_str());
-                return 1;
-            }
         }
     }
 
@@ -2742,12 +2635,13 @@ int main(int argc, char* argv[]) {
                          "avg_probe_ms,avg_io_wait_ms,avg_uring_submit_ms,"
                          "avg_submit_calls,avg_safe_out_rate,io_queue_depth,"
                          "sqpoll_enabled,cluster_submit_reserve,submission_mode,"
-                         "clu_read_mode,assignment_mode,assignment_factor,clustering_source,"
-                         "rair_lambda,rair_strict_second_choice,"
-                         "avg_duplicate_candidates,avg_deduplicated_candidates,"
+                         "clustering_source,avg_duplicate_candidates,avg_deduplicated_candidates,"
                          "avg_unique_fetch_candidates,index_source,resolved_index_dir,"
                          "loaded_eps_ip,loaded_d_k,preload_time_ms,preload_bytes,"
-                         "resident_cluster_mem_bytes,query_uses_resident_clusters,"
+                         "resident_preload_batch_size,resident_file_size_bytes,"
+                         "resident_file_buffer_bytes,resident_code_storage_bytes,"
+                         "resident_decoded_address_bytes,resident_raw_address_bytes,"
+                         "resident_parsed_address_duplicate_bytes,resident_cluster_mem_bytes,"
                          "logical_dim,effective_dim,padding_mode,rotation_mode,"
                          "avg_prepare_rotation_ms,avg_prepare_quant_lut_ms,index_total_bytes\n";
         }
@@ -2789,12 +2683,7 @@ int main(int argc, char* argv[]) {
                       << (cluster_reader.sqpoll_enabled() ? 1 : 0) << ","
                       << search_cfg.cluster_submit_reserve << ","
                       << arg_submission_mode << ","
-                      << arg_clu_read_mode << ","
-                      << AssignmentModeName(index.assignment_mode()) << ","
-                      << index.assignment_factor() << ","
                       << ClusteringSourceName(index.clustering_source()) << ","
-                      << index.rair_lambda() << ","
-                      << (index.rair_strict_second_choice() ? 1 : 0) << ","
                       << sm.avg_duplicate_candidates << ","
                       << sm.avg_deduplicated_candidates << ","
                       << sm.avg_unique_fetch_candidates << ","
@@ -2804,8 +2693,14 @@ int main(int argc, char* argv[]) {
                       << index.conann().d_k() << ","
                       << sm.preload_time_ms << ","
                       << sm.preload_bytes << ","
+                      << sm.resident_preload_batch_size << ","
+                      << sm.resident_file_size_bytes << ","
+                      << sm.resident_file_buffer_bytes << ","
+                      << sm.resident_code_storage_bytes << ","
+                      << sm.resident_decoded_address_bytes << ","
+                      << sm.resident_raw_address_bytes << ","
+                      << sm.resident_parsed_address_duplicate_bytes << ","
                       << sm.resident_cluster_mem_bytes << ","
-                      << (sm.query_uses_resident_clusters ? 1 : 0) << ","
                       << index.logical_dim() << ","
                       << index.effective_dim() << ","
                       << "\"" << index.padding_mode() << "\"" << ","
@@ -2905,14 +2800,14 @@ int main(int argc, char* argv[]) {
     Log("  exrabitq_storage_version=%u  exrabitq_storage_format=%s\n",
         index.segment().cluster_reader().file_version(),
         ExRaBitQStorageFormatName(index.segment().cluster_reader().file_version()));
+    Log("  exrabitq_stage2_magnitude_packed=%s\n",
+        (index.segment().cluster_reader().file_version() >= 12 && arg_bits > 1)
+            ? "true"
+            : "false");
     Log("  loaded_eps_ip=%.6f  loaded_d_k=%.6f\n",
         index.conann().epsilon(), index.conann().d_k());
-    Log("  assignment_mode=%s  assignment_factor=%u  clustering_source=%s\n",
-        AssignmentModeName(index.assignment_mode()),
-        index.assignment_factor(),
+    Log("  clustering_source=%s\n",
         ClusteringSourceName(index.clustering_source()));
-    Log("  rair_lambda=%.3f  rair_strict_second_choice=%d\n",
-        index.rair_lambda(), index.rair_strict_second_choice() ? 1 : 0);
     Log("  io_wait=%.3f ms  cpu=%.3f ms  coarse_select=%.3f ms  score=%.3f ms  topn=%.3f ms  probe=%.3f ms\n",
         metrics.avg_io_wait, metrics.avg_cpu, metrics.avg_coarse_select,
         metrics.avg_coarse_score, metrics.avg_coarse_topn, metrics.avg_probe);
@@ -2942,6 +2837,11 @@ int main(int argc, char* argv[]) {
     Log("  stage2_collect=%.3f ms  stage2_kernel=%.3f ms  stage2_scatter=%.3f ms\n",
         metrics.avg_probe_stage2_collect, metrics.avg_probe_stage2_kernel,
         metrics.avg_probe_stage2_scatter);
+    Log("  stage2_decode=%.3f ms  decode_blocks=%.1f  decode_in_bytes=%.1f  decode_out_bytes=%.1f\n",
+        metrics.avg_probe_stage2_decode,
+        metrics.avg_stage2_decode_blocks,
+        metrics.avg_stage2_decode_input_bytes,
+        metrics.avg_stage2_decode_output_bytes);
     Log("  stage2_kernel_sign_flip=%.3f ms  stage2_kernel_abs_fma=%.3f ms  stage2_kernel_tail=%.3f ms  stage2_kernel_reduce=%.3f ms\n",
         metrics.avg_probe_stage2_kernel_sign_flip,
         metrics.avg_probe_stage2_kernel_abs_fma,
@@ -2953,9 +2853,7 @@ int main(int argc, char* argv[]) {
         metrics.avg_stage2_lanes_skipped,
         metrics.avg_stage2_lanes_total_valid,
         metrics.avg_stage2_lane_density);
-    Log("  clu_mode=%s  resident=%d  preload_time=%.3f ms  preload_bytes=%.0f  resident_mem=%.0f  parallel_view_build=%.3f ms  parallel_view_bytes=%.0f\n",
-        arg_clu_read_mode.c_str(),
-        metrics.query_uses_resident_clusters ? 1 : 0,
+    Log("  cluster_mode=resident_full_preload  preload_time=%.3f ms  preload_bytes=%.0f  resident_mem=%.0f  parallel_view_build=%.3f ms  parallel_view_bytes=%.0f\n",
         metrics.preload_time_ms,
         metrics.preload_bytes,
         metrics.resident_cluster_mem_bytes,
@@ -3003,6 +2901,9 @@ int main(int argc, char* argv[]) {
         f << "  " << JStr("exrabitq_storage_format",
                           ExRaBitQStorageFormatName(
                               index.segment().cluster_reader().file_version())) << ",\n";
+        f << "  " << JBool("exrabitq_stage2_magnitude_packed",
+                            index.segment().cluster_reader().file_version() >= 12 &&
+                            arg_bits > 1) << ",\n";
         f << "  " << JInt("num_images", N) << ",\n";
         f << "  " << JInt("num_queries", Q) << ",\n";
         f << "  " << JInt("dimension", dim) << ",\n";
@@ -3022,10 +2923,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JStr("epsilon_sampling_mode",
                              EpsilonSamplingModeName(arg_epsilon_sampling_mode)) << ",\n";
         f << "    " << JNum("epsilon_percentile", arg_epsilon_percentile) << ",\n";
-        f << "    " << JBool("pad_to_pow2", arg_pad_to_pow2 != 0) << ",\n";
-        f << "    " << JBool("blocked_hadamard_permuted", arg_blocked_hadamard_permuted != 0) << ",\n";
-        f << "    " << JBool("fht_kac_rotator", arg_fht_kac_rotator != 0) << ",\n";
-        f << "    " << JStr("assignment_mode", resolved_assignment_mode) << ",\n";
         f << "    " << JStr("coarse_builder", arg_coarse_builder) << ",\n";
         f << "    " << JStr("requested_metric", index.requested_metric()) << ",\n";
         f << "    " << JStr("effective_metric", index.effective_metric()) << ",\n";
@@ -3033,9 +2930,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JInt("faiss_niter", arg_max_iter == 20 ? 10 : arg_max_iter) << ",\n";
         f << "    " << JInt("faiss_nredo", 1) << ",\n";
         f << "    " << JStr("faiss_backend", "cpu") << ",\n";
-        f << "    " << JInt("assignment_factor", arg_assignment_factor) << ",\n";
-        f << "    " << JNum("rair_lambda", arg_rair_lambda) << ",\n";
-        f << "    " << JBool("rair_strict_second_choice", arg_rair_strict_second_choice != 0) << ",\n";
         f << "    " << JStr("requested_index_dir", arg_index_dir) << ",\n";
         f << "    " << JStr("payload_mode", arg_payload_mode) << ",\n";
         f << "    " << JStr("payload_index", arg_payload_index) << ",\n";
@@ -3070,7 +2964,6 @@ int main(int argc, char* argv[]) {
                             search_cfg.non_safeout_candidate_budget) << ",\n";
         f << "    " << JInt("safein_all_threshold_bytes",
                             search_cfg.safein_all_threshold) << ",\n";
-        f << "    " << JInt("prefetch_depth", search_cfg.prefetch_depth) << ",\n";
         f << "    " << JInt("io_queue_depth", search_cfg.io_queue_depth) << ",\n";
         f << "    " << JInt("fixed_vec_buffer_count", search_cfg.fixed_vec_buffer_count) << ",\n";
         f << "    " << JInt("cluster_submit_reserve", search_cfg.cluster_submit_reserve) << ",\n";
@@ -3078,18 +2971,13 @@ int main(int argc, char* argv[]) {
         f << "    " << JBool("sqpoll_requested", arg_sqpoll) << ",\n";
         f << "    " << JBool("sqpoll_effective", cluster_reader.sqpoll_enabled()) << ",\n";
         f << "    " << JStr("submission_mode", arg_submission_mode) << ",\n";
-        f << "    " << JStr("clu_read_mode", arg_clu_read_mode) << ",\n";
-        f << "    " << JBool("use_resident_clusters", search_cfg.use_resident_clusters) << ",\n";
+        f << "    " << JStr("cluster_loading", "resident_full_preload") << ",\n";
         f << "    " << JBool("enable_fine_grained_timing", search_cfg.enable_fine_grained_timing) << ",\n";
         f << "    " << JBool("enable_hotpath_detailed_timing", search_cfg.enable_hotpath_detailed_timing) << ",\n";
         f << "    " << JBool("enable_address_decode_simd", search_cfg.enable_address_decode_simd) << ",\n";
         f << "    " << JBool("enable_rerank_batched_distance_simd", search_cfg.enable_rerank_batched_distance_simd) << ",\n";
         f << "    " << JBool("enable_coarse_select_simd", search_cfg.enable_coarse_select_simd) << ",\n";
         f << "    " << JBool("enable_coarse_select_phase2", search_cfg.enable_coarse_select_phase2) << ",\n";
-        f << "    " << JBool("enable_hnsw_coarse_routing", search_cfg.enable_hnsw_coarse_routing) << ",\n";
-        f << "    " << JInt("hnsw_coarse_m", search_cfg.hnsw_coarse_m) << ",\n";
-        f << "    " << JInt("hnsw_coarse_ef_construction", search_cfg.hnsw_coarse_ef_construction) << ",\n";
-        f << "    " << JInt("hnsw_coarse_ef_search", search_cfg.hnsw_coarse_ef_search) << ",\n";
         f << "    " << JBool("enable_two_level_coarse_routing", search_cfg.enable_two_level_coarse_routing) << ",\n";
         f << "    " << JInt("two_level_coarse_threshold", search_cfg.two_level_coarse_threshold) << ",\n";
         f << "    " << JInt("two_level_coarse_super_count", search_cfg.two_level_coarse_super_count) << ",\n";
@@ -3151,14 +3039,10 @@ int main(int argc, char* argv[]) {
                              safeout_epsilon_stats.valid_error_count) << ",\n";
         f << "    " << JInt("safeout_epsilon_attempted_pairs",
                              safeout_epsilon_stats.attempted_pairs) << ",\n";
-        f << "    " << JStr("assignment_mode", AssignmentModeName(index.assignment_mode())) << ",\n";
         f << "    " << JStr("coarse_builder", CoarseBuilderName(index.coarse_builder())) << ",\n";
         f << "    " << JStr("requested_metric", index.requested_metric()) << ",\n";
         f << "    " << JStr("effective_metric", index.effective_metric()) << ",\n";
         f << "    " << JStr("faiss_backend", "cpu") << ",\n";
-        f << "    " << JInt("assignment_factor", index.assignment_factor()) << ",\n";
-        f << "    " << JNum("rair_lambda", index.rair_lambda()) << ",\n";
-        f << "    " << JBool("rair_strict_second_choice", index.rair_strict_second_choice()) << ",\n";
         f << "    " << JStr("clustering_source", ClusteringSourceName(index.clustering_source())) << "\n";
         f << "  }\n";
         f << "}\n";
@@ -3184,6 +3068,9 @@ int main(int argc, char* argv[]) {
         f << "    " << JStr("exrabitq_storage_format",
                             ExRaBitQStorageFormatName(
                                 index.segment().cluster_reader().file_version())) << ",\n";
+        f << "    " << JBool("exrabitq_stage2_magnitude_packed",
+                              index.segment().cluster_reader().file_version() >= 12 &&
+                              arg_bits > 1) << ",\n";
         f << "    " << JNum("loaded_eps_ip", loaded_eps_ip) << ",\n";
         f << "    " << JNum("loaded_d_k", loaded_d_k) << ",\n";
         f << "    " << JNum("runtime_eps_ip", index.conann().epsilon()) << ",\n";
@@ -3242,6 +3129,14 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("p99_query_time_ms", metrics.p99) << ",\n";
         f << "    " << JNum("preload_time_ms", metrics.preload_time_ms) << ",\n";
         f << "    " << JNum("preload_bytes", metrics.preload_bytes) << ",\n";
+        f << "    " << JStr("resident_preload_mode", index.segment().resident_preload_mode()) << ",\n";
+        f << "    " << JNum("resident_preload_batch_size", metrics.resident_preload_batch_size) << ",\n";
+        f << "    " << JNum("resident_file_size_bytes", metrics.resident_file_size_bytes) << ",\n";
+        f << "    " << JNum("resident_file_buffer_bytes", metrics.resident_file_buffer_bytes) << ",\n";
+        f << "    " << JNum("resident_code_storage_bytes", metrics.resident_code_storage_bytes) << ",\n";
+        f << "    " << JNum("resident_decoded_address_bytes", metrics.resident_decoded_address_bytes) << ",\n";
+        f << "    " << JNum("resident_raw_address_bytes", metrics.resident_raw_address_bytes) << ",\n";
+        f << "    " << JNum("resident_parsed_address_duplicate_bytes", metrics.resident_parsed_address_duplicate_bytes) << ",\n";
         f << "    " << JNum("resident_cluster_mem_bytes", metrics.resident_cluster_mem_bytes) << ",\n";
         f << "    " << JNum("resident_parallel_view_build_ms", metrics.resident_parallel_view_build_ms) << ",\n";
         f << "    " << JNum("resident_parallel_view_bytes", metrics.resident_parallel_view_bytes) << ",\n";
@@ -3250,7 +3145,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("index_data_dat_bytes", metrics.index_data_dat_bytes) << ",\n";
         f << "    " << JNum("index_rotation_bytes", metrics.index_rotation_bytes) << ",\n";
         f << "    " << JNum("index_rotated_centroids_bytes", metrics.index_rotated_centroids_bytes) << ",\n";
-        f << "    " << JBool("query_uses_resident_clusters", metrics.query_uses_resident_clusters) << ",\n";
         f << "    " << JInt("num_queries", Q) << "\n";
         f << "  },\n";
 
@@ -3285,13 +3179,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_coarse_exact_fallback", metrics.avg_coarse_exact_fallback) << ",\n";
         f << "    " << JNum("avg_coarse_exact_overlap", metrics.avg_coarse_exact_overlap) << ",\n";
         f << "    " << JNum("avg_coarse_hierarchy_build_ms", metrics.avg_coarse_hierarchy_build_ms) << ",\n";
-        f << "    " << JNum("avg_coarse_hnsw_graph_build_ms", metrics.avg_coarse_hnsw_graph_build_ms) << ",\n";
-        f << "    " << JNum("avg_coarse_hnsw_m", metrics.avg_coarse_hnsw_m) << ",\n";
-        f << "    " << JNum("avg_coarse_hnsw_ef_search", metrics.avg_coarse_hnsw_ef_search) << ",\n";
-        f << "    " << JNum("avg_coarse_hnsw_returned_clusters", metrics.avg_coarse_hnsw_returned_clusters) << ",\n";
-        f << "    " << JNum("avg_coarse_hnsw_visited_nodes", metrics.avg_coarse_hnsw_visited_nodes) << ",\n";
-        f << "    " << JNum("avg_coarse_hnsw_distance_computations", metrics.avg_coarse_hnsw_distance_computations) << ",\n";
-        f << "    " << JNum("avg_coarse_hnsw_hops", metrics.avg_coarse_hnsw_hops) << ",\n";
         f << "    " << JNum("avg_probe_time_ms", metrics.avg_probe) << ",\n";
         f << "    " << JNum("avg_probe_prepare_ms", metrics.avg_probe_prepare) << ",\n";
         f << "    " << JNum("avg_probe_prepare_rotation_ms", metrics.avg_probe_prepare_rotation) << ",\n";
@@ -3313,6 +3200,7 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_probe_stage2_kernel_abs_fma_ms", metrics.avg_probe_stage2_kernel_abs_fma) << ",\n";
         f << "    " << JNum("avg_probe_stage2_kernel_tail_ms", metrics.avg_probe_stage2_kernel_tail) << ",\n";
         f << "    " << JNum("avg_probe_stage2_kernel_reduce_ms", metrics.avg_probe_stage2_kernel_reduce) << ",\n";
+        f << "    " << JNum("avg_probe_stage2_decode_ms", metrics.avg_probe_stage2_decode) << ",\n";
         f << "    " << JNum("avg_stage1_fused_blocks", metrics.avg_stage1_fused_blocks) << ",\n";
         f << "    " << JNum("avg_stage1_fused_safeout_lanes", metrics.avg_stage1_fused_safeout_lanes) << ",\n";
         f << "    " << JNum("avg_stage1_fused_safein_lanes", metrics.avg_stage1_fused_safein_lanes) << ",\n";
@@ -3321,6 +3209,9 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_stage2_lanes_skipped", metrics.avg_stage2_lanes_skipped) << ",\n";
         f << "    " << JNum("avg_stage2_lanes_total_valid", metrics.avg_stage2_lanes_total_valid) << ",\n";
         f << "    " << JNum("avg_stage2_lane_density", metrics.avg_stage2_lane_density) << ",\n";
+        f << "    " << JNum("avg_stage2_decode_blocks", metrics.avg_stage2_decode_blocks) << ",\n";
+        f << "    " << JNum("avg_stage2_decode_input_bytes", metrics.avg_stage2_decode_input_bytes) << ",\n";
+        f << "    " << JNum("avg_stage2_decode_output_bytes", metrics.avg_stage2_decode_output_bytes) << ",\n";
         f << "    " << JNum("avg_probe_classify_ms", metrics.avg_probe_classify) << ",\n";
         f << "    " << JNum("avg_probe_submit_ms", metrics.avg_probe_submit) << ",\n";
         f << "    " << JNum("avg_probe_submit_prepare_vec_only_ms", metrics.avg_probe_submit_prepare_vec_only) << ",\n";
@@ -3330,8 +3221,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_probe_submit_pending_slot_alloc_ms", metrics.avg_probe_submit_pending_slot_alloc) << ",\n";
         f << "    " << JNum("avg_probe_submit_prep_read_ms", metrics.avg_probe_submit_prep_read) << ",\n";
         f << "    " << JNum("avg_rerank_cpu_ms", metrics.avg_rerank_cpu) << ",\n";
-        f << "    " << JNum("avg_prefetch_submit_ms", metrics.avg_prefetch_submit) << ",\n";
-        f << "    " << JNum("avg_prefetch_wait_ms", metrics.avg_prefetch_wait) << ",\n";
         f << "    " << JNum("avg_safein_payload_prefetch_ms", metrics.avg_safein_payload_prefetch) << ",\n";
         f << "    " << JNum("avg_candidate_collect_ms", metrics.avg_candidate_collect) << ",\n";
         f << "    " << JNum("avg_pool_vector_read_ms", metrics.avg_pool_vector_read) << ",\n";
@@ -3341,7 +3230,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_remaining_payload_fetch_ms", metrics.avg_remaining_payload_fetch) << ",\n";
         f << "    " << JNum("avg_uring_prep_ms", metrics.avg_uring_prep) << ",\n";
         f << "    " << JNum("avg_uring_submit_ms", metrics.avg_uring_submit) << ",\n";
-        f << "    " << JNum("avg_parse_cluster_ms", metrics.avg_parse_cluster) << ",\n";
         f << "    " << JNum("avg_fetch_missing_ms", metrics.avg_fetch_missing) << ",\n";
         f << "    " << JNum("avg_submit_calls", metrics.avg_submit_calls) << ",\n";
         f << "    " << JNum("avg_submit_window_flushes", metrics.avg_submit_window_flushes) << ",\n";
@@ -3420,13 +3308,6 @@ int main(int argc, char* argv[]) {
             f << "      " << JInt("coarse_exact_fallback", qr.coarse_exact_fallback) << ",\n";
             f << "      " << JInt("coarse_exact_overlap", qr.coarse_exact_overlap) << ",\n";
             f << "      " << JNum("coarse_hierarchy_build_ms", qr.coarse_hierarchy_build_ms) << ",\n";
-            f << "      " << JNum("coarse_hnsw_graph_build_ms", qr.coarse_hnsw_graph_build_ms) << ",\n";
-            f << "      " << JInt("coarse_hnsw_m", qr.coarse_hnsw_m) << ",\n";
-            f << "      " << JInt("coarse_hnsw_ef_search", qr.coarse_hnsw_ef_search) << ",\n";
-            f << "      " << JInt("coarse_hnsw_returned_clusters", qr.coarse_hnsw_returned_clusters) << ",\n";
-            f << "      " << JInt("coarse_hnsw_visited_nodes", qr.coarse_hnsw_visited_nodes) << ",\n";
-            f << "      " << JInt("coarse_hnsw_distance_computations", qr.coarse_hnsw_distance_computations) << ",\n";
-            f << "      " << JInt("coarse_hnsw_hops", qr.coarse_hnsw_hops) << ",\n";
             f << "      " << JNum("probe_ms", qr.probe_time_ms) << ",\n";
             f << "      " << JNum("probe_prepare_ms", qr.probe_prepare_ms) << ",\n";
             f << "      " << JNum("probe_prepare_rotation_ms", qr.probe_prepare_rotation_ms) << ",\n";
@@ -3448,6 +3329,7 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("probe_stage2_kernel_abs_fma_ms", qr.probe_stage2_kernel_abs_fma_ms) << ",\n";
             f << "      " << JNum("probe_stage2_kernel_tail_ms", qr.probe_stage2_kernel_tail_ms) << ",\n";
             f << "      " << JNum("probe_stage2_kernel_reduce_ms", qr.probe_stage2_kernel_reduce_ms) << ",\n";
+            f << "      " << JNum("probe_stage2_decode_ms", qr.probe_stage2_decode_ms) << ",\n";
             f << "      " << JNum("stage1_fused_blocks", qr.stage1_fused_blocks) << ",\n";
             f << "      " << JNum("stage1_fused_safeout_lanes", qr.stage1_fused_safeout_lanes) << ",\n";
             f << "      " << JNum("stage1_fused_safein_lanes", qr.stage1_fused_safein_lanes) << ",\n";
@@ -3455,6 +3337,9 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("stage2_lanes_requested", qr.stage2_lanes_requested) << ",\n";
             f << "      " << JNum("stage2_lanes_skipped", qr.stage2_lanes_skipped) << ",\n";
             f << "      " << JNum("stage2_lanes_total_valid", qr.stage2_lanes_total_valid) << ",\n";
+            f << "      " << JNum("stage2_decode_blocks", qr.stage2_decode_blocks) << ",\n";
+            f << "      " << JNum("stage2_decode_input_bytes", qr.stage2_decode_input_bytes) << ",\n";
+            f << "      " << JNum("stage2_decode_output_bytes", qr.stage2_decode_output_bytes) << ",\n";
             f << "      " << JNum("probe_classify_ms", qr.probe_classify_ms) << ",\n";
             f << "      " << JNum("probe_submit_ms", qr.probe_submit_ms) << ",\n";
             f << "      " << JNum("probe_submit_prepare_vec_only_ms", qr.probe_submit_prepare_vec_only_ms) << ",\n";
@@ -3463,8 +3348,6 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("probe_submit_vec_only_emit_ms", qr.probe_submit_vec_only_emit_ms) << ",\n";
             f << "      " << JNum("probe_submit_pending_slot_alloc_ms", qr.probe_submit_pending_slot_alloc_ms) << ",\n";
             f << "      " << JNum("probe_submit_prep_read_ms", qr.probe_submit_prep_read_ms) << ",\n";
-            f << "      " << JNum("prefetch_submit_ms", qr.prefetch_submit_ms) << ",\n";
-            f << "      " << JNum("prefetch_wait_ms", qr.prefetch_wait_ms) << ",\n";
             f << "      " << JNum("safein_payload_prefetch_ms", qr.safein_payload_prefetch_ms) << ",\n";
             f << "      " << JNum("candidate_collect_ms", qr.candidate_collect_ms) << ",\n";
             f << "      " << JNum("pool_vector_read_ms", qr.pool_vector_read_ms) << ",\n";

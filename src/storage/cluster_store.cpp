@@ -1,5 +1,6 @@
 #include "vdb/storage/cluster_store.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "vdb/simd/ip_exrabitq.h"
 #include "vdb/simd/popcount.h"
 #include "vdb/storage/pack_codes.h"
 
@@ -15,7 +17,8 @@ namespace vdb {
 namespace storage {
 
 static constexpr uint32_t kGlobalMagic = 0x4C4D4356;
-static constexpr uint32_t kFileVersion = 11;
+static constexpr uint32_t kFileVersion = 12;
+static constexpr uint32_t kFileVersionV11 = 11;
 static constexpr uint32_t kFileVersionV10 = 10;
 static constexpr uint32_t kFileVersionV9 = 9;
 static constexpr uint32_t kFileVersionV8 = 8;
@@ -38,15 +41,24 @@ inline uint32_t ExRaBitQDimBlock() {
     return 64;
 }
 
-inline uint32_t EffectiveWriterFileVersion() {
+inline bool SupportsPackedStage2MagnitudeBits(uint8_t bits) {
+    return bits == 2 || bits == 4;
+}
+
+inline uint32_t EffectiveWriterFileVersion(uint8_t bits) {
     const char* env = std::getenv("VDB_CLUSTER_STORE_VERSION");
     if (env == nullptr || env[0] == '\0') {
-        return kFileVersion;
+        return (bits > 1 && !SupportsPackedStage2MagnitudeBits(bits))
+            ? kFileVersionV11
+            : kFileVersion;
     }
     const long ver = std::strtol(env, nullptr, 10);
     if (ver == static_cast<long>(kFileVersionV10)) return kFileVersionV10;
+    if (ver == static_cast<long>(kFileVersionV11)) return kFileVersionV11;
     if (ver == static_cast<long>(kFileVersion)) return kFileVersion;
-    return kFileVersion;
+    return (bits > 1 && !SupportsPackedStage2MagnitudeBits(bits))
+        ? kFileVersionV11
+        : kFileVersion;
 }
 
 inline void WriteRaw(std::fstream& f, const void* data, size_t len) {
@@ -103,8 +115,9 @@ inline void PadTo4K(std::fstream& f, uint64_t& offset) {
 void BuildResidentParallelStage2View(const query::ParsedCluster& parsed,
                                      ClusterStoreReader::ResidentClusterView* view) {
     if (view == nullptr) return;
-    if (parsed.exrabitq_storage_version < 11 ||
+    if (parsed.exrabitq_storage_version < kFileVersionV11 ||
         parsed.exrabitq_batch_blocks == nullptr ||
+        parsed.exrabitq_magnitude_packed ||
         parsed.exrabitq_batch_size == 0 ||
         parsed.exrabitq_dim_block == 0 ||
         parsed.exrabitq_num_dim_blocks == 0 ||
@@ -165,6 +178,84 @@ void BuildResidentParallelStage2View(const query::ParsedCluster& parsed,
     }
 }
 
+bool UseCompactResidentPreload() {
+    const char* mode = std::getenv("VDB_RESIDENT_PRELOAD_MODE");
+    if (mode != nullptr && mode[0] != '\0') {
+        if (std::strcmp(mode, "full_file") == 0 ||
+            std::strcmp(mode, "legacy_full_file") == 0 ||
+            std::strcmp(mode, "legacy") == 0) {
+            return false;
+        }
+        return true;
+    }
+    const char* compact = std::getenv("VDB_COMPACT_RESIDENT_PRELOAD");
+    if (compact != nullptr &&
+        (std::strcmp(compact, "0") == 0 ||
+         std::strcmp(compact, "false") == 0 ||
+         std::strcmp(compact, "off") == 0)) {
+        return false;
+    }
+    return true;
+}
+
+void CopyParsedMetadataToResident(const query::ParsedCluster& parsed,
+                                  ClusterStoreReader::ResidentClusterView* view) {
+    view->fastscan_block_size = parsed.fastscan_block_size;
+    view->num_fastscan_blocks = parsed.num_fastscan_blocks;
+    view->exrabitq_entry_size = parsed.exrabitq_entry_size;
+    view->exrabitq_sign_bytes = parsed.exrabitq_sign_bytes;
+    view->exrabitq_sign_packed = parsed.exrabitq_sign_packed;
+    view->exrabitq_storage_version = parsed.exrabitq_storage_version;
+    view->exrabitq_batch_block_size = parsed.exrabitq_batch_block_size;
+    view->exrabitq_batch_size = parsed.exrabitq_batch_size;
+    view->exrabitq_dim_block = parsed.exrabitq_dim_block;
+    view->exrabitq_num_dim_blocks = parsed.exrabitq_num_dim_blocks;
+    view->exrabitq_num_batch_blocks = parsed.exrabitq_num_batch_blocks;
+    view->exrabitq_abs_bytes_per_lane_dim_block =
+        parsed.exrabitq_abs_bytes_per_lane_dim_block;
+    view->exrabitq_magnitude_bits = parsed.exrabitq_magnitude_bits;
+    view->exrabitq_magnitude_packed = parsed.exrabitq_magnitude_packed;
+    view->num_records = parsed.num_records;
+    view->epsilon = parsed.epsilon;
+    view->address_page_size = parsed.address_page_size;
+}
+
+void RelocateResidentCodePointers(const query::ParsedCluster& parsed,
+                                  ClusterStoreReader::ResidentClusterView* view) {
+    const uint8_t* base = view->code_storage.empty() ? nullptr
+                                                     : view->code_storage.data();
+    view->fastscan_blocks = base == nullptr ? nullptr
+                                            : base + parsed.fastscan_region_offset;
+    view->exrabitq_entries =
+        (base != nullptr && parsed.exrabitq_entries != nullptr)
+            ? base + parsed.exrabitq_region_offset
+            : nullptr;
+    view->exrabitq_batch_blocks =
+        (base != nullptr && parsed.exrabitq_batch_blocks != nullptr)
+            ? base + parsed.exrabitq_region_offset
+            : nullptr;
+}
+
+ClusterStoreReader::ResidentClusterView MakeCompactResidentView(
+    query::ParsedCluster& parsed) {
+    ClusterStoreReader::ResidentClusterView view;
+    CopyParsedMetadataToResident(parsed, &view);
+    if (parsed.code_region_bytes > 0) {
+        view.code_storage.assign(parsed.fastscan_blocks,
+                                 parsed.fastscan_blocks + parsed.code_region_bytes);
+    }
+    view.code_storage_bytes = static_cast<uint64_t>(view.code_storage.size());
+    RelocateResidentCodePointers(parsed, &view);
+    view.raw_addresses = nullptr;
+    view.addresses_are_raw_v2 = false;
+    view.raw_address_bytes = 0;
+    view.decoded_addresses = std::move(parsed.decoded_addresses);
+    view.decoded_address_bytes =
+        static_cast<uint64_t>(view.decoded_addresses.size()) *
+        sizeof(AddressEntry);
+    return view;
+}
+
 }  // namespace
 
 ClusterStoreWriter::ClusterStoreWriter() = default;
@@ -198,12 +289,18 @@ Status ClusterStoreWriter::Open(const std::string& path,
     in_cluster_ = false;
     finalized_ = false;
 
+    const uint32_t file_version = EffectiveWriterFileVersion(rabitq_config.bits);
+    if (file_version >= kFileVersion && rabitq_config.bits > 1 &&
+        !SupportsPackedStage2MagnitudeBits(rabitq_config.bits)) {
+        return Status::InvalidArgument(
+            "Packed ExRaBitQ Stage2 magnitude supports only bits=2 or bits=4");
+    }
+
     file_.open(path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
     if (!file_.is_open()) {
         return Status::IOError("Failed to open ClusterStore: " + path);
     }
 
-    const uint32_t file_version = EffectiveWriterFileVersion();
     WriteVal(file_, kGlobalMagic);
     WriteVal(file_, file_version);
     WriteVal(file_, num_clusters);
@@ -306,14 +403,26 @@ Status ClusterStoreWriter::WriteVectors(
         static_cast<uint32_t>(current_offset_ - block_start_);
 
     if (info_.rabitq_config.bits > 1) {
+        const uint32_t writer_version =
+            EffectiveWriterFileVersion(info_.rabitq_config.bits);
+        if (writer_version >= kFileVersion &&
+            !SupportsPackedStage2MagnitudeBits(info_.rabitq_config.bits)) {
+            return Status::InvalidArgument(
+                "Packed ExRaBitQ Stage2 magnitude supports only bits=2 or bits=4");
+        }
+        const bool pack_stage2_magnitude = writer_version >= kFileVersion;
         const uint32_t sign_bytes =
             PackedSignBytes(dim);
-        if (EffectiveWriterFileVersion() >= 11) {
+        if (writer_version >= kFileVersionV11) {
             const uint32_t batch_size = ExRaBitQBatchSize();
             const uint32_t dim_block = ExRaBitQDimBlock();
             const uint32_t num_dim_blocks = (dim + dim_block - 1) / dim_block;
             const uint32_t num_batch_blocks = (N + batch_size - 1) / batch_size;
             const uint32_t sign_block_bytes = dim_block / 8;
+            const uint32_t abs_lane_bytes = pack_stage2_magnitude
+                ? simd::ExRaBitQPackedMagnitudeBytes(
+                      dim_block, info_.rabitq_config.bits)
+                : dim_block;
 
             for (uint32_t bb = 0; bb < num_batch_blocks; ++bb) {
                 const uint32_t start = bb * batch_size;
@@ -334,17 +443,33 @@ Status ClusterStoreWriter::WriteVectors(
                             const uint32_t copy = std::min(dim_block, dim - dim_start);
                             std::memcpy(abs_buf, code.ex_code.data() + dim_start, copy);
                         }
-                        WriteRaw(file_, abs_buf, dim_block);
+                        if (pack_stage2_magnitude) {
+                            uint8_t packed_abs_buf[32] = {0};
+                            if (!simd::ExRaBitQPackMagnitudes(
+                                    abs_buf, dim_block, info_.rabitq_config.bits,
+                                    packed_abs_buf, abs_lane_bytes)) {
+                                return Status::InvalidArgument(
+                                    "ExRaBitQ code contains value outside bit-width range");
+                            }
+                            WriteRaw(file_, packed_abs_buf, abs_lane_bytes);
+                        } else {
+                            WriteRaw(file_, abs_buf, dim_block);
+                        }
                     }
                 }
                 for (uint32_t db = 0; db < num_dim_blocks; ++db) {
                     const uint32_t dim_start = db * dim_block;
+                    const uint32_t sign_offset = dim_start / 8;
+                    const uint32_t sign_copy =
+                        sign_offset < sign_bytes
+                            ? std::min(sign_block_bytes, sign_bytes - sign_offset)
+                            : 0;
                     for (uint32_t lane = 0; lane < batch_size; ++lane) {
                         uint8_t sign_buf[8] = {0};
-                        if (lane < valid_count) {
+                        if (lane < valid_count && sign_copy > 0) {
                             const auto& code = codes[start + lane];
-                            const uint8_t* src = code.ex_sign_packed.data() + dim_start / 8;
-                            std::memcpy(sign_buf, src, sign_block_bytes);
+                            const uint8_t* src = code.ex_sign_packed.data() + sign_offset;
+                            std::memcpy(sign_buf, src, sign_copy);
                         }
                         WriteRaw(file_, sign_buf, sign_block_bytes);
                     }
@@ -359,7 +484,7 @@ Status ClusterStoreWriter::WriteVectors(
                 }
                 const uint32_t block_bytes =
                     sizeof(uint32_t) +
-                    num_dim_blocks * batch_size * dim_block +
+                    num_dim_blocks * batch_size * abs_lane_bytes +
                     num_dim_blocks * batch_size * sign_block_bytes +
                     batch_size * sizeof(float);
                 current_offset_ += block_bytes;
@@ -449,14 +574,20 @@ Status ClusterStoreWriter::EndCluster() {
     const uint64_t trailer_start = current_offset_;
     uint32_t ex_region_bytes = 0;
     if (info_.rabitq_config.bits > 1) {
-        if (EffectiveWriterFileVersion() >= 11) {
+        const uint32_t writer_version =
+            EffectiveWriterFileVersion(info_.rabitq_config.bits);
+        if (writer_version >= kFileVersionV11) {
             const uint32_t batch_size = ExRaBitQBatchSize();
             const uint32_t dim_block = ExRaBitQDimBlock();
             const uint32_t num_dim_blocks = (info_.dim + dim_block - 1) / dim_block;
             const uint32_t sign_block_bytes = dim_block / 8;
+            const uint32_t abs_lane_bytes = writer_version >= kFileVersion
+                ? simd::ExRaBitQPackedMagnitudeBytes(
+                      dim_block, info_.rabitq_config.bits)
+                : dim_block;
             const uint32_t batch_block_size =
                 sizeof(uint32_t) +
-                num_dim_blocks * batch_size * dim_block +
+                num_dim_blocks * batch_size * abs_lane_bytes +
                 num_dim_blocks * batch_size * sign_block_bytes +
                 batch_size * sizeof(float);
             ex_region_bytes =
@@ -581,6 +712,15 @@ ClusterStoreReader::ClusterStoreReader(ClusterStoreReader&& other) noexcept
       resident_preload_ready_(other.resident_preload_ready_),
       resident_preload_bytes_(other.resident_preload_bytes_),
       resident_cluster_mem_bytes_(other.resident_cluster_mem_bytes_),
+      resident_file_size_bytes_(other.resident_file_size_bytes_),
+      resident_file_buffer_bytes_(other.resident_file_buffer_bytes_),
+      resident_code_storage_bytes_(other.resident_code_storage_bytes_),
+      resident_decoded_address_bytes_(other.resident_decoded_address_bytes_),
+      resident_raw_address_bytes_(other.resident_raw_address_bytes_),
+      resident_parsed_address_duplicate_bytes_(
+          other.resident_parsed_address_duplicate_bytes_),
+      resident_preload_batch_size_(other.resident_preload_batch_size_),
+      resident_preload_mode_(std::move(other.resident_preload_mode_)),
       resident_preload_time_ms_(other.resident_preload_time_ms_),
       resident_parallel_view_bytes_(other.resident_parallel_view_bytes_),
       resident_parallel_view_build_ms_(other.resident_parallel_view_build_ms_) {
@@ -588,6 +728,14 @@ ClusterStoreReader::ClusterStoreReader(ClusterStoreReader&& other) noexcept
     other.resident_preload_ready_ = false;
     other.resident_preload_bytes_ = 0;
     other.resident_cluster_mem_bytes_ = 0;
+    other.resident_file_size_bytes_ = 0;
+    other.resident_file_buffer_bytes_ = 0;
+    other.resident_code_storage_bytes_ = 0;
+    other.resident_decoded_address_bytes_ = 0;
+    other.resident_raw_address_bytes_ = 0;
+    other.resident_parsed_address_duplicate_bytes_ = 0;
+    other.resident_preload_batch_size_ = 0;
+    other.resident_preload_mode_.clear();
     other.resident_preload_time_ms_ = 0.0;
     other.resident_parallel_view_bytes_ = 0;
     other.resident_parallel_view_build_ms_ = 0.0;
@@ -607,6 +755,15 @@ ClusterStoreReader& ClusterStoreReader::operator=(
         resident_preload_ready_ = other.resident_preload_ready_;
         resident_preload_bytes_ = other.resident_preload_bytes_;
         resident_cluster_mem_bytes_ = other.resident_cluster_mem_bytes_;
+        resident_file_size_bytes_ = other.resident_file_size_bytes_;
+        resident_file_buffer_bytes_ = other.resident_file_buffer_bytes_;
+        resident_code_storage_bytes_ = other.resident_code_storage_bytes_;
+        resident_decoded_address_bytes_ = other.resident_decoded_address_bytes_;
+        resident_raw_address_bytes_ = other.resident_raw_address_bytes_;
+        resident_parsed_address_duplicate_bytes_ =
+            other.resident_parsed_address_duplicate_bytes_;
+        resident_preload_batch_size_ = other.resident_preload_batch_size_;
+        resident_preload_mode_ = std::move(other.resident_preload_mode_);
         resident_preload_time_ms_ = other.resident_preload_time_ms_;
         resident_parallel_view_bytes_ = other.resident_parallel_view_bytes_;
         resident_parallel_view_build_ms_ = other.resident_parallel_view_build_ms_;
@@ -614,6 +771,14 @@ ClusterStoreReader& ClusterStoreReader::operator=(
         other.resident_preload_ready_ = false;
         other.resident_preload_bytes_ = 0;
         other.resident_cluster_mem_bytes_ = 0;
+        other.resident_file_size_bytes_ = 0;
+        other.resident_file_buffer_bytes_ = 0;
+        other.resident_code_storage_bytes_ = 0;
+        other.resident_decoded_address_bytes_ = 0;
+        other.resident_raw_address_bytes_ = 0;
+        other.resident_parsed_address_duplicate_bytes_ = 0;
+        other.resident_preload_batch_size_ = 0;
+        other.resident_preload_mode_.clear();
         other.resident_preload_time_ms_ = 0.0;
         other.resident_parallel_view_bytes_ = 0;
         other.resident_parallel_view_build_ms_ = 0.0;
@@ -633,6 +798,14 @@ void ClusterStoreReader::Close() {
     resident_preload_ready_ = false;
     resident_preload_bytes_ = 0;
     resident_cluster_mem_bytes_ = 0;
+    resident_file_size_bytes_ = 0;
+    resident_file_buffer_bytes_ = 0;
+    resident_code_storage_bytes_ = 0;
+    resident_decoded_address_bytes_ = 0;
+    resident_raw_address_bytes_ = 0;
+    resident_parsed_address_duplicate_bytes_ = 0;
+    resident_preload_batch_size_ = 0;
+    resident_preload_mode_.clear();
     resident_preload_time_ms_ = 0.0;
     resident_parallel_view_bytes_ = 0;
     resident_parallel_view_build_ms_ = 0.0;
@@ -678,7 +851,8 @@ Status ClusterStoreReader::Open(const std::string& path, bool use_direct_io) {
         }
         std::memcpy(&version, p, 4);
         p += 4;
-        if (version != kFileVersion && version != kFileVersionV10 && version != kFileVersionV9 &&
+        if (version != kFileVersion && version != kFileVersionV11 &&
+            version != kFileVersionV10 && version != kFileVersionV9 &&
             version != kFileVersionV8 &&
             version != kFileVersionV7) {
             std::free(hdr_buf);
@@ -698,6 +872,13 @@ Status ClusterStoreReader::Open(const std::string& path, bool use_direct_io) {
         p += 4;
         std::memcpy(&info_.rabitq_config.c_factor, p, 4);
         p += 4;
+        if (version >= kFileVersion && info_.rabitq_config.bits > 1 &&
+            !SupportsPackedStage2MagnitudeBits(info_.rabitq_config.bits)) {
+            std::free(hdr_buf);
+            Close();
+            return Status::NotSupported(
+                "Packed ExRaBitQ Stage2 magnitude supports only bits=2 or bits=4");
+        }
 
         uint32_t path_len = 0;
         std::memcpy(&path_len, p, 4);
@@ -937,7 +1118,7 @@ Status ClusterStoreReader::EnsureClusterLoaded(uint32_t cluster_id) {
     data.codes_offset = entry.block_offset;
     const uint32_t region1_size = entry.num_fastscan_blocks * fastscan_block_bytes();
     const uint32_t region2_size =
-        (file_version_ >= kFileVersion)
+        (file_version_ >= kFileVersionV11)
             ? exrabitq_num_batch_blocks(entry.num_records) * exrabitq_batch_block_size()
             : entry.num_records * exrabitq_entry_size();
     data.codes_length = region1_size + region2_size;
@@ -1151,7 +1332,7 @@ Status ClusterStoreReader::ParseClusterBlockView(
     const uint32_t region1_size = entry.num_fastscan_blocks * fb_size;
     const uint32_t ex_entry_size = exrabitq_entry_size();
     const uint32_t region2_size =
-        (file_version_ >= kFileVersion)
+        (file_version_ >= kFileVersionV11)
             ? exrabitq_num_batch_blocks(entry.num_records) * exrabitq_batch_block_size()
             : entry.num_records * ex_entry_size;
     const uint32_t codes_length = region1_size + region2_size;
@@ -1216,7 +1397,7 @@ Status ClusterStoreReader::ParseClusterBlockView(
     out.exrabitq_sign_packed = (file_version_ >= kFileVersionV10);
     out.exrabitq_storage_version = file_version_;
     out.exrabitq_batch_blocks =
-        (file_version_ >= kFileVersion && info_.rabitq_config.bits > 1)
+        (file_version_ >= kFileVersionV11 && info_.rabitq_config.bits > 1)
             ? block_ptr + region1_size
             : nullptr;
     out.exrabitq_batch_block_size = exrabitq_batch_block_size();
@@ -1224,12 +1405,28 @@ Status ClusterStoreReader::ParseClusterBlockView(
     out.exrabitq_dim_block = exrabitq_dim_block();
     out.exrabitq_num_dim_blocks = exrabitq_dim_block_count();
     out.exrabitq_num_batch_blocks = exrabitq_num_batch_blocks(entry.num_records);
+    out.exrabitq_abs_bytes_per_lane_dim_block =
+        exrabitq_abs_bytes_per_lane_dim_block();
+    out.exrabitq_magnitude_bits = info_.rabitq_config.bits;
+    out.exrabitq_magnitude_packed = exrabitq_magnitude_packed();
     out.num_records = entry.num_records;
     out.epsilon = entry.epsilon;
     out.raw_addresses = raw_addresses;
     out.address_page_size = address_page_size;
     out.addresses_are_raw_v2 = addresses_are_raw_v2;
     out.decoded_addresses = std::move(decoded);
+    out.decoded_addresses_data =
+        out.decoded_addresses.empty() ? nullptr : out.decoded_addresses.data();
+    out.decoded_address_count =
+        static_cast<uint32_t>(out.decoded_addresses.size());
+    out.fastscan_region_offset = 0;
+    out.exrabitq_region_offset = region1_size;
+    out.code_region_bytes = codes_length;
+    out.address_payload_offset =
+        addresses_are_raw_v2 ? v9_payload_offset : codes_length;
+    out.address_payload_bytes = expected_payload_bytes;
+    out.mini_trailer_offset = block_size - mini_trailer_size;
+    out.mini_trailer_size = mini_trailer_size;
     out.codes_start = out.fastscan_blocks;
     out.code_entry_size = 0;
     return Status::OK();
@@ -1260,6 +1457,123 @@ Status ClusterStoreReader::PreloadAllClusters() {
         return Status::IOError("Failed to determine .clu file size");
     }
 
+    if (UseCompactResidentPreload()) {
+        std::map<uint32_t, ResidentClusterView> resident_clusters;
+        std::map<uint32_t, query::ParsedCluster> resident_parsed_clusters;
+        uint64_t resident_cluster_mem_bytes = 0;
+        uint64_t resident_parallel_view_bytes = 0;
+        uint64_t resident_code_storage_bytes = 0;
+        uint64_t resident_decoded_address_bytes = 0;
+        uint64_t resident_preload_bytes = 0;
+        double parallel_build_ms = 0.0;
+
+        std::vector<const ClusterStoreWriter::ClusterLookupEntry*> ordered;
+        ordered.reserve(info_.lookup_table.size());
+        for (const auto& entry : info_.lookup_table) {
+            if (entry.block_offset + entry.block_size >
+                static_cast<uint64_t>(file_size)) {
+                return Status::Corruption("Cluster block exceeds .clu file size");
+            }
+            ordered.push_back(&entry);
+        }
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const auto* a, const auto* b) {
+                      return a->block_offset < b->block_offset;
+                  });
+
+        constexpr size_t kBatchSize = 16;
+        constexpr uint64_t kMaxSpanWasteRatio = 4;
+        size_t i = 0;
+        while (i < ordered.size()) {
+            size_t batch_end = i + 1;
+            uint64_t span_begin = ordered[i]->block_offset;
+            uint64_t span_end = ordered[i]->block_offset + ordered[i]->block_size;
+            uint64_t used_bytes = ordered[i]->block_size;
+
+            while (batch_end < ordered.size() && batch_end - i < kBatchSize) {
+                const auto* next = ordered[batch_end];
+                const uint64_t next_end = next->block_offset + next->block_size;
+                const uint64_t candidate_span_end = std::max(span_end, next_end);
+                const uint64_t candidate_used = used_bytes + next->block_size;
+                const uint64_t candidate_span = candidate_span_end - span_begin;
+                if (candidate_span > candidate_used * kMaxSpanWasteRatio) {
+                    break;
+                }
+                span_end = candidate_span_end;
+                used_bytes = candidate_used;
+                ++batch_end;
+            }
+
+            const uint64_t span_bytes = span_end - span_begin;
+            std::vector<uint8_t> batch_buffer(static_cast<size_t>(span_bytes));
+            if (span_bytes > 0 &&
+                !PreadBytes(fd_, static_cast<off_t>(span_begin),
+                            batch_buffer.data(), batch_buffer.size())) {
+                return Status::IOError("Failed to batch-read resident cluster blocks");
+            }
+            resident_preload_bytes += span_bytes;
+
+            for (size_t j = i; j < batch_end; ++j) {
+                const auto* entry = ordered[j];
+                const uint64_t relative = entry->block_offset - span_begin;
+                if (relative + entry->block_size > span_bytes) {
+                    return Status::Corruption("Cluster block exceeds preload batch buffer");
+                }
+                query::ParsedCluster parsed;
+                const uint8_t* block_ptr =
+                    batch_buffer.data() + static_cast<size_t>(relative);
+                VDB_RETURN_IF_ERROR(ParseClusterBlockView(
+                    entry->cluster_id, block_ptr, entry->block_size, parsed));
+                ResidentClusterView view = MakeCompactResidentView(parsed);
+                auto pb0 = std::chrono::steady_clock::now();
+                BuildResidentParallelStage2View(parsed, &view);
+                parallel_build_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - pb0).count();
+                const uint64_t parallel_bytes =
+                    static_cast<uint64_t>(view.exrabitq_parallel_abs_blocks_storage.size()) +
+                    static_cast<uint64_t>(view.exrabitq_parallel_sign_words_storage.size()) *
+                        sizeof(uint16_t);
+                resident_parallel_view_bytes += parallel_bytes;
+                resident_code_storage_bytes += view.code_storage_bytes;
+                resident_decoded_address_bytes += view.decoded_address_bytes;
+
+                auto inserted =
+                    resident_clusters.emplace(entry->cluster_id, std::move(view));
+                if (!inserted.second) {
+                    return Status::Corruption("Duplicate resident cluster");
+                }
+                resident_cluster_mem_bytes += inserted.first->second.code_storage_bytes;
+                resident_cluster_mem_bytes +=
+                    inserted.first->second.decoded_address_bytes;
+                resident_cluster_mem_bytes += parallel_bytes;
+                resident_parsed_clusters.emplace(
+                    entry->cluster_id, inserted.first->second.ToParsedCluster());
+            }
+            i = batch_end;
+        }
+
+        resident_file_buffer_.clear();
+        resident_file_buffer_.shrink_to_fit();
+        resident_clusters_ = std::move(resident_clusters);
+        resident_parsed_clusters_ = std::move(resident_parsed_clusters);
+        resident_preload_ready_ = true;
+        resident_preload_bytes_ = resident_preload_bytes;
+        resident_cluster_mem_bytes_ = resident_cluster_mem_bytes;
+        resident_file_size_bytes_ = static_cast<uint64_t>(file_size);
+        resident_file_buffer_bytes_ = 0;
+        resident_code_storage_bytes_ = resident_code_storage_bytes;
+        resident_decoded_address_bytes_ = resident_decoded_address_bytes;
+        resident_raw_address_bytes_ = 0;
+        resident_parsed_address_duplicate_bytes_ = 0;
+        resident_preload_batch_size_ = 16;
+        resident_preload_mode_ = "compact_batched";
+        resident_preload_time_ms_ = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+        resident_parallel_view_bytes_ = resident_parallel_view_bytes;
+        resident_parallel_view_build_ms_ = parallel_build_ms;
+        return Status::OK();
+    }
+
     resident_file_buffer_.resize(static_cast<size_t>(file_size));
     if (file_size > 0 &&
         !PreadBytes(fd_, 0, resident_file_buffer_.data(),
@@ -1272,6 +1586,8 @@ Status ClusterStoreReader::PreloadAllClusters() {
     std::map<uint32_t, query::ParsedCluster> resident_parsed_clusters;
     uint64_t resident_cluster_mem_bytes = 0;
     uint64_t resident_parallel_view_bytes = 0;
+    uint64_t resident_decoded_address_bytes = 0;
+    uint64_t resident_raw_address_bytes = 0;
     auto parallel_build_start = std::chrono::steady_clock::now();
     for (const auto& entry : info_.lookup_table) {
         if (entry.block_offset + entry.block_size >
@@ -1301,20 +1617,29 @@ Status ClusterStoreReader::PreloadAllClusters() {
         view.exrabitq_dim_block = parsed.exrabitq_dim_block;
         view.exrabitq_num_dim_blocks = parsed.exrabitq_num_dim_blocks;
         view.exrabitq_num_batch_blocks = parsed.exrabitq_num_batch_blocks;
+        view.exrabitq_abs_bytes_per_lane_dim_block =
+            parsed.exrabitq_abs_bytes_per_lane_dim_block;
+        view.exrabitq_magnitude_bits = parsed.exrabitq_magnitude_bits;
+        view.exrabitq_magnitude_packed = parsed.exrabitq_magnitude_packed;
         view.num_records = parsed.num_records;
         view.epsilon = parsed.epsilon;
         view.raw_addresses = parsed.raw_addresses;
         view.address_page_size = parsed.address_page_size;
         view.addresses_are_raw_v2 = parsed.addresses_are_raw_v2;
         view.decoded_addresses = parsed.decoded_addresses;
+        view.decoded_address_bytes =
+            static_cast<uint64_t>(view.decoded_addresses.size()) * sizeof(AddressEntry);
+        view.raw_address_bytes = parsed.address_payload_bytes;
         BuildResidentParallelStage2View(parsed, &view);
         resident_parallel_view_bytes +=
             static_cast<uint64_t>(view.exrabitq_parallel_abs_blocks_storage.size());
         resident_parallel_view_bytes +=
             static_cast<uint64_t>(view.exrabitq_parallel_sign_words_storage.size()) *
             sizeof(uint16_t);
+        resident_decoded_address_bytes +=
+            static_cast<uint64_t>(view.decoded_addresses.size()) * sizeof(AddressEntry);
+        resident_raw_address_bytes += parsed.address_payload_bytes;
         auto inserted = resident_clusters.emplace(entry.cluster_id, std::move(view));
-        resident_cluster_mem_bytes += entry.block_size;
         resident_cluster_mem_bytes +=
             static_cast<uint64_t>(parsed.decoded_addresses.size()) *
             sizeof(AddressEntry);
@@ -1331,7 +1656,16 @@ Status ClusterStoreReader::PreloadAllClusters() {
     resident_parsed_clusters_ = std::move(resident_parsed_clusters);
     resident_preload_ready_ = true;
     resident_preload_bytes_ = static_cast<uint64_t>(resident_file_buffer_.size());
-    resident_cluster_mem_bytes_ = resident_cluster_mem_bytes;
+    resident_cluster_mem_bytes_ =
+        resident_cluster_mem_bytes + static_cast<uint64_t>(resident_file_buffer_.size());
+    resident_file_size_bytes_ = static_cast<uint64_t>(file_size);
+    resident_file_buffer_bytes_ = static_cast<uint64_t>(resident_file_buffer_.size());
+    resident_code_storage_bytes_ = 0;
+    resident_decoded_address_bytes_ = resident_decoded_address_bytes;
+    resident_raw_address_bytes_ = resident_raw_address_bytes;
+    resident_parsed_address_duplicate_bytes_ = 0;
+    resident_preload_batch_size_ = 0;
+    resident_preload_mode_ = "full_file";
     resident_preload_time_ms_ = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
     resident_parallel_view_bytes_ = resident_parallel_view_bytes;
@@ -1457,15 +1791,16 @@ Status ClusterStoreReader::LoadCodes(
             out_codes[i].sum_x += __builtin_popcountll(w);
         }
 
-        if (file_version_ >= kFileVersion || ex_entry_sz > 0) {
+        if (file_version_ >= kFileVersionV11 || ex_entry_sz > 0) {
             const uint32_t region1_size = entry.num_fastscan_blocks * fb_bytes;
             const uint32_t sign_bytes = exrabitq_sign_bytes();
             out_codes[i].ex_sign_packed.resize(PackedSignBytes(dim));
-            if (file_version_ >= kFileVersion) {
+            if (file_version_ >= kFileVersionV11) {
                 const uint32_t batch_size = exrabitq_batch_size();
                 const uint32_t dim_block = exrabitq_dim_block();
                 const uint32_t num_dim_blocks = exrabitq_dim_block_count();
                 const uint32_t sign_block_bytes = dim_block / 8;
+                const uint32_t abs_lane_bytes = exrabitq_abs_bytes_per_lane_dim_block();
                 const uint32_t batch_block_size = exrabitq_batch_block_size();
                 const uint32_t block_id = indices[i] / batch_size;
                 const uint32_t lane_id = indices[i] % batch_size;
@@ -1475,7 +1810,7 @@ Status ClusterStoreReader::LoadCodes(
                 const uint8_t* payload = block + sizeof(uint32_t);
                 const uint8_t* abs_base = payload;
                 const uint8_t* sign_base =
-                    abs_base + num_dim_blocks * batch_size * dim_block;
+                    abs_base + num_dim_blocks * batch_size * abs_lane_bytes;
                 out_codes[i].ex_code.resize(dim);
                 std::fill(out_codes[i].ex_sign_packed.begin(),
                           out_codes[i].ex_sign_packed.end(), 0);
@@ -1483,14 +1818,37 @@ Status ClusterStoreReader::LoadCodes(
                     const uint32_t dim_start = db * dim_block;
                     const uint32_t copy = std::min(dim_block, dim - dim_start);
                     const uint8_t* abs_ptr =
-                        abs_base + static_cast<size_t>(db) * batch_size * dim_block +
-                        lane_id * dim_block;
-                    std::memcpy(out_codes[i].ex_code.data() + dim_start, abs_ptr, copy);
+                        abs_base + static_cast<size_t>(db) * batch_size * abs_lane_bytes +
+                        lane_id * abs_lane_bytes;
+                    if (exrabitq_magnitude_packed()) {
+                        uint8_t unpacked_abs[64] = {0};
+                        if (!simd::ExRaBitQUnpackMagnitudes(
+                                abs_ptr, dim_block, info_.rabitq_config.bits,
+                                unpacked_abs)) {
+                            return Status::Corruption(
+                                "Failed to unpack ExRaBitQ packed magnitude block");
+                        }
+                        std::memcpy(out_codes[i].ex_code.data() + dim_start,
+                                    unpacked_abs, copy);
+                    } else {
+                        std::memcpy(out_codes[i].ex_code.data() + dim_start,
+                                    abs_ptr, copy);
+                    }
                     const uint8_t* sign_ptr =
                         sign_base + static_cast<size_t>(db) * batch_size * sign_block_bytes +
                         lane_id * sign_block_bytes;
-                    std::memcpy(out_codes[i].ex_sign_packed.data() + dim_start / 8,
-                                sign_ptr, sign_block_bytes);
+                    const uint32_t sign_offset = dim_start / 8;
+                    const uint32_t sign_copy =
+                        sign_offset < out_codes[i].ex_sign_packed.size()
+                            ? std::min<uint32_t>(
+                                  sign_block_bytes,
+                                  static_cast<uint32_t>(
+                                      out_codes[i].ex_sign_packed.size() - sign_offset))
+                            : 0;
+                    if (sign_copy > 0) {
+                        std::memcpy(out_codes[i].ex_sign_packed.data() + sign_offset,
+                                    sign_ptr, sign_copy);
+                    }
                 }
                 const float* xipnorms = reinterpret_cast<const float*>(
                     block + batch_block_size - batch_size * sizeof(float));
