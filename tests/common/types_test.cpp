@@ -262,6 +262,11 @@ TEST(TypesTest, RaBitQConfigDefaults) {
   EXPECT_EQ(config.bits, 1);
   EXPECT_EQ(config.block_size, 64u);
   EXPECT_FLOAT_EQ(config.c_factor, 5.75f);
+  EXPECT_EQ(config.effective_total_bits(), 1u);
+  EXPECT_EQ(config.stage2_payload_bits(), 0u);
+  EXPECT_EQ(config.active_code_bits(), 1u);
+  EXPECT_EQ(config.estimator_mode, RaBitQEstimatorMode::kLegacySignedMagnitude);
+  EXPECT_EQ(config.exdata_layout, RaBitQExDataLayout::kGenericPacked);
 }
 
 TEST(TypesTest, RaBitQConfigEquality) {
@@ -278,6 +283,91 @@ TEST(TypesTest, RaBitQConfigCustom) {
   EXPECT_EQ(config.bits, 4);
   EXPECT_EQ(config.block_size, 128u);
   EXPECT_FLOAT_EQ(config.c_factor, 3.0f);
+  EXPECT_EQ(config.effective_total_bits(), 4u);
+  EXPECT_EQ(config.stage2_payload_bits(), 4u);
+  EXPECT_EQ(config.active_code_bits(), 4u);
+}
+
+TEST(TypesTest, RaBitQConfigOfficialBitSemantics) {
+  RaBitQConfig config;
+  config.total_bits = 4;
+  config.ex_bits = 3;
+  config.estimator_mode = RaBitQEstimatorMode::kOfficial1PlusN;
+
+  EXPECT_TRUE(config.uses_official_1_plus_n());
+  EXPECT_EQ(config.effective_total_bits(), 4u);
+  EXPECT_EQ(config.stage2_payload_bits(), 3u);
+  EXPECT_EQ(config.active_code_bits(), 3u);
+  EXPECT_TRUE(config.official_bits_valid());
+  EXPECT_EQ(RaBitQEstimatorModeName(config.estimator_mode), "official_1_plus_n");
+  EXPECT_EQ(RaBitQFormatKey(config), "official_1_plus_n_total4_ex3");
+
+  config.exdata_layout = RaBitQExDataLayout::kSplit3TwoPlusOne;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kSplit3TwoPlusOne);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total4_ex3_split3_2plus1");
+
+  config.exdata_layout = RaBitQExDataLayout::kSplit3Bitplanes;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total4_ex3_split3_bitplanes");
+
+  config.ex_bits = 2;
+  config.total_bits = 3;
+  EXPECT_FALSE(config.exdata_layout_valid());
+
+  config.exdata_layout = RaBitQExDataLayout::kSplit2Bitplanes;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kSplit2Bitplanes);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total3_ex2_split2_bitplanes");
+
+  config.ex_bits = 1;
+  config.total_bits = 2;
+  config.exdata_layout = RaBitQExDataLayout::kSplit1Bitplane;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kSplit1Bitplane);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total2_ex1_split1_bitplane");
+
+  config.exdata_layout = RaBitQExDataLayout::kSelectedDirect;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kSplit1Bitplane);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total2_ex1_split1_bitplane");
+}
+
+TEST(TypesTest, RaBitQEstimatorModeParser) {
+  RaBitQEstimatorMode mode = RaBitQEstimatorMode::kLegacySignedMagnitude;
+  EXPECT_TRUE(ParseRaBitQEstimatorMode("official", &mode));
+  EXPECT_EQ(mode, RaBitQEstimatorMode::kOfficial1PlusN);
+  EXPECT_TRUE(ParseRaBitQEstimatorMode("legacy_signed_magnitude", &mode));
+  EXPECT_EQ(mode, RaBitQEstimatorMode::kLegacySignedMagnitude);
+  EXPECT_FALSE(ParseRaBitQEstimatorMode("auto", &mode));
+}
+
+TEST(TypesTest, RaBitQExDataLayoutParser) {
+  RaBitQExDataLayout layout = RaBitQExDataLayout::kGenericPacked;
+  EXPECT_TRUE(ParseRaBitQExDataLayout("split3_2plus1", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kSplit3TwoPlusOne);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("1plus1plus1", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kSplit3Bitplanes);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("1plus1", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kSplit2Bitplanes);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("split1_bitplane", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kSplit1Bitplane);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("selected_direct", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kSelectedDirect);
+  EXPECT_EQ(RaBitQResolveSelectedExDataLayout(layout),
+            RaBitQExDataLayout::kSplit3Bitplanes);
+  EXPECT_EQ(RaBitQResolveSelectedExDataLayoutForBits(layout, 1),
+            RaBitQExDataLayout::kSplit1Bitplane);
+  EXPECT_EQ(RaBitQResolveSelectedExDataLayoutForBits(layout, 2),
+            RaBitQExDataLayout::kSplit2Bitplanes);
+  EXPECT_EQ(RaBitQResolveSelectedExDataLayoutForBits(layout, 3),
+            RaBitQExDataLayout::kSplit3Bitplanes);
+  EXPECT_FALSE(ParseRaBitQExDataLayout("packed3", &layout));
 }
 
 }  // namespace

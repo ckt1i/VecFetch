@@ -416,21 +416,274 @@ struct Candidate {
   }
 };
 
+enum class RaBitQEstimatorMode : uint8_t {
+  kLegacySignedMagnitude = 0,
+  kOfficial1PlusN = 1,
+};
+
+constexpr std::string_view RaBitQEstimatorModeName(RaBitQEstimatorMode mode) {
+  switch (mode) {
+    case RaBitQEstimatorMode::kOfficial1PlusN:
+      return "official_1_plus_n";
+    case RaBitQEstimatorMode::kLegacySignedMagnitude:
+    default:
+      return "legacy_signed_magnitude";
+  }
+}
+
+inline bool ParseRaBitQEstimatorMode(std::string_view value,
+                                     RaBitQEstimatorMode* mode) {
+  if (value == "legacy" || value == "legacy_signed_magnitude") {
+    if (mode != nullptr) {
+      *mode = RaBitQEstimatorMode::kLegacySignedMagnitude;
+    }
+    return true;
+  }
+  if (value == "official" || value == "official_1_plus_n") {
+    if (mode != nullptr) {
+      *mode = RaBitQEstimatorMode::kOfficial1PlusN;
+    }
+    return true;
+  }
+  return false;
+}
+
+constexpr RaBitQEstimatorMode RaBitQEstimatorModeFromByte(uint8_t mode) {
+  return mode == static_cast<uint8_t>(RaBitQEstimatorMode::kOfficial1PlusN)
+      ? RaBitQEstimatorMode::kOfficial1PlusN
+      : RaBitQEstimatorMode::kLegacySignedMagnitude;
+}
+
+enum class RaBitQExDataLayout : uint8_t {
+  kGenericPacked = 0,
+  kSplit3TwoPlusOne = 1,
+  kSplit3Bitplanes = 2,
+  kSelectedDirect = 3,
+  kSplit1Bitplane = 4,
+  kSplit2Bitplanes = 5,
+};
+
+constexpr std::string_view RaBitQExDataLayoutName(RaBitQExDataLayout layout) {
+  switch (layout) {
+    case RaBitQExDataLayout::kSplit3TwoPlusOne:
+      return "split3_2plus1";
+    case RaBitQExDataLayout::kSplit3Bitplanes:
+      return "split3_bitplanes";
+    case RaBitQExDataLayout::kSplit1Bitplane:
+      return "split1_bitplane";
+    case RaBitQExDataLayout::kSplit2Bitplanes:
+      return "split2_bitplanes";
+    case RaBitQExDataLayout::kSelectedDirect:
+      return "selected_direct";
+    case RaBitQExDataLayout::kGenericPacked:
+    default:
+      return "generic_packed";
+  }
+}
+
+inline bool ParseRaBitQExDataLayout(std::string_view value,
+                                    RaBitQExDataLayout* layout) {
+  if (value == "" || value == "generic" || value == "generic_packed") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kGenericPacked;
+    }
+    return true;
+  }
+  if (value == "split3_2plus1" || value == "2plus1" ||
+      value == "two_plus_one") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kSplit3TwoPlusOne;
+    }
+    return true;
+  }
+  if (value == "split3_bitplanes" || value == "bitplanes" ||
+      value == "bitplanes3" || value == "1plus1plus1") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kSplit3Bitplanes;
+    }
+    return true;
+  }
+  if (value == "split2_bitplanes" || value == "bitplanes2" ||
+      value == "1plus1") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kSplit2Bitplanes;
+    }
+    return true;
+  }
+  if (value == "split1_bitplane" || value == "split1_bitplanes" ||
+      value == "bitplane1" || value == "bitplanes1") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kSplit1Bitplane;
+    }
+    return true;
+  }
+  if (value == "selected" || value == "selected_direct") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kSelectedDirect;
+    }
+    return true;
+  }
+  return false;
+}
+
+constexpr RaBitQExDataLayout RaBitQExDataLayoutFromByte(uint8_t layout) {
+  switch (layout) {
+    case static_cast<uint8_t>(RaBitQExDataLayout::kSplit3TwoPlusOne):
+      return RaBitQExDataLayout::kSplit3TwoPlusOne;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kSplit3Bitplanes):
+      return RaBitQExDataLayout::kSplit3Bitplanes;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kSelectedDirect):
+      return RaBitQExDataLayout::kSelectedDirect;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kSplit1Bitplane):
+      return RaBitQExDataLayout::kSplit1Bitplane;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kSplit2Bitplanes):
+      return RaBitQExDataLayout::kSplit2Bitplanes;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kGenericPacked):
+    default:
+      return RaBitQExDataLayout::kGenericPacked;
+  }
+}
+
+constexpr bool RaBitQExDataLayoutByteValid(uint8_t layout) {
+  return layout == static_cast<uint8_t>(RaBitQExDataLayout::kGenericPacked) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSplit3TwoPlusOne) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSplit3Bitplanes) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSelectedDirect) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSplit1Bitplane) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSplit2Bitplanes);
+}
+
+constexpr RaBitQExDataLayout RaBitQResolveSelectedExDataLayout(
+    RaBitQExDataLayout layout) {
+  return layout == RaBitQExDataLayout::kSelectedDirect
+      ? RaBitQExDataLayout::kSplit3Bitplanes
+      : layout;
+}
+
+constexpr RaBitQExDataLayout RaBitQResolveSelectedExDataLayoutForBits(
+    RaBitQExDataLayout layout, uint8_t ex_bits) {
+  if (layout != RaBitQExDataLayout::kSelectedDirect) {
+    return layout;
+  }
+  if (ex_bits == 1) return RaBitQExDataLayout::kSplit1Bitplane;
+  if (ex_bits == 2) return RaBitQExDataLayout::kSplit2Bitplanes;
+  if (ex_bits == 3) return RaBitQExDataLayout::kSplit3Bitplanes;
+  return RaBitQExDataLayout::kSelectedDirect;
+}
+
+constexpr uint8_t RaBitQExDataLayoutDirectBits(RaBitQExDataLayout layout) {
+  const RaBitQExDataLayout resolved = RaBitQResolveSelectedExDataLayout(layout);
+  switch (resolved) {
+    case RaBitQExDataLayout::kSplit1Bitplane:
+      return 1;
+    case RaBitQExDataLayout::kSplit2Bitplanes:
+      return 2;
+    case RaBitQExDataLayout::kSplit3TwoPlusOne:
+    case RaBitQExDataLayout::kSplit3Bitplanes:
+      return 3;
+    case RaBitQExDataLayout::kGenericPacked:
+    case RaBitQExDataLayout::kSelectedDirect:
+    default:
+      return 0;
+  }
+}
+
+constexpr bool RaBitQExDataLayoutIsDirect(RaBitQExDataLayout layout) {
+  const RaBitQExDataLayout resolved = RaBitQResolveSelectedExDataLayout(layout);
+  return resolved == RaBitQExDataLayout::kSplit3TwoPlusOne ||
+         resolved == RaBitQExDataLayout::kSplit3Bitplanes ||
+         resolved == RaBitQExDataLayout::kSplit1Bitplane ||
+         resolved == RaBitQExDataLayout::kSplit2Bitplanes;
+}
+
 /// RaBitQ (Reduced-Bit Quantization) configuration
 struct RaBitQConfig {
-  uint8_t bits = 1;          // Quantization bits: 1, 2, 4, or 8
+  uint8_t bits = 1;          // Legacy Stage2 payload bits; official mode uses ex_bits.
   uint32_t block_size = 64;  // Block granularity for SIMD (typically 64)
   float c_factor = 5.75f;    // Error bound factor: epsilon = c * 2^(-B/2) / sqrt(D)
   uint8_t storage_version = 7;  // On-disk format version (7 = dual-region FastScan)
+  uint8_t total_bits = 1;    // Official reported precision: 1 + ex_bits.
+  uint8_t ex_bits = 0;       // Official Stage2 ExData payload bits.
+  RaBitQEstimatorMode estimator_mode =
+      RaBitQEstimatorMode::kLegacySignedMagnitude;
+  RaBitQExDataLayout exdata_layout = RaBitQExDataLayout::kGenericPacked;
+
+  bool uses_official_1_plus_n() const {
+    return estimator_mode == RaBitQEstimatorMode::kOfficial1PlusN;
+  }
+
+  uint8_t effective_total_bits() const {
+    return uses_official_1_plus_n() ? total_bits : bits;
+  }
+
+  uint8_t stage2_payload_bits() const {
+    return uses_official_1_plus_n() ? ex_bits : (bits > 1 ? bits : 0);
+  }
+
+  uint8_t active_code_bits() const {
+    const uint8_t payload_bits = stage2_payload_bits();
+    return payload_bits > 0 ? payload_bits : 1;
+  }
+
+  bool has_stage2_payload() const { return stage2_payload_bits() > 0; }
+
+  bool official_bits_valid() const {
+    return !uses_official_1_plus_n() || total_bits == static_cast<uint8_t>(ex_bits + 1u);
+  }
+
+  RaBitQExDataLayout effective_exdata_layout() const {
+    return uses_official_1_plus_n()
+        ? RaBitQResolveSelectedExDataLayoutForBits(exdata_layout, ex_bits)
+        : RaBitQExDataLayout::kGenericPacked;
+  }
+
+  bool exdata_layout_valid() const {
+    if (!uses_official_1_plus_n()) {
+      return exdata_layout == RaBitQExDataLayout::kGenericPacked;
+    }
+    const RaBitQExDataLayout effective = effective_exdata_layout();
+    if (effective == RaBitQExDataLayout::kGenericPacked) {
+      return true;
+    }
+    if (effective == RaBitQExDataLayout::kSplit3TwoPlusOne) {
+      return ex_bits == 3;
+    }
+    const uint8_t direct_bits = RaBitQExDataLayoutDirectBits(effective);
+    return direct_bits != 0 && direct_bits == ex_bits;
+  }
 
   bool operator==(const RaBitQConfig& other) const {
     return bits == other.bits &&
            block_size == other.block_size &&
            c_factor == other.c_factor &&
-           storage_version == other.storage_version;
+           storage_version == other.storage_version &&
+           total_bits == other.total_bits &&
+           ex_bits == other.ex_bits &&
+           estimator_mode == other.estimator_mode &&
+           exdata_layout == other.exdata_layout;
   }
   bool operator!=(const RaBitQConfig& other) const { return !(*this == other); }
 };
+
+inline std::string RaBitQFormatKey(const RaBitQConfig& config) {
+  if (config.uses_official_1_plus_n()) {
+    std::string key =
+        "official_1_plus_n_total" +
+        std::to_string(static_cast<uint32_t>(config.effective_total_bits())) +
+        "_ex" +
+        std::to_string(static_cast<uint32_t>(config.stage2_payload_bits()));
+    const RaBitQExDataLayout layout = config.effective_exdata_layout();
+    if (RaBitQExDataLayoutIsDirect(layout)) {
+      key += "_";
+      key += std::string(RaBitQExDataLayoutName(layout));
+    } else if (config.exdata_layout == RaBitQExDataLayout::kSelectedDirect) {
+      key += "_selected_direct";
+    }
+    return key;
+  }
+  return "legacy_signed_magnitude_bits" +
+         std::to_string(static_cast<uint32_t>(config.effective_total_bits()));
+}
 
 // ============================================================================
 // Constants

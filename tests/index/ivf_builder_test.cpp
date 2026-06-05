@@ -144,7 +144,47 @@ TEST_F(IvfBuilderTest, Build_RabitqSafeInDkCalibration_FullAndNProbe) {
         EXPECT_GT(idx.conann().safein_d_k(), 0.0f);
         EXPECT_EQ(idx.safein_dk_space(), SafeInDkSpace::RabitqS2);
         EXPECT_EQ(idx.safein_dk_search_scope(), scope);
+        EXPECT_EQ(idx.safein_dk_estimator_mode(), "legacy_signed_magnitude");
     }
+}
+
+TEST_F(IvfBuilderTest, Build_OfficialRabitqSafeInDkRecordsEstimatorMode) {
+    constexpr uint32_t N = 80;
+    constexpr Dim dim = 64;
+    constexpr uint32_t nlist = 4;
+
+    auto vecs = GenerateVectors(N, dim, 11);
+
+    IvfBuilderConfig cfg;
+    cfg.nlist = nlist;
+    cfg.max_iterations = 6;
+    cfg.seed = 11;
+    cfg.rabitq.total_bits = 4;
+    cfg.rabitq.ex_bits = 3;
+    cfg.rabitq.estimator_mode = RaBitQEstimatorMode::kOfficial1PlusN;
+    cfg.calibration_samples = 8;
+    cfg.calibration_topk = 5;
+    cfg.calibration_percentile = 0.95f;
+    cfg.safein_dk_space = SafeInDkSpace::RabitqS2;
+    cfg.safein_dk_search_scope = SafeInDkSearchScope::NProbe;
+    cfg.safein_dk_nprobe = 2;
+    cfg.page_size = 1;
+
+    IvfBuilder builder(cfg);
+    auto s = builder.Build(vecs.data(), N, dim, test_dir_);
+    ASSERT_TRUE(s.ok()) << s.message();
+    EXPECT_GT(builder.calibrated_safein_dk(), 0.0f);
+
+    IvfIndex idx;
+    ASSERT_TRUE(idx.Open(test_dir_).ok());
+    EXPECT_EQ(idx.safein_dk_bits(), 4u);
+    EXPECT_EQ(idx.safein_dk_estimator_mode(), "official_1_plus_n");
+    EXPECT_EQ(idx.segment().rabitq_config().estimator_mode,
+              RaBitQEstimatorMode::kOfficial1PlusN);
+
+    const std::string sidecar = ReadFileToString(test_dir_ + "/build_metadata.json");
+    EXPECT_NE(sidecar.find("\"safein_dk_estimator_mode\": \"official_1_plus_n\""),
+              std::string::npos);
 }
 
 // ============================================================================

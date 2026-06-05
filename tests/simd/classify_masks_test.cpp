@@ -101,6 +101,11 @@ TEST(FastScanStage1EvaluateTest, MatchesLegacyDequantizeAndMasks) {
             for (uint32_t i = 0; i < count; ++i) {
                 EXPECT_NEAR(fused_dists[i], legacy_dists[i], 1e-5f)
                     << "dim=" << dim << " count=" << count << " lane=" << i;
+                const float expected_ip_x0_qr =
+                    (static_cast<float>(raw_accu[i]) + static_cast<float>(fs_shift)) *
+                    fs_width;
+                EXPECT_NEAR(fused.ip_x0_qr[i], expected_ip_x0_qr, 1e-7f)
+                    << "dim=" << dim << " count=" << count << " lane=" << i;
             }
             EXPECT_EQ(fused.safeout_mask, legacy_so)
                 << "dim=" << dim << " count=" << count;

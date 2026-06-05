@@ -277,7 +277,7 @@ class OverlapScheduler {
     void MaterializeBudgetedReadPlans(SearchContext& ctx);
 
     // Stage 2 ExRaBitQ re-classification
-    float margin_s2_divisor_ = 1.0f;  // 2^(bits-1), precomputed
+    float margin_s2_divisor_ = 1.0f;  // 2^(total_bits-1), precomputed
     bool has_s2_ = false;             // true when bits > 1
 
     // Phase 3: per-query estimator for PrepareQueryInto, ClusterProber for

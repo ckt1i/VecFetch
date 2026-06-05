@@ -95,9 +95,10 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
       use_dynamic_safeout_(config.enable_dynamic_safeout),
       use_dynamic_safein_(config.dynamic_safein_mode != DynamicSafeInMode::Static),
       use_estimate_frontier_(use_dynamic_safeout_ || use_dynamic_safein_),
-      estimator_(index.dim(), index.segment().rabitq_config().bits),
+      estimator_(index.dim(), index.segment().rabitq_config().active_code_bits()),
       prober_(index.conann(), index.dim(),
-              index.segment().rabitq_config().bits) {
+              index.segment().rabitq_config().active_code_bits(),
+              index.segment().rabitq_config().effective_total_bits()) {
     if (index.used_hadamard()) {
         query_wrapper_.rotated_q.resize(index.dim());
     }
@@ -124,11 +125,12 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
     if (config_.non_safeout_candidate_budget > 0) {
         budgeted_read_plan_heap_.reserve(config_.non_safeout_candidate_budget);
     }
-    // Stage 2: precompute margin divisor from bits
-    uint8_t bits = index.segment().rabitq_config().bits;
+    // Stage 2: precompute margin divisor from effective total bits.
+    uint8_t bits = index.segment().rabitq_config().active_code_bits();
     if (bits > 1) {
         has_s2_ = true;
-        margin_s2_divisor_ = static_cast<float>(1u << (bits - 1));
+        margin_s2_divisor_ = static_cast<float>(
+            1u << (index.segment().rabitq_config().effective_total_bits() - 1));
     }
     buffer_pool_.Prime(vec_bytes_, std::max(1u, config_.io_queue_depth));
     InitializeDataBufferSlab();

@@ -459,6 +459,40 @@ float RaBitQEstimator::EstimateDistanceMultiBit(
                                        code.norm, code.xipnorm);
 }
 
+float RaBitQEstimator::EstimateDistanceOfficial1PlusN(
+    const PreparedQuery& pq,
+    const RaBitQCode& code,
+    uint8_t ex_bits) const {
+    if (ex_bits > 0 && code.ex_code.empty()) {
+        throw std::invalid_argument(
+            "official RaBitQ Stage2 estimate requires sign-folded ExData");
+    }
+
+    float ip_x0_qr = 0.0f;
+    for (size_t i = 0; i < dim_; ++i) {
+        const size_t word_idx = i / 64;
+        const size_t bit_idx = i % 64;
+        if (word_idx < code.code.size() &&
+            ((code.code[word_idx] >> bit_idx) & 1ULL) != 0ULL) {
+            ip_x0_qr += pq.rotated[i];
+        }
+    }
+
+    const float ip_ex = ex_bits > 0
+        ? simd::IPOfficialRaBitQExData(pq.rotated.data(), code.ex_code.data(), dim_)
+        : 0.0f;
+    const float normalized_ip = simd::OfficialRaBitQCombineNormalizedIP(
+        ip_x0_qr, ip_ex, pq.sum_q, ex_bits);
+    const float factor_add = code.ex_factor_add > 0.0f
+        ? code.ex_factor_add
+        : code.norm * code.norm;
+    const float factor_rescale = code.ex_factor_rescale != 0.0f
+        ? code.ex_factor_rescale
+        : -2.0f * code.norm * code.xipnorm;
+    return simd::OfficialRaBitQEstimateDistance(
+        pq.norm_qc_sq, factor_add, factor_rescale, pq.norm_qc * normalized_ip);
+}
+
 // ============================================================================
 // EstimateDistanceMultiBitRaw — Stage 2: xipnorm-corrected M-bit estimate
 // ============================================================================

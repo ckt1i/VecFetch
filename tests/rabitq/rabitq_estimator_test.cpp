@@ -10,6 +10,7 @@
 #include "vdb/rabitq/rabitq_estimator.h"
 #include "vdb/rabitq/rabitq_rotation.h"
 #include "vdb/simd/distance_l2.h"
+#include "vdb/simd/ip_exrabitq.h"
 
 using vdb::rabitq::RotationMatrix;
 using vdb::rabitq::RaBitQEncoder;
@@ -212,6 +213,45 @@ TEST(RaBitQEstimatorTest, WithCentroid_ReasonableDistance) {
     // The approximation should be in the same ballpark (within 10x)
     // This is a loose check — RaBitQ is approximate
     EXPECT_LT(std::abs(approx - exact), 10.0f * exact + 1.0f);
+}
+
+TEST(RaBitQEstimatorTest, Official1PlusNEstimateMatchesReferenceFormula) {
+    constexpr Dim dim = 64;
+    RotationMatrix P(dim);
+    P.GenerateRandom(42);
+
+    vdb::RaBitQConfig config;
+    config.total_bits = 4;
+    config.ex_bits = 3;
+    config.estimator_mode = vdb::RaBitQEstimatorMode::kOfficial1PlusN;
+
+    RaBitQEncoder encoder(dim, P, config);
+    RaBitQEstimator estimator(dim, config.active_code_bits());
+    auto vec = RandomVec(dim, 100);
+    auto query = RandomVec(dim, 200);
+    auto centroid = RandomVec(dim, 300);
+
+    auto code = encoder.Encode(vec.data(), centroid.data());
+    auto pq = estimator.PrepareQuery(query.data(), centroid.data(), P);
+
+    float ip_x0_qr = 0.0f;
+    for (Dim d = 0; d < dim; ++d) {
+        if (((code.code[d / 64] >> (d % 64)) & 1ULL) != 0ULL) {
+            ip_x0_qr += pq.rotated[d];
+        }
+    }
+    const float ip_ex =
+        vdb::simd::IPOfficialRaBitQExData(pq.rotated.data(), code.ex_code.data(), dim);
+    const float normalized_ip = vdb::simd::OfficialRaBitQCombineNormalizedIP(
+        ip_x0_qr, ip_ex, pq.sum_q, config.ex_bits);
+    const float expected = std::max(
+        pq.norm_qc_sq + code.ex_factor_add +
+            code.ex_factor_rescale * (pq.norm_qc * normalized_ip),
+        0.0f);
+
+    const float actual =
+        estimator.EstimateDistanceOfficial1PlusN(pq, code, config.ex_bits);
+    EXPECT_NEAR(actual, expected, 1e-4f);
 }
 
 // ===========================================================================

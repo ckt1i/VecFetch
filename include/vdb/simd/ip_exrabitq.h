@@ -15,109 +15,162 @@ struct IPExRaBitQBatchPackedSignCompactTiming {
     double reduce_ms = 0;
 };
 
-/// Pack/unpack ExRaBitQ Stage2 magnitude codes for the v12 packed `.clu`
-/// layout. Supported packed widths in this change are 2 and 4 bits.
+/// Pack/unpack ExRaBitQ Stage2 payload codes for packed `.clu` layouts.
+/// Legacy v12 uses 2/4-bit magnitudes; official v13 also uses 3-bit ExData.
 uint32_t ExRaBitQPackedMagnitudeBytes(uint32_t dim_block, uint8_t bits);
 
-bool ExRaBitQPackMagnitudes(const uint8_t* VDB_RESTRICT decoded,
-                            uint32_t count,
-                            uint8_t bits,
-                            uint8_t* VDB_RESTRICT packed,
-                            uint32_t packed_bytes);
+bool ExRaBitQPackMagnitudes(const uint8_t* VDB_RESTRICT decoded, uint32_t count, uint8_t bits,
+                            uint8_t* VDB_RESTRICT packed, uint32_t packed_bytes);
 
-bool ExRaBitQUnpackMagnitudes(const uint8_t* VDB_RESTRICT packed,
-                              uint32_t count,
-                              uint8_t bits,
+bool ExRaBitQUnpackMagnitudes(const uint8_t* VDB_RESTRICT packed, uint32_t count, uint8_t bits,
                               uint8_t* VDB_RESTRICT decoded);
 
-bool ExRaBitQDecodePackedBatchBlockMagnitudes(
-    const uint8_t* VDB_RESTRICT packed_abs_blocks,
-    uint32_t num_dim_blocks,
-    uint32_t batch_size,
-    uint32_t dim_block,
-    uint32_t abs_bytes_per_lane_dim_block,
-    uint8_t bits,
-    uint8_t* VDB_RESTRICT decoded_abs_blocks);
+bool ExRaBitQDecodePackedBatchBlockMagnitudes(const uint8_t* VDB_RESTRICT packed_abs_blocks,
+                                              uint32_t num_dim_blocks, uint32_t batch_size,
+                                              uint32_t dim_block,
+                                              uint32_t abs_bytes_per_lane_dim_block, uint8_t bits,
+                                              uint8_t* VDB_RESTRICT decoded_abs_blocks);
+
+bool ExRaBitQPackOfficialDirect3(const uint8_t* VDB_RESTRICT decoded, uint32_t count,
+                                 RaBitQExDataLayout layout,
+                                 uint8_t* VDB_RESTRICT packed, uint32_t packed_bytes);
+
+bool ExRaBitQUnpackOfficialDirect3(const uint8_t* VDB_RESTRICT packed, uint32_t count,
+                                   RaBitQExDataLayout layout,
+                                   uint8_t* VDB_RESTRICT decoded);
+
+bool ExRaBitQPackOfficialDirectBitplanes(const uint8_t* VDB_RESTRICT decoded,
+                                         uint32_t count, uint8_t bits,
+                                         uint8_t* VDB_RESTRICT packed,
+                                         uint32_t packed_bytes);
+
+bool ExRaBitQUnpackOfficialDirectBitplanes(const uint8_t* VDB_RESTRICT packed,
+                                           uint32_t count, uint8_t bits,
+                                           uint8_t* VDB_RESTRICT decoded);
 
 /// Compute the signed inner product for ExRaBitQ Stage 2:
 ///
 ///   result = Σ query[i] * sign[i] * (code_abs[i] + 0.5)
 ///
 /// @param query      Rotated query vector (float, length = dim)
-/// @param code_abs   Per-dimension quantized absolute values (uint8_t, length = dim)
+/// @param code_abs   Per-dimension quantized absolute values (uint8_t, length =
+/// dim)
 /// @param sign       Sign payload, either packed bits or per-dimension flags
 /// @param sign_packed Whether `sign` uses packed-bit layout
 /// @param dim        Vector dimensionality
 /// @return           Raw inner product (to be multiplied by xipnorm)
-float IPExRaBitQ(const float* VDB_RESTRICT query,
-                 const uint8_t* VDB_RESTRICT code_abs,
-                 const uint8_t* VDB_RESTRICT sign,
-                 bool sign_packed,
-                 Dim dim);
+float IPExRaBitQ(const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT code_abs,
+                 const uint8_t* VDB_RESTRICT sign, bool sign_packed, Dim dim);
 
 /// Backward-compatible overload for legacy un-packed sign payloads.
 VDB_FORCE_INLINE float IPExRaBitQ(const float* VDB_RESTRICT query,
                                   const uint8_t* VDB_RESTRICT code_abs,
-                                  const uint8_t* VDB_RESTRICT sign,
-                                  Dim dim) {
+                                  const uint8_t* VDB_RESTRICT sign, Dim dim) {
     return IPExRaBitQ(query, code_abs, sign, false, dim);
 }
 
 /// Packed-sign specialized Stage2 kernel for v10 serving path.
-float IPExRaBitQPackedSign(const float* VDB_RESTRICT query,
-                           const uint8_t* VDB_RESTRICT code_abs,
-                           const uint8_t* VDB_RESTRICT packed_sign,
-                           Dim dim);
+float IPExRaBitQPackedSign(const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT code_abs,
+                           const uint8_t* VDB_RESTRICT packed_sign, Dim dim);
 
 /// Batch packed-sign Stage2 kernel.
-/// `code_abs_ptrs`, `packed_sign_ptrs`, and `out_ip_raw` must all have length >= count.
+/// `code_abs_ptrs`, `packed_sign_ptrs`, and `out_ip_raw` must all have length
+/// >= count.
 void IPExRaBitQBatchPackedSign(const float* VDB_RESTRICT query,
                                const uint8_t* const* VDB_RESTRICT code_abs_ptrs,
-                               const uint8_t* const* VDB_RESTRICT packed_sign_ptrs,
-                               uint32_t count,
-                               Dim dim,
-                               float* VDB_RESTRICT out_ip_raw);
+                               const uint8_t* const* VDB_RESTRICT packed_sign_ptrs, uint32_t count,
+                               Dim dim, float* VDB_RESTRICT out_ip_raw);
 
 /// Compact-block packed-sign Stage2 kernel for v11 serving path.
 /// `abs_blocks` layout: [num_dim_blocks][8][64]
 /// `sign_blocks` layout: [num_dim_blocks][8][8B]
 void IPExRaBitQBatchPackedSignCompact(const float* VDB_RESTRICT query,
                                       const uint8_t* VDB_RESTRICT abs_blocks,
-                                      const uint8_t* VDB_RESTRICT sign_blocks,
-                                      uint32_t valid_count,
-                                      Dim dim,
-                                      uint32_t dim_block,
-                                      float* VDB_RESTRICT out_ip_raw,
+                                      const uint8_t* VDB_RESTRICT sign_blocks, uint32_t valid_count,
+                                      Dim dim, uint32_t dim_block, float* VDB_RESTRICT out_ip_raw,
                                       IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
 
-/// Parallel-friendly resident Stage2 kernel for v11 preload-time transcode path.
-/// `abs_slices` layout: [num_dim_blocks][dim_block/16][8][16]
+/// Parallel-friendly resident Stage2 kernel for v11 preload-time transcode
+/// path. `abs_slices` layout: [num_dim_blocks][dim_block/16][8][16]
 /// `sign_words` layout: [num_dim_blocks][dim_block/16][8]
 void IPExRaBitQBatchPackedSignParallelCompact(
-    const float* VDB_RESTRICT query,
-    const uint8_t* VDB_RESTRICT abs_slices,
-    const uint16_t* VDB_RESTRICT sign_words,
-    uint32_t valid_count,
-    Dim dim,
-    uint32_t dim_block,
-    uint32_t slices_per_dim_block,
-    float* VDB_RESTRICT out_ip_raw,
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT abs_slices,
+    const uint16_t* VDB_RESTRICT sign_words, uint32_t valid_count, Dim dim, uint32_t dim_block,
+    uint32_t slices_per_dim_block, float* VDB_RESTRICT out_ip_raw,
     IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
 
 /// Mask-aware variant of the parallel-friendly Stage2 kernel.
 /// Computes and writes only lanes selected by `lane_mask`; lane indexes in
 /// `out_ip_raw` remain the original block-local lane ids.
 void IPExRaBitQBatchPackedSignParallelCompactMasked(
-    const float* VDB_RESTRICT query,
-    const uint8_t* VDB_RESTRICT abs_slices,
-    const uint16_t* VDB_RESTRICT sign_words,
-    uint32_t lane_mask,
-    uint32_t valid_count,
-    Dim dim,
-    uint32_t dim_block,
-    uint32_t slices_per_dim_block,
-    float* VDB_RESTRICT out_ip_raw,
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT abs_slices,
+    const uint16_t* VDB_RESTRICT sign_words, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, uint32_t slices_per_dim_block, float* VDB_RESTRICT out_ip_raw,
     IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
 
-}  // namespace simd
-}  // namespace vdb
+/// Official RaBitQ 1+n ExData dot over decoded sign-folded ExData codes:
+///
+///   result = sum_i query[i] * ex_code[i]
+///
+/// The sign-bit contribution and `cb * sum_q` bias are combined separately via
+/// OfficialRaBitQCombineNormalizedIP because v13 stores no per-vector sign
+/// payload in the Stage2 ExData region.
+float IPOfficialRaBitQExData(const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT ex_code,
+                             Dim dim);
+
+/// Compact-block official ExData kernel. `ex_code_blocks` layout is
+/// [num_dim_blocks][8][dim_block] with decoded sign-folded ExData codes.
+void IPOfficialRaBitQBatchCompact(const float* VDB_RESTRICT query,
+                                  const uint8_t* VDB_RESTRICT ex_code_blocks, uint32_t valid_count,
+                                  Dim dim, uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+                                  IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Mask-aware official ExData compact-block kernel. Computes and writes only
+/// lanes selected by `lane_mask`; lane indexes in `out_ip_ex` remain original
+/// block-local lane ids.
+void IPOfficialRaBitQBatchCompactMasked(const float* VDB_RESTRICT query,
+                                        const uint8_t* VDB_RESTRICT ex_code_blocks,
+                                        uint32_t lane_mask, uint32_t valid_count, Dim dim,
+                                        uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+                                        IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Mask-aware official ExData kernel over direct-compact 1/2/3-bit bitplane
+/// layouts. `compact_blocks` layout is
+/// [num_dim_blocks][8][ceil(dim_block * bits / 8)].
+void IPOfficialRaBitQBatchCompactDirectBitplanesMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Mask-aware official ExData kernel over legacy direct-compact 3-bit layouts.
+/// `compact_blocks` layout is [num_dim_blocks][8][24B] for dim_block=64.
+void IPOfficialRaBitQBatchCompactDirect3Masked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    RaBitQExDataLayout layout, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+VDB_FORCE_INLINE float OfficialRaBitQExBias(uint8_t ex_bits) {
+    return -(static_cast<float>(1u << ex_bits) - 0.5f);
+}
+
+/// Combine normalized-query official terms:
+///
+///   sum_i q[i] * ((sign_bit_i << ex_bits) + ex_code_i + cb)
+///
+/// where `ip_x0_qr` is sum_i(q[i] for sign_bit_i == 1).
+VDB_FORCE_INLINE float OfficialRaBitQCombineNormalizedIP(float ip_x0_qr, float ip_ex_code,
+                                                         float sum_q, uint8_t ex_bits) {
+    const float sign_scale = static_cast<float>(1u << ex_bits);
+    return sign_scale * ip_x0_qr + ip_ex_code + OfficialRaBitQExBias(ex_bits) * sum_q;
+}
+
+VDB_FORCE_INLINE float OfficialRaBitQEstimateDistance(float query_norm_sq, float factor_add,
+                                                      float factor_rescale, float ex_ip) {
+    const float dist = query_norm_sq + factor_add + factor_rescale * ex_ip;
+    return dist > 0.0f ? dist : 0.0f;
+}
+
+} // namespace simd
+} // namespace vdb

@@ -622,6 +622,23 @@ Status IvfIndex::Open(const std::string& dir, bool use_direct_io) {
             conann_params->safein_dk_calibration_samples();
         safein_dk_nprobe_ = conann_params->safein_dk_nprobe();
         safein_dk_bits_ = conann_params->safein_dk_bits();
+        safein_dk_estimator_mode_ = "legacy_signed_magnitude";
+        const auto* safein_mode = conann_params->safein_dk_estimator_mode();
+        if (safein_mode != nullptr && safein_mode->size() > 0) {
+            safein_dk_estimator_mode_ = safein_mode->str();
+        } else if (const auto* rq = seg_meta->rabitq_params();
+                   rq != nullptr && rq->rabitq_estimator_mode() != nullptr &&
+                   rq->rabitq_estimator_mode()->size() > 0) {
+            RaBitQEstimatorMode parsed_mode =
+                RaBitQEstimatorMode::kLegacySignedMagnitude;
+            if (ParseRaBitQEstimatorMode(
+                    std::string_view(rq->rabitq_estimator_mode()->c_str(),
+                                     rq->rabitq_estimator_mode()->size()),
+                    &parsed_mode)) {
+                safein_dk_estimator_mode_ =
+                    std::string(RaBitQEstimatorModeName(parsed_mode));
+            }
+        }
         const bool has_safein_dk =
             (safein_dk_space_ == SafeInDkSpace::RabitqS2) && (safein_dk > 0.0f);
         conann_ = ConANN(eps, legacy_dk, safein_dk, has_safein_dk);

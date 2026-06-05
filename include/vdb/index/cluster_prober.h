@@ -108,8 +108,10 @@ class ClusterProber {
  public:
     /// @param conann  ConANN classifier (caller owns, must outlive ClusterProber)
     /// @param dim     Vector dimensionality
-    /// @param bits    RaBitQ quantization bits (1, 2, or 4)
+    /// @param bits    Active RaBitQ code bits (legacy bits or official ex_bits)
     ClusterProber(const ConANN& conann, Dim dim, uint8_t bits);
+    ClusterProber(const ConANN& conann, Dim dim, uint8_t code_bits,
+                  uint8_t total_bits);
     ~ClusterProber();
 
     VDB_DISALLOW_COPY_AND_MOVE(ClusterProber);
@@ -150,8 +152,9 @@ class ClusterProber {
     const ConANN& conann_;
     Dim dim_;
     uint8_t bits_;
+    uint8_t total_bits_;
     bool has_s2_;
-    float margin_s2_divisor_;   // 2^(bits-1), precomputed; 1.0 when bits==1
+    float margin_s2_divisor_;   // 2^(total_bits-1), precomputed; 1.0 when no S2
     rabitq::RaBitQEstimator estimator_;
 };
 

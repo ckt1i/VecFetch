@@ -450,7 +450,7 @@ void IvfBuilder::CalibrateSafeInDk(
     const rabitq::RotationMatrix& rotation) {
     calibrated_safein_dk_ = calibrated_dk_;
     if (config_.safein_dk_space != SafeInDkSpace::RabitqS2) return;
-    if (config_.rabitq.bits <= 1) return;
+    if (!config_.rabitq.has_stage2_payload()) return;
 
     const uint32_t total_queries =
         (config_.calibration_queries != nullptr && config_.num_calibration_queries > 0)
@@ -469,9 +469,16 @@ void IvfBuilder::CalibrateSafeInDk(
     std::vector<float> query_level_kths;
     query_level_kths.reserve(query_indices.size());
 
-    rabitq::RaBitQEstimator estimator(dim, config_.rabitq.bits);
+    rabitq::RaBitQEstimator estimator(dim, config_.rabitq.active_code_bits());
     rabitq::PreparedQuery pq;
     rabitq::ClusterPreparedScratch scratch;
+    const auto estimate_stage2 = [&](const rabitq::RaBitQCode& code) -> float {
+        if (config_.rabitq.uses_official_1_plus_n()) {
+            return estimator.EstimateDistanceOfficial1PlusN(
+                pq, code, config_.rabitq.stage2_payload_bits());
+        }
+        return estimator.EstimateDistanceMultiBit(pq, code);
+    };
     std::vector<std::pair<float, uint32_t>> centroid_dists;
     centroid_dists.reserve(cluster_members.size());
 
@@ -486,7 +493,7 @@ void IvfBuilder::CalibrateSafeInDk(
                 estimator.PrepareQueryInto(query, centroid, rotation, &pq, &scratch);
                 const auto& codes = all_codes[cid];
                 for (const auto& code : codes) {
-                    candidate_dists.push_back(estimator.EstimateDistanceMultiBit(pq, code));
+                    candidate_dists.push_back(estimate_stage2(code));
                 }
             }
         } else {
@@ -507,7 +514,7 @@ void IvfBuilder::CalibrateSafeInDk(
                 estimator.PrepareQueryInto(query, centroid, rotation, &pq, &scratch);
                 const auto& codes = all_codes[cid];
                 for (const auto& code : codes) {
-                    candidate_dists.push_back(estimator.EstimateDistanceMultiBit(pq, code));
+                    candidate_dists.push_back(estimate_stage2(code));
                 }
             }
         }
@@ -752,7 +759,7 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
     }
 
     // --- Build encoder ---
-    rabitq::RaBitQEncoder encoder(dim, rotation, config_.rabitq.bits);
+    rabitq::RaBitQEncoder encoder(dim, rotation, config_.rabitq);
 
     // =======================================================================
     // Unified file writing: single data.dat + single cluster.clu
@@ -826,7 +833,7 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
         all_codes, cluster_members, encoded_vectors, centroids_.data(),
         rotation, dim, K,
         config_.epsilon_samples, config_.epsilon_percentile, config_.seed,
-        calibrated_dk_, config_.rabitq.bits);
+        calibrated_dk_, config_.rabitq.active_code_bits());
     CalibrateSafeInDk(all_codes, cluster_members, encoded_vectors, N, dim, rotation);
 
     // --- Phase 2c: write unified cluster.clu ---
@@ -886,13 +893,22 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
         false
     );
 
+    const auto& global_info = clu_writer.info();
+
     // RaBitQParams
+    auto rabitq_estimator_mode =
+        fbb.CreateString(std::string(RaBitQEstimatorModeName(
+            config_.rabitq.estimator_mode)));
     auto rabitq_params = vdb::schema::CreateRaBitQParams(
         fbb,
-        config_.rabitq.bits,
+        config_.rabitq.active_code_bits(),
         config_.rabitq.block_size,
         config_.rabitq.c_factor,
-        0, 0  // codebook offset/length (not applicable for 1-bit)
+        0, 0,  // codebook offset/length (not applicable for 1-bit)
+        config_.rabitq.effective_total_bits(),
+        config_.rabitq.stage2_payload_bits(),
+        rabitq_estimator_mode,
+        global_info.rabitq_config.storage_version
     );
 
     // ConANNParams
@@ -912,11 +928,11 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
         ResolveSafeInCalibrationSamples(config_),
         config_.safein_dk_search_scope == SafeInDkSearchScope::NProbe ? 1 : 0,
         ResolveSafeInNProbe(config_),
-        config_.rabitq.bits
+        config_.rabitq.effective_total_bits(),
+        rabitq_estimator_mode
     );
 
     // ClusterMeta array — per-cluster info from the lookup table
-    const auto& global_info = clu_writer.info();
     std::vector<flatbuffers::Offset<vdb::schema::ClusterMeta>> cluster_offsets;
     cluster_offsets.reserve(K);
     for (uint32_t k = 0; k < K; ++k) {
@@ -1025,7 +1041,20 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
             << (config_.safein_dk_search_scope == SafeInDkSearchScope::NProbe ? "nprobe" : "full_database")
             << "\",\n"
             << "  \"safein_dk_nprobe\": " << ResolveSafeInNProbe(config_) << ",\n"
-            << "  \"safein_dk_bits\": " << static_cast<uint32_t>(config_.rabitq.bits) << ",\n"
+            << "  \"safein_dk_bits\": "
+            << static_cast<uint32_t>(config_.rabitq.effective_total_bits()) << ",\n"
+            << "  \"safein_dk_estimator_mode\": \""
+            << RaBitQEstimatorModeName(config_.rabitq.estimator_mode) << "\",\n"
+            << "  \"rabitq_bits\": "
+            << static_cast<uint32_t>(config_.rabitq.active_code_bits()) << ",\n"
+            << "  \"rabitq_total_bits\": "
+            << static_cast<uint32_t>(config_.rabitq.effective_total_bits()) << ",\n"
+            << "  \"rabitq_ex_bits\": "
+            << static_cast<uint32_t>(config_.rabitq.stage2_payload_bits()) << ",\n"
+            << "  \"rabitq_estimator_mode\": \""
+            << RaBitQEstimatorModeName(config_.rabitq.estimator_mode) << "\",\n"
+            << "  \"cluster_clu_version\": "
+            << static_cast<uint32_t>(global_info.rabitq_config.storage_version) << ",\n"
             << "  \"faiss_backend\": \"cpu\"\n"
             << "}\n";
         const std::string payload = oss.str();

@@ -176,12 +176,28 @@ RaBitQEncoder::RaBitQEncoder(Dim dim, const RotationMatrix& rotation,
                              uint8_t bits, uint64_t t_const_seed)
     : dim_(dim),
       bits_(bits),
+      total_bits_(bits),
+      ex_bits_(bits > 1 ? bits : 0),
+      official_1_plus_n_(false),
       words_per_plane_((dim + 63) / 64),
       total_words_(static_cast<uint32_t>(bits) * ((dim + 63) / 64)),
       rotation_(rotation) {
     if (bits_ > 1) {
         max_code_ = static_cast<int>((1u << bits_) - 1);
         t_const_ = ComputeTConst(dim_, bits_, t_const_seed);
+    }
+}
+
+RaBitQEncoder::RaBitQEncoder(Dim dim, const RotationMatrix& rotation,
+                             const RaBitQConfig& config,
+                             uint64_t t_const_seed)
+    : RaBitQEncoder(dim, rotation, config.active_code_bits(), t_const_seed) {
+    official_1_plus_n_ = config.uses_official_1_plus_n();
+    total_bits_ = config.effective_total_bits();
+    ex_bits_ = config.stage2_payload_bits();
+    if (official_1_plus_n_ && ex_bits_ > 0 && bits_ == 1) {
+        max_code_ = static_cast<int>((1u << ex_bits_) - 1u);
+        t_const_ = ComputeTConst(dim_, ex_bits_, t_const_seed);
     }
 }
 
@@ -245,6 +261,26 @@ RaBitQCode RaBitQEncoder::Encode(const float* vec,
                 result.code[word_idx] |= (1ULL << bit_idx);
             }
         }
+        if (official_1_plus_n_ && ex_bits_ > 0) {
+            std::vector<float> abs_rot(L);
+            for (size_t i = 0; i < L; ++i) {
+                abs_rot[i] = std::abs(rotated[i]);
+            }
+
+            result.ex_code.resize(L);
+            result.xipnorm = FastQuantizeEx(abs_rot.data(), static_cast<uint32_t>(L),
+                                            max_code_, t_const_, result.ex_code.data());
+            for (size_t i = 0; i < L; ++i) {
+                if (rotated[i] < 0.0f) {
+                    result.ex_code[i] =
+                        static_cast<uint8_t>(max_code_ - result.ex_code[i]);
+                }
+            }
+            result.ex_code_sign_folded = true;
+            result.ex_sign_packed.clear();
+            result.ex_factor_add = norm * norm;
+            result.ex_factor_rescale = -2.0f * norm * result.xipnorm;
+        }
     } else {
         // M-bit: sign-based bit-plane (for Stage 1) + fast_quantize ex_code (for Stage 2)
 
@@ -278,8 +314,21 @@ RaBitQCode RaBitQEncoder::Encode(const float* vec,
         result.xipnorm = FastQuantizeEx(abs_rot.data(), static_cast<uint32_t>(L),
                                         max_code_, t_const_,
                                         result.ex_code.data());
-        PackExSignBits(rotated.data(), static_cast<uint32_t>(L),
-                       result.ex_sign_packed);
+        if (official_1_plus_n_) {
+            for (size_t i = 0; i < L; ++i) {
+                if (rotated[i] < 0.0f) {
+                    result.ex_code[i] =
+                        static_cast<uint8_t>(max_code_ - result.ex_code[i]);
+                }
+            }
+            result.ex_code_sign_folded = true;
+            result.ex_sign_packed.clear();
+            result.ex_factor_add = norm * norm;
+            result.ex_factor_rescale = -2.0f * norm * result.xipnorm;
+        } else {
+            PackExSignBits(rotated.data(), static_cast<uint32_t>(L),
+                           result.ex_sign_packed);
+        }
     }
 
     // Precompute sum_x = popcount(MSB plane only)
@@ -333,6 +382,36 @@ RaBitQCode RaBitQEncoder::EncodeSlow(const float* vec,
                 result.code[i / 64] |= (1ULL << (i % 64));
             }
         }
+        if (official_1_plus_n_ && ex_bits_ > 0) {
+            constexpr double kEps = 1e-5;
+            std::vector<float> abs_rot(L);
+            for (size_t i = 0; i < L; ++i) abs_rot[i] = std::abs(rotated[i]);
+
+            double best_t = BestRescaleFactorSlow(abs_rot.data(),
+                                                   static_cast<uint32_t>(L),
+                                                   static_cast<uint32_t>(ex_bits_));
+
+            result.ex_code.resize(L);
+            double final_numer = 0.0;
+            for (size_t i = 0; i < L; ++i) {
+                int ca = static_cast<int>(best_t * abs_rot[i] + kEps);
+                if (ca > max_code_) ca = max_code_;
+                result.ex_code[i] = static_cast<uint8_t>(ca);
+                final_numer += (ca + 0.5) * abs_rot[i];
+            }
+            result.xipnorm = (final_numer > 1e-30)
+                            ? static_cast<float>(1.0 / final_numer) : 1.0f;
+            for (size_t i = 0; i < L; ++i) {
+                if (rotated[i] < 0.0f) {
+                    result.ex_code[i] =
+                        static_cast<uint8_t>(max_code_ - result.ex_code[i]);
+                }
+            }
+            result.ex_code_sign_folded = true;
+            result.ex_sign_packed.clear();
+            result.ex_factor_add = norm * norm;
+            result.ex_factor_rescale = -2.0f * norm * result.xipnorm;
+        }
     } else {
         // Bit-plane (Stage 1) — same as Encode()
         const float scale = static_cast<float>(num_levels) * 0.5f;
@@ -368,10 +447,23 @@ RaBitQCode RaBitQEncoder::EncodeSlow(const float* vec,
             result.ex_code[i] = static_cast<uint8_t>(ca);
             final_numer += (ca + 0.5) * abs_rot[i];
         }
-        PackExSignBits(rotated.data(), static_cast<uint32_t>(L),
-                       result.ex_sign_packed);
         result.xipnorm = (final_numer > 1e-30)
                         ? static_cast<float>(1.0 / final_numer) : 1.0f;
+        if (official_1_plus_n_) {
+            for (size_t i = 0; i < L; ++i) {
+                if (rotated[i] < 0.0f) {
+                    result.ex_code[i] =
+                        static_cast<uint8_t>(max_code - result.ex_code[i]);
+                }
+            }
+            result.ex_code_sign_folded = true;
+            result.ex_sign_packed.clear();
+            result.ex_factor_add = norm * norm;
+            result.ex_factor_rescale = -2.0f * norm * result.xipnorm;
+        } else {
+            PackExSignBits(rotated.data(), static_cast<uint32_t>(L),
+                           result.ex_sign_packed);
+        }
     }
 
     result.sum_x = simd::PopcountTotal(result.code.data(), wpp);

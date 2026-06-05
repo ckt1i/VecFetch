@@ -205,19 +205,185 @@ static std::string FormatEpsilonTag(float epsilon_percentile) {
 static std::string ResolveBenchIndexDir(const std::string& dataset_name,
                                         const std::string& output_dir,
                                         int nlist,
-                                        int bits,
+                                        const RaBitQConfig& rabitq_config,
                                         float epsilon_percentile,
                                         const std::string& requested_index_dir) {
     if (!requested_index_dir.empty()) {
         return requested_index_dir;
     }
     if (dataset_name == "coco_100k" && nlist == 2048) {
-        std::string dir = "/home/zcq/VDB/test/data/COCO100k/index_fkmeans_2048_bits" +
-               std::to_string(bits) + "_eps" +
-               FormatEpsilonTag(epsilon_percentile);
+        std::string dir = "/home/zcq/VDB/test/data/COCO100k/index_fkmeans_2048_";
+        if (rabitq_config.uses_official_1_plus_n()) {
+            dir += RaBitQFormatKey(rabitq_config);
+        } else {
+            dir += "bits" + std::to_string(rabitq_config.effective_total_bits());
+        }
+        dir += "_eps" + FormatEpsilonTag(epsilon_percentile);
         return dir;
     }
+    if (rabitq_config.uses_official_1_plus_n()) {
+        return output_dir + "/index_" + RaBitQFormatKey(rabitq_config);
+    }
     return output_dir + "/index";
+}
+
+enum class RaBitQValidationMode {
+    Auto,
+    Official,
+    Legacy,
+};
+
+static bool ParseRaBitQValidationModeArg(const std::string& value,
+                                         RaBitQValidationMode* out) {
+    if (value == "auto") {
+        *out = RaBitQValidationMode::Auto;
+        return true;
+    }
+    if (value == "official" || value == "official_1_plus_n") {
+        *out = RaBitQValidationMode::Official;
+        return true;
+    }
+    if (value == "legacy" || value == "legacy_signed_magnitude") {
+        *out = RaBitQValidationMode::Legacy;
+        return true;
+    }
+    return false;
+}
+
+static const char* RaBitQValidationModeName(RaBitQValidationMode mode) {
+    switch (mode) {
+        case RaBitQValidationMode::Auto:
+            return "auto";
+        case RaBitQValidationMode::Official:
+            return "official_1_plus_n";
+        case RaBitQValidationMode::Legacy:
+            return "legacy_signed_magnitude";
+    }
+    return "auto";
+}
+
+static bool ValidateRaBitQMode(const RaBitQConfig& config,
+                               RaBitQValidationMode requested,
+                               const char* flag_name) {
+    if (requested == RaBitQValidationMode::Auto) return true;
+    const bool official = config.uses_official_1_plus_n();
+    if (requested == RaBitQValidationMode::Official && !official) {
+        std::fprintf(stderr,
+                     "%s=official_1_plus_n requested, but index is %s\n",
+                     flag_name,
+                     std::string(RaBitQEstimatorModeName(
+                         config.estimator_mode)).c_str());
+        return false;
+    }
+    if (requested == RaBitQValidationMode::Legacy && official) {
+        std::fprintf(stderr,
+                     "%s=legacy_signed_magnitude requested, but index is %s\n",
+                     flag_name,
+                     std::string(RaBitQEstimatorModeName(
+                         config.estimator_mode)).c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool ResolveRaBitQBuildConfig(int argc, char* argv[],
+                                     int arg_bits,
+                                     int arg_block_size,
+                                     float arg_c_factor,
+                                     RaBitQConfig* out) {
+    std::string mode_arg =
+        GetStringArg(argc, argv, "--rabitq-estimator-mode", "");
+    if (mode_arg.empty()) {
+        mode_arg = GetStringArg(argc, argv, "--rabitq-mode",
+                                "legacy_signed_magnitude");
+    }
+    RaBitQEstimatorMode mode = RaBitQEstimatorMode::kLegacySignedMagnitude;
+    if (!ParseRaBitQEstimatorMode(mode_arg, &mode)) {
+        std::fprintf(stderr,
+                     "Invalid --rabitq-estimator-mode: %s "
+                     "(expected legacy_signed_magnitude or official_1_plus_n)\n",
+                     mode_arg.c_str());
+        return false;
+    }
+    const std::string layout_arg =
+        GetStringArg(argc, argv, "--rabitq-exdata-layout", "generic_packed");
+    RaBitQExDataLayout exdata_layout = RaBitQExDataLayout::kGenericPacked;
+    if (!ParseRaBitQExDataLayout(layout_arg, &exdata_layout)) {
+        std::fprintf(stderr,
+                     "Invalid --rabitq-exdata-layout: %s "
+                     "(expected generic_packed, split1_bitplane, split2_bitplanes, "
+                     "split3_2plus1, split3_bitplanes, or selected_direct)\n",
+                     layout_arg.c_str());
+        return false;
+    }
+
+    RaBitQConfig config;
+    config.block_size = static_cast<uint32_t>(arg_block_size);
+    config.c_factor = arg_c_factor;
+    config.estimator_mode = mode;
+    config.exdata_layout = exdata_layout;
+    if (mode == RaBitQEstimatorMode::kOfficial1PlusN) {
+        const int total_bits =
+            GetIntArg(argc, argv, "--rabitq-total-bits",
+                      GetIntArg(argc, argv, "--total-bits", arg_bits));
+        const int ex_bits =
+            GetIntArg(argc, argv, "--rabitq-ex-bits",
+                      GetIntArg(argc, argv, "--ex-bits", total_bits - 1));
+        if (total_bits < 1 || total_bits > 8 || ex_bits < 0 || ex_bits > 7) {
+            std::fprintf(stderr,
+                         "Invalid official RaBitQ bits: total_bits=%d ex_bits=%d\n",
+                         total_bits, ex_bits);
+            return false;
+        }
+        config.total_bits = static_cast<uint8_t>(total_bits);
+        config.ex_bits = static_cast<uint8_t>(ex_bits);
+        config.bits = config.ex_bits > 0 ? config.ex_bits : 1;
+        if (!config.official_bits_valid()) {
+            std::fprintf(stderr,
+                         "official RaBitQ requires total_bits == ex_bits + 1 "
+                         "(got total_bits=%d ex_bits=%d)\n",
+                         total_bits, ex_bits);
+            return false;
+        }
+        if (!(ex_bits == 0 || ex_bits == 1 || ex_bits == 2 || ex_bits == 3 || ex_bits == 4)) {
+            std::fprintf(stderr,
+                         "official RaBitQ supports ex_bits=0,1,2,3,4 "
+                         "(got ex_bits=%d)\n",
+                         ex_bits);
+            return false;
+        }
+        if (!config.exdata_layout_valid()) {
+            std::fprintf(stderr,
+                         "optimized --rabitq-exdata-layout is incompatible with official bits "
+                         "(got layout=%s total_bits=%d ex_bits=%d)\n",
+                         std::string(RaBitQExDataLayoutName(exdata_layout)).c_str(),
+                         total_bits, ex_bits);
+            return false;
+        }
+    } else {
+        if (HasFlag(argc, argv, "--rabitq-total-bits") ||
+            HasFlag(argc, argv, "--total-bits") ||
+            HasFlag(argc, argv, "--rabitq-ex-bits") ||
+            HasFlag(argc, argv, "--ex-bits")) {
+            std::fprintf(stderr,
+                         "total/ex bit flags require "
+                         "--rabitq-estimator-mode official_1_plus_n\n");
+            return false;
+        }
+        if (exdata_layout != RaBitQExDataLayout::kGenericPacked) {
+            std::fprintf(stderr,
+                         "--rabitq-exdata-layout=%s requires "
+                         "--rabitq-estimator-mode official_1_plus_n\n",
+                         std::string(RaBitQExDataLayoutName(exdata_layout)).c_str());
+            return false;
+        }
+        config.bits = static_cast<uint8_t>(std::max(1, arg_bits));
+        config.total_bits = config.bits;
+        config.ex_bits = config.bits > 1 ? config.bits : 0;
+        config.exdata_layout = RaBitQExDataLayout::kGenericPacked;
+    }
+    *out = config;
+    return true;
 }
 
 static std::string NormalizePath(const std::string& path) {
@@ -409,6 +575,8 @@ static StatusOr<std::vector<std::vector<int64_t>>> LoadExternalGroundTruth(
 }
 
 static const char* ExRaBitQStorageFormatName(uint32_t clu_file_version) {
+    if (clu_file_version >= 14) return "official_1_plus_n_direct_compact_exdata";
+    if (clu_file_version >= 13) return "official_1_plus_n_packed_exdata";
     if (clu_file_version >= 12) return "compact_blocked_packed_magnitude";
     if (clu_file_version >= 11) return "compact_blocked";
     if (clu_file_version >= 10) return "packed_sign";
@@ -1646,6 +1814,23 @@ int main(int argc, char* argv[]) {
     int arg_bits       = GetIntArg(argc, argv, "--bits", 1);
     int arg_block_size = GetIntArg(argc, argv, "--block-size", 64);
     float arg_c_factor = GetFloatArg(argc, argv, "--c-factor", 5.75f);
+    RaBitQConfig arg_rabitq_config;
+    if (!ResolveRaBitQBuildConfig(argc, argv, arg_bits, arg_block_size,
+                                  arg_c_factor, &arg_rabitq_config)) {
+        return 1;
+    }
+    const std::string arg_query_mode =
+        GetStringArg(argc, argv, "--rabitq-validation-mode",
+                     GetStringArg(argc, argv, "--rabitq-query-mode", "auto"));
+    RaBitQValidationMode arg_rabitq_validation_mode = RaBitQValidationMode::Auto;
+    if (!ParseRaBitQValidationModeArg(arg_query_mode,
+                                      &arg_rabitq_validation_mode)) {
+        std::fprintf(stderr,
+                     "Invalid --rabitq-validation-mode: %s "
+                     "(expected auto, official_1_plus_n, or legacy_signed_magnitude)\n",
+                     arg_query_mode.c_str());
+        return 1;
+    }
     int arg_max_iter   = GetIntArg(argc, argv, "--max-iter", 20);
     int arg_seed       = GetIntArg(argc, argv, "--seed", 42);
     int arg_page_size  = GetIntArg(argc, argv, "--page-size", 4096);
@@ -2084,7 +2269,7 @@ int main(int argc, char* argv[]) {
     // ================================================================
     std::string output_dir = output_base + "/" + ds_name + "_" + ts;
     std::string index_dir = ResolveBenchIndexDir(
-        ds_name, output_dir, arg_nlist, arg_bits,
+        ds_name, output_dir, arg_nlist, arg_rabitq_config,
         arg_epsilon_percentile, arg_index_dir);
     const std::string index_source =
         arg_index_dir.empty() ? "rebuilt" : "reused";
@@ -2113,8 +2298,7 @@ int main(int argc, char* argv[]) {
         cfg.faiss_train_size = 100000;
         cfg.faiss_niter = static_cast<uint32_t>(arg_max_iter == 20 ? 0 : arg_max_iter);
         cfg.faiss_nredo = 1;
-        cfg.rabitq = {static_cast<uint8_t>(arg_bits),
-                      static_cast<uint32_t>(arg_block_size), arg_c_factor};
+        cfg.rabitq = arg_rabitq_config;
         cfg.nprobe = static_cast<uint32_t>(std::max(1, arg_nprobe));
         cfg.calibration_samples =
             std::min(static_cast<uint32_t>(arg_calibration_samples), N);
@@ -2194,6 +2378,12 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "Open failed: %s\n", s.ToString().c_str());
         return 1;
     }
+    if (!ValidateRaBitQMode(index.segment().rabitq_config(),
+                            arg_rabitq_validation_mode,
+                            "--rabitq-validation-mode")) {
+        return 1;
+    }
+    const RaBitQConfig& loaded_rabitq_config = index.segment().rabitq_config();
 
     Log("  Index params: eps_ip=%.6f  d_k=%.6f\n",
         index.conann().epsilon(), index.conann().d_k());
@@ -2347,7 +2537,7 @@ int main(int argc, char* argv[]) {
         if (need_calibration_codes) {
             EncodeAllCodes(img_emb.data, N, dim, cluster_members_for_stats,
                            index.centroids(), index.rotation(),
-                           static_cast<uint8_t>(arg_bits),
+                           loaded_rabitq_config,
                            calibration_cluster_subset_ptr, &all_codes);
         }
 
@@ -2376,7 +2566,7 @@ int main(int argc, char* argv[]) {
             safein_dk_sample_values = GenerateRabitqSafeInDkSamples(
                 qry_emb.data.data(), Q, dim, GT_K, safein_dk_requested_samples,
                 cluster_members_for_stats, all_codes, index.centroids(),
-                index.rotation(), static_cast<uint8_t>(arg_bits),
+                index.rotation(), loaded_rabitq_config,
                 static_cast<uint64_t>(arg_seed), effective_mode, &index,
                 arg_safein_dk_search_scope,
                 static_cast<uint32_t>(std::max(1, arg_safein_dk_nprobe)));
@@ -2433,7 +2623,7 @@ int main(int argc, char* argv[]) {
                 index.centroids(), index.rotation(), dim,
                 static_cast<uint32_t>(arg_epsilon_samples),
                 arg_safein_epsilon_percentile, static_cast<uint64_t>(arg_seed),
-                runtime_safein_d_k, static_cast<uint8_t>(arg_bits),
+                runtime_safein_d_k, loaded_rabitq_config,
                 calibration_cluster_subset_ptr, arg_epsilon_sampling_mode,
                 &safein_epsilon_stats);
         } else if (arg_safein_epsilon_override >= 0.0f) {
@@ -2446,7 +2636,7 @@ int main(int argc, char* argv[]) {
                 index.centroids(), index.rotation(), dim,
                 static_cast<uint32_t>(arg_epsilon_samples),
                 arg_safeout_epsilon_percentile, static_cast<uint64_t>(arg_seed),
-                runtime_safein_d_k, static_cast<uint8_t>(arg_bits),
+                runtime_safein_d_k, loaded_rabitq_config,
                 calibration_cluster_subset_ptr, arg_epsilon_sampling_mode,
                 &safeout_epsilon_stats);
         }
@@ -2636,7 +2826,10 @@ int main(int argc, char* argv[]) {
                          "avg_submit_calls,avg_safe_out_rate,io_queue_depth,"
                          "sqpoll_enabled,cluster_submit_reserve,submission_mode,"
                          "clustering_source,avg_duplicate_candidates,avg_deduplicated_candidates,"
-                         "avg_unique_fetch_candidates,index_source,resolved_index_dir,"
+	                         "avg_unique_fetch_candidates,index_source,resolved_index_dir,"
+	                         "rabitq_format_key,rabitq_estimator_mode,rabitq_total_bits,"
+	                         "rabitq_ex_bits,rabitq_exdata_layout,"
+	                         "rabitq_effective_exdata_layout,"
                          "loaded_eps_ip,loaded_d_k,preload_time_ms,preload_bytes,"
                          "resident_preload_batch_size,resident_file_size_bytes,"
                          "resident_file_buffer_bytes,resident_code_storage_bytes,"
@@ -2689,7 +2882,18 @@ int main(int argc, char* argv[]) {
                       << sm.avg_unique_fetch_candidates << ","
                       << index_source << ","
                       << "\"" << resolved_index_dir << "\"" << ","
-                      << index.conann().epsilon() << ","
+                      << "\"" << RaBitQFormatKey(index.segment().rabitq_config()) << "\","
+                      << "\"" << std::string(RaBitQEstimatorModeName(
+                             index.segment().rabitq_config().estimator_mode)) << "\","
+                      << static_cast<uint32_t>(
+                             index.segment().rabitq_config().effective_total_bits()) << ","
+	                      << static_cast<uint32_t>(
+	                             index.segment().rabitq_config().stage2_payload_bits()) << ","
+	                      << "\"" << std::string(RaBitQExDataLayoutName(
+	                             index.segment().rabitq_config().exdata_layout)) << "\","
+	                      << "\"" << std::string(RaBitQExDataLayoutName(
+	                             index.segment().rabitq_config().effective_exdata_layout())) << "\","
+	                      << index.conann().epsilon() << ","
                       << index.conann().d_k() << ","
                       << sm.preload_time_ms << ","
                       << sm.preload_bytes << ","
@@ -2800,8 +3004,22 @@ int main(int argc, char* argv[]) {
     Log("  exrabitq_storage_version=%u  exrabitq_storage_format=%s\n",
         index.segment().cluster_reader().file_version(),
         ExRaBitQStorageFormatName(index.segment().cluster_reader().file_version()));
+    Log("  rabitq_estimator_mode=%s  rabitq_total_bits=%u  rabitq_ex_bits=%u\n",
+        std::string(RaBitQEstimatorModeName(
+            index.segment().rabitq_config().estimator_mode)).c_str(),
+        static_cast<uint32_t>(index.segment().rabitq_config().effective_total_bits()),
+        static_cast<uint32_t>(index.segment().rabitq_config().stage2_payload_bits()));
+    Log("  rabitq_exdata_layout=%s  rabitq_effective_exdata_layout=%s\n",
+        std::string(RaBitQExDataLayoutName(
+            index.segment().rabitq_config().exdata_layout)).c_str(),
+        std::string(RaBitQExDataLayoutName(
+            index.segment().rabitq_config().effective_exdata_layout())).c_str());
+    Log("  rabitq_format_key=%s  rabitq_validation_mode=%s\n",
+        RaBitQFormatKey(index.segment().rabitq_config()).c_str(),
+        RaBitQValidationModeName(arg_rabitq_validation_mode));
     Log("  exrabitq_stage2_magnitude_packed=%s\n",
-        (index.segment().cluster_reader().file_version() >= 12 && arg_bits > 1)
+        (index.segment().cluster_reader().file_version() >= 12 &&
+         index.segment().rabitq_config().has_stage2_payload())
             ? "true"
             : "false");
     Log("  loaded_eps_ip=%.6f  loaded_d_k=%.6f\n",
@@ -2903,7 +3121,24 @@ int main(int argc, char* argv[]) {
                               index.segment().cluster_reader().file_version())) << ",\n";
         f << "  " << JBool("exrabitq_stage2_magnitude_packed",
                             index.segment().cluster_reader().file_version() >= 12 &&
-                            arg_bits > 1) << ",\n";
+                            index.segment().rabitq_config().has_stage2_payload()) << ",\n";
+        f << "  " << JStr("rabitq_estimator_mode",
+                          std::string(RaBitQEstimatorModeName(
+                              index.segment().rabitq_config().estimator_mode))) << ",\n";
+        f << "  " << JInt("rabitq_total_bits",
+                          index.segment().rabitq_config().effective_total_bits()) << ",\n";
+        f << "  " << JInt("rabitq_ex_bits",
+                          index.segment().rabitq_config().stage2_payload_bits()) << ",\n";
+        f << "  " << JStr("rabitq_exdata_layout",
+                          std::string(RaBitQExDataLayoutName(
+                              index.segment().rabitq_config().exdata_layout))) << ",\n";
+        f << "  " << JStr("rabitq_effective_exdata_layout",
+                          std::string(RaBitQExDataLayoutName(
+                              index.segment().rabitq_config().effective_exdata_layout()))) << ",\n";
+        f << "  " << JStr("rabitq_format_key",
+                          RaBitQFormatKey(index.segment().rabitq_config())) << ",\n";
+        f << "  " << JStr("rabitq_validation_mode",
+                          RaBitQValidationModeName(arg_rabitq_validation_mode)) << ",\n";
         f << "  " << JInt("num_images", N) << ",\n";
         f << "  " << JInt("num_queries", Q) << ",\n";
         f << "  " << JInt("dimension", dim) << ",\n";
@@ -2915,7 +3150,23 @@ int main(int argc, char* argv[]) {
         f << "    " << JInt("nlist", arg_nlist) << ",\n";
         f << "    " << JInt("max_iterations", arg_max_iter) << ",\n";
         f << "    " << JInt("seed", arg_seed) << ",\n";
-        f << "    " << JInt("rabitq_bits", arg_bits) << ",\n";
+        f << "    " << JInt("rabitq_bits",
+                            arg_rabitq_config.effective_total_bits()) << ",\n";
+        f << "    " << JInt("rabitq_total_bits",
+                            arg_rabitq_config.effective_total_bits()) << ",\n";
+        f << "    " << JInt("rabitq_ex_bits",
+                            arg_rabitq_config.stage2_payload_bits()) << ",\n";
+        f << "    " << JStr("rabitq_estimator_mode",
+                            std::string(RaBitQEstimatorModeName(
+                                arg_rabitq_config.estimator_mode))) << ",\n";
+        f << "    " << JStr("rabitq_exdata_layout",
+                            std::string(RaBitQExDataLayoutName(
+                                arg_rabitq_config.exdata_layout))) << ",\n";
+        f << "    " << JStr("rabitq_effective_exdata_layout",
+                            std::string(RaBitQExDataLayoutName(
+                                arg_rabitq_config.effective_exdata_layout()))) << ",\n";
+        f << "    " << JStr("rabitq_format_key",
+                            RaBitQFormatKey(arg_rabitq_config)) << ",\n";
         f << "    " << JInt("rabitq_block_size", arg_block_size) << ",\n";
         f << "    " << JNum("rabitq_c_factor", arg_c_factor) << ",\n";
         f << "    " << JInt("page_size", arg_page_size) << ",\n";
@@ -3070,7 +3321,18 @@ int main(int argc, char* argv[]) {
                                 index.segment().cluster_reader().file_version())) << ",\n";
         f << "    " << JBool("exrabitq_stage2_magnitude_packed",
                               index.segment().cluster_reader().file_version() >= 12 &&
-                              arg_bits > 1) << ",\n";
+                              index.segment().rabitq_config().has_stage2_payload()) << ",\n";
+        f << "    " << JStr("rabitq_estimator_mode",
+                            std::string(RaBitQEstimatorModeName(
+                                index.segment().rabitq_config().estimator_mode))) << ",\n";
+        f << "    " << JInt("rabitq_total_bits",
+                            index.segment().rabitq_config().effective_total_bits()) << ",\n";
+        f << "    " << JInt("rabitq_ex_bits",
+                            index.segment().rabitq_config().stage2_payload_bits()) << ",\n";
+        f << "    " << JStr("rabitq_format_key",
+                            RaBitQFormatKey(index.segment().rabitq_config())) << ",\n";
+        f << "    " << JStr("rabitq_validation_mode",
+                            RaBitQValidationModeName(arg_rabitq_validation_mode)) << ",\n";
         f << "    " << JNum("loaded_eps_ip", loaded_eps_ip) << ",\n";
         f << "    " << JNum("loaded_d_k", loaded_d_k) << ",\n";
         f << "    " << JNum("runtime_eps_ip", index.conann().epsilon()) << ",\n";

@@ -50,11 +50,14 @@ struct ParsedCluster {
         const uint8_t* abs_blocks = nullptr;   // v11: [dim_block_count][8][64]; v12: packed
         const uint8_t* sign_blocks = nullptr;  // [dim_block_count][8][8B]
         const float* xipnorms = nullptr;       // [8]
+        const float* official_factor_adds = nullptr;     // [8], v13 only
+        const float* official_factor_rescales = nullptr; // [8], v13 only
         uint32_t valid_count = 0;
         uint32_t batch_block_id = 0;
         uint32_t abs_bytes_per_lane_dim_block = 0;
         uint8_t magnitude_bits = 0;
         bool abs_packed = false;
+        RaBitQExDataLayout exdata_layout = RaBitQExDataLayout::kGenericPacked;
     };
 
     struct ExRaBitQBatchParallelBlockView {
@@ -88,6 +91,11 @@ struct ParsedCluster {
     uint32_t exrabitq_abs_bytes_per_lane_dim_block = 0;
     uint8_t exrabitq_magnitude_bits = 0;
     bool exrabitq_magnitude_packed = false;
+    uint8_t rabitq_total_bits = 1;
+    uint8_t rabitq_ex_bits = 0;
+    RaBitQEstimatorMode rabitq_estimator_mode =
+        RaBitQEstimatorMode::kLegacySignedMagnitude;
+    RaBitQExDataLayout rabitq_exdata_layout = RaBitQExDataLayout::kGenericPacked;
     const uint8_t* exrabitq_parallel_abs_blocks = nullptr;
     const uint16_t* exrabitq_parallel_sign_words = nullptr;
     uint32_t exrabitq_parallel_abs_block_size = 0;
@@ -168,13 +176,26 @@ struct ParsedCluster {
         std::memcpy(&view.valid_count, block, sizeof(uint32_t));
         const uint8_t* payload = block + sizeof(uint32_t);
         view.abs_blocks = payload;
-        view.sign_blocks = payload + abs_total_bytes;
-        view.xipnorms = reinterpret_cast<const float*>(
-            block + exrabitq_batch_block_size - exrabitq_batch_size * sizeof(float));
+        view.sign_blocks = uses_official_1_plus_n() ? nullptr : payload + abs_total_bytes;
+        const uint32_t factor_count =
+            uses_official_1_plus_n() ? exrabitq_batch_size * 2u : exrabitq_batch_size;
+        const float* factors = reinterpret_cast<const float*>(
+            block + exrabitq_batch_block_size - factor_count * sizeof(float));
+        if (uses_official_1_plus_n()) {
+            view.official_factor_adds = factors;
+            view.official_factor_rescales = factors + exrabitq_batch_size;
+        } else {
+            view.xipnorms = factors;
+        }
         view.abs_bytes_per_lane_dim_block = abs_lane_bytes;
         view.magnitude_bits = exrabitq_magnitude_bits;
         view.abs_packed = exrabitq_magnitude_packed;
+        view.exdata_layout = rabitq_exdata_layout;
         return view;
+    }
+
+    bool uses_official_1_plus_n() const {
+        return rabitq_estimator_mode == RaBitQEstimatorMode::kOfficial1PlusN;
     }
 
     ExRaBitQBatchParallelBlockView exrabitq_batch_parallel_block_view(

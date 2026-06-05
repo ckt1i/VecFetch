@@ -108,6 +108,65 @@ static std::string JBool(const std::string& k, bool v) {
     return "\"" + k + "\": " + (v ? "true" : "false");
 }
 
+enum class RaBitQValidationMode {
+    Auto,
+    Official,
+    Legacy,
+};
+
+static bool ParseRaBitQValidationModeArg(const std::string& value,
+                                         RaBitQValidationMode* out) {
+    if (value == "auto") {
+        *out = RaBitQValidationMode::Auto;
+        return true;
+    }
+    if (value == "official" || value == "official_1_plus_n") {
+        *out = RaBitQValidationMode::Official;
+        return true;
+    }
+    if (value == "legacy" || value == "legacy_signed_magnitude") {
+        *out = RaBitQValidationMode::Legacy;
+        return true;
+    }
+    return false;
+}
+
+static const char* RaBitQValidationModeName(RaBitQValidationMode mode) {
+    switch (mode) {
+        case RaBitQValidationMode::Auto:
+            return "auto";
+        case RaBitQValidationMode::Official:
+            return "official_1_plus_n";
+        case RaBitQValidationMode::Legacy:
+            return "legacy_signed_magnitude";
+    }
+    return "auto";
+}
+
+static bool ValidateRaBitQMode(const vdb::RaBitQConfig& config,
+                               RaBitQValidationMode requested,
+                               const char* flag_name) {
+    if (requested == RaBitQValidationMode::Auto) return true;
+    const bool official = config.uses_official_1_plus_n();
+    if (requested == RaBitQValidationMode::Official && !official) {
+        std::fprintf(stderr,
+                     "%s=official_1_plus_n requested, but index is %s\n",
+                     flag_name,
+                     std::string(vdb::RaBitQEstimatorModeName(
+                         config.estimator_mode)).c_str());
+        return false;
+    }
+    if (requested == RaBitQValidationMode::Legacy && official) {
+        std::fprintf(stderr,
+                     "%s=legacy_signed_magnitude requested, but index is %s\n",
+                     flag_name,
+                     std::string(vdb::RaBitQEstimatorModeName(
+                         config.estimator_mode)).c_str());
+        return false;
+    }
+    return true;
+}
+
 struct ProcRss {
     int64_t rss_kib = 0;
     int64_t hwm_kib = 0;
@@ -389,6 +448,8 @@ static double ComputeRecallAtK(const std::vector<int64_t>& predicted,
 }
 
 static const char* ExRaBitQStorageFormatName(uint32_t version) {
+    if (version >= 14) return "official_1_plus_n_direct_compact_exdata";
+    if (version >= 13) return "official_1_plus_n_packed_exdata";
     if (version >= 12) return "compact_blocked_packed_magnitude";
     if (version >= 11) return "compact_blocked";
     if (version >= 10) return "packed_sign";
@@ -492,6 +553,7 @@ static int Usage() {
         "  --nprobe N                  Probed clusters (default: 64)\n"
         "  --dynamic-safein static|frontier (default: static)\n"
         "  --dynamic-safeout 0|1       Dynamic SafeOut (default: 1)\n"
+        "  --rabitq-validation-mode auto|official_1_plus_n|legacy_signed_magnitude\n"
         "  --non-safeout-candidate-budget N (default: 0)\n"
         "  --fixed-vec-buffer-count N  Fixed vector buffers (default: 0)\n"
         "  --fine-grained-timing 0|1   Enable detailed stage timing (default: 0)\n"
@@ -536,6 +598,17 @@ int main(int argc, char** argv) {
         GetStringArg(argc, argv, "--submission-mode", "shared");
     const std::string dynamic_safein =
         GetStringArg(argc, argv, "--dynamic-safein", "static");
+    const std::string rabitq_mode =
+        GetStringArg(argc, argv, "--rabitq-validation-mode",
+                     GetStringArg(argc, argv, "--rabitq-query-mode", "auto"));
+    RaBitQValidationMode rabitq_validation_mode = RaBitQValidationMode::Auto;
+    if (!ParseRaBitQValidationModeArg(rabitq_mode, &rabitq_validation_mode)) {
+        std::fprintf(stderr,
+                     "Invalid --rabitq-validation-mode: %s "
+                     "(expected auto, official_1_plus_n, or legacy_signed_magnitude)\n",
+                     rabitq_mode.c_str());
+        return 1;
+    }
 
     Log("=== VDB Online Query Benchmark ===\n");
     Log("Index: %s\n", index_dir.c_str());
@@ -586,6 +659,11 @@ int main(int argc, char** argv) {
     Status s = index.Open(index_dir, direct_io);
     if (!s.ok()) {
         std::fprintf(stderr, "Open index failed: %s\n", s.ToString().c_str());
+        return 1;
+    }
+    if (!ValidateRaBitQMode(index.segment().rabitq_config(),
+                            rabitq_validation_mode,
+                            "--rabitq-validation-mode")) {
         return 1;
     }
     if (queries.cols != index.logical_dim()) {
@@ -757,7 +835,7 @@ int main(int argc, char** argv) {
 
     const uint32_t clu_version = index.segment().cluster_reader().file_version();
     const bool packed_stage2 =
-        (clu_version >= 12 && index.segment().rabitq_config().bits > 1);
+        (clu_version >= 12 && index.segment().rabitq_config().has_stage2_payload());
 
     f << "{\n";
     f << "  \"metrics\": {\n";
@@ -793,7 +871,24 @@ int main(int argc, char** argv) {
     f << "    " << JInt("resident_parallel_view_bytes", static_cast<int64_t>(index.segment().resident_parallel_view_bytes())) << ",\n";
     f << "    " << JInt("exrabitq_storage_version", clu_version) << ",\n";
     f << "    " << JStr("exrabitq_storage_format", ExRaBitQStorageFormatName(clu_version)) << ",\n";
-    f << "    " << JBool("exrabitq_stage2_magnitude_packed", packed_stage2) << "\n";
+    f << "    " << JBool("exrabitq_stage2_magnitude_packed", packed_stage2) << ",\n";
+    f << "    " << JStr("rabitq_estimator_mode",
+                        std::string(RaBitQEstimatorModeName(
+                            index.segment().rabitq_config().estimator_mode))) << ",\n";
+    f << "    " << JInt("rabitq_total_bits",
+                        index.segment().rabitq_config().effective_total_bits()) << ",\n";
+	    f << "    " << JInt("rabitq_ex_bits",
+	                        index.segment().rabitq_config().stage2_payload_bits()) << ",\n";
+	    f << "    " << JStr("rabitq_exdata_layout",
+	                        std::string(RaBitQExDataLayoutName(
+	                            index.segment().rabitq_config().exdata_layout))) << ",\n";
+	    f << "    " << JStr("rabitq_effective_exdata_layout",
+	                        std::string(RaBitQExDataLayoutName(
+	                            index.segment().rabitq_config().effective_exdata_layout()))) << ",\n";
+	    f << "    " << JStr("rabitq_format_key",
+	                        RaBitQFormatKey(index.segment().rabitq_config())) << ",\n";
+    f << "    " << JStr("rabitq_validation_mode",
+                        RaBitQValidationModeName(rabitq_validation_mode)) << "\n";
     f << "  },\n";
     f << "  \"pipeline_stats\": {\n";
     f << "    " << JNum("avg_total_probed", metrics.total_probed * inv_q) << ",\n";

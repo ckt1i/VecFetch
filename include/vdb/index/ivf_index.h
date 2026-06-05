@@ -179,6 +179,9 @@ class IvfIndex {
     uint32_t safein_dk_calibration_samples() const { return safein_dk_calibration_samples_; }
     uint32_t safein_dk_nprobe() const { return safein_dk_nprobe_; }
     uint8_t safein_dk_bits() const { return safein_dk_bits_; }
+    const std::string& safein_dk_estimator_mode() const {
+        return safein_dk_estimator_mode_;
+    }
 
  private:
     std::string dir_;
@@ -209,6 +212,7 @@ class IvfIndex {
     uint32_t safein_dk_calibration_samples_ = 0;
     uint32_t safein_dk_nprobe_ = 0;
     uint8_t safein_dk_bits_ = 0;
+    std::string safein_dk_estimator_mode_ = "legacy_signed_magnitude";
     Dim logical_dim_ = 0;
     std::string padding_mode_ = "none";
     std::string rotation_mode_ = "random_matrix";

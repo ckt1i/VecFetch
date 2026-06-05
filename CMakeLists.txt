@@ -496,6 +496,10 @@ if(VDB_BUILD_TESTS)
     target_link_libraries(test_conann PRIVATE vdb_index GTest::gtest GTest::gtest_main)
     add_test(NAME test_conann COMMAND test_conann)
 
+    add_executable(test_cluster_prober tests/index/cluster_prober_test.cpp)
+    target_link_libraries(test_cluster_prober PRIVATE vdb_index GTest::gtest GTest::gtest_main)
+    add_test(NAME test_cluster_prober COMMAND test_cluster_prober)
+
     add_executable(test_rabitq_bench_calibration
         tests/benchmarks/rabitq_bench_calibration_test.cpp
         benchmarks/rabitq_bench_calibration.cpp)

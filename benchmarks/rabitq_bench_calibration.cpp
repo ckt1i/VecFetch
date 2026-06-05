@@ -63,6 +63,29 @@ std::vector<uint32_t> SampleIndicesWithReplacement(uint32_t total,
     return ids;
 }
 
+RaBitQConfig LegacyRaBitQConfig(uint8_t bits) {
+    RaBitQConfig config;
+    config.bits = bits;
+    config.total_bits = bits;
+    config.ex_bits = bits > 1 ? bits : 0;
+    config.estimator_mode = RaBitQEstimatorMode::kLegacySignedMagnitude;
+    return config;
+}
+
+float EstimateRabitqCalibrationDistance(const RaBitQConfig& config,
+                                        const rabitq::RaBitQEstimator& estimator,
+                                        const rabitq::PreparedQuery& pq,
+                                        const rabitq::RaBitQCode& code) {
+    if (config.uses_official_1_plus_n() && config.has_stage2_payload()) {
+        return estimator.EstimateDistanceOfficial1PlusN(
+            pq, code, config.stage2_payload_bits());
+    }
+    if (config.has_stage2_payload()) {
+        return estimator.EstimateDistanceMultiBit(pq, code);
+    }
+    return estimator.EstimateDistanceAccurate(pq, code);
+}
+
 }  // namespace
 
 StatusOr<std::vector<uint32_t>> LoadAssignments(const std::string& path,
@@ -150,8 +173,21 @@ void EncodeAllCodes(const std::vector<float>& base_data,
                     uint8_t bits,
                     const std::vector<uint32_t>* cluster_subset,
                     std::vector<std::vector<rabitq::RaBitQCode>>* all_codes) {
+    EncodeAllCodes(base_data, n, dim, cluster_members, centroids, rotation,
+                   LegacyRaBitQConfig(bits), cluster_subset, all_codes);
+}
+
+void EncodeAllCodes(const std::vector<float>& base_data,
+                    uint32_t n,
+                    Dim dim,
+                    const std::vector<std::vector<uint32_t>>& cluster_members,
+                    const std::vector<float>& centroids,
+                    const rabitq::RotationMatrix& rotation,
+                    const RaBitQConfig& config,
+                    const std::vector<uint32_t>* cluster_subset,
+                    std::vector<std::vector<rabitq::RaBitQCode>>* all_codes) {
     (void)n;
-    rabitq::RaBitQEncoder encoder(dim, rotation, bits);
+    rabitq::RaBitQEncoder encoder(dim, rotation, config);
     all_codes->assign(cluster_members.size(), {});
     const bool use_subset = cluster_subset != nullptr && !cluster_subset->empty();
     if (use_subset) {
@@ -239,7 +275,29 @@ std::vector<float> GenerateRabitqSafeInDkSamples(
     const index::IvfIndex* index,
     index::SafeInDkSearchScope search_scope,
     uint32_t nprobe) {
-    rabitq::RaBitQEstimator estimator(dim, bits);
+    return GenerateRabitqSafeInDkSamples(
+        queries, q, dim, top_k, sample_queries, cluster_members, all_codes,
+        centroids, rotation, LegacyRaBitQConfig(bits), seed, sampling_mode,
+        index, search_scope, nprobe);
+}
+
+std::vector<float> GenerateRabitqSafeInDkSamples(
+    const float* queries,
+    uint32_t q,
+    Dim dim,
+    uint32_t top_k,
+    uint32_t sample_queries,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<float>& centroids,
+    const rabitq::RotationMatrix& rotation,
+    const RaBitQConfig& config,
+    uint64_t seed,
+    SafeInDkSamplingMode sampling_mode,
+    const index::IvfIndex* index,
+    index::SafeInDkSearchScope search_scope,
+    uint32_t nprobe) {
+    rabitq::RaBitQEstimator estimator(dim, config.active_code_bits());
     rabitq::PreparedQuery pq;
     rabitq::ClusterPreparedScratch scratch;
     const auto sampled = (sampling_mode == SafeInDkSamplingMode::WithReplacement)
@@ -265,7 +323,8 @@ std::vector<float> GenerateRabitqSafeInDkSamples(
                     rotation, &pq, &scratch);
                 const auto& codes = all_codes[cid];
                 for (const auto& code : codes) {
-                    dists.push_back(estimator.EstimateDistanceMultiBit(pq, code));
+                    dists.push_back(
+                        EstimateRabitqCalibrationDistance(config, estimator, pq, code));
                 }
             }
         } else {
@@ -275,7 +334,8 @@ std::vector<float> GenerateRabitqSafeInDkSamples(
                     rotation, &pq, &scratch);
                 const auto& codes = all_codes[cid];
                 for (const auto& code : codes) {
-                    dists.push_back(estimator.EstimateDistanceMultiBit(pq, code));
+                    dists.push_back(
+                        EstimateRabitqCalibrationDistance(config, estimator, pq, code));
                 }
             }
         }
@@ -325,9 +385,31 @@ float CalibrateRabitqSafeInDk(
     const index::IvfIndex* index,
     index::SafeInDkSearchScope search_scope,
     uint32_t nprobe) {
+    return CalibrateRabitqSafeInDk(
+        queries, q, dim, top_k, sample_queries, percentile, cluster_members,
+        all_codes, centroids, rotation, LegacyRaBitQConfig(bits), seed, index,
+        search_scope, nprobe);
+}
+
+float CalibrateRabitqSafeInDk(
+    const float* queries,
+    uint32_t q,
+    Dim dim,
+    uint32_t top_k,
+    uint32_t sample_queries,
+    float percentile,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<float>& centroids,
+    const rabitq::RotationMatrix& rotation,
+    const RaBitQConfig& config,
+    uint64_t seed,
+    const index::IvfIndex* index,
+    index::SafeInDkSearchScope search_scope,
+    uint32_t nprobe) {
     auto samples = GenerateRabitqSafeInDkSamples(
         queries, q, dim, top_k, sample_queries, cluster_members, all_codes,
-        centroids, rotation, bits, seed, SafeInDkSamplingMode::Unique, index,
+        centroids, rotation, config, seed, SafeInDkSamplingMode::Unique, index,
         search_scope, nprobe);
     return SelectSafeInDkFromSamples(samples, percentile);
 }
@@ -357,10 +439,31 @@ float CalibrateSplitEpsilon(
     const std::vector<uint32_t>* cluster_subset,
     EpsilonSamplingMode sampling_mode,
     EpsilonCalibrationStats* stats) {
+    return CalibrateSplitEpsilon(
+        all_codes, cluster_members, vectors, centroids, rotation, dim,
+        max_samples_per_cluster, percentile, seed, d_k, LegacyRaBitQConfig(bits),
+        cluster_subset, sampling_mode, stats);
+}
+
+float CalibrateSplitEpsilon(
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const float* vectors,
+    const std::vector<float>& centroids,
+    const rabitq::RotationMatrix& rotation,
+    Dim dim,
+    uint32_t max_samples_per_cluster,
+    float percentile,
+    uint64_t seed,
+    float d_k,
+    const RaBitQConfig& config,
+    const std::vector<uint32_t>* cluster_subset,
+    EpsilonSamplingMode sampling_mode,
+    EpsilonCalibrationStats* stats) {
     const float lo = 0.1f * d_k;
     const float hi = 10.0f * d_k;
     std::vector<float> errors;
-    rabitq::RaBitQEstimator estimator(dim, bits);
+    rabitq::RaBitQEstimator estimator(dim, config.active_code_bits());
     std::vector<uint32_t> sample_ids;
     const bool use_subset = cluster_subset != nullptr && !cluster_subset->empty();
     if (stats != nullptr) {
@@ -374,9 +477,8 @@ float CalibrateSplitEpsilon(
                             const float* target) -> bool {
         const float true_dist = simd::L2Sqr(query, target, dim);
         if (true_dist < lo || true_dist > hi) return false;
-        const float est_dist = (bits > 1)
-            ? estimator.EstimateDistanceMultiBit(pq, code)
-            : estimator.EstimateDistanceAccurate(pq, code);
+        const float est_dist =
+            EstimateRabitqCalibrationDistance(config, estimator, pq, code);
         const float denom = 2.0f * code.norm * pq.norm_qc;
         if (denom <= 0.0f) return false;
         errors.push_back(std::abs(est_dist - true_dist) / denom);

@@ -1221,6 +1221,258 @@ TEST_F(ClusterStoreTest, ParseClusterBlock_Bits4MatchesLoadedData) {
     }
 }
 
+TEST_F(ClusterStoreTest, OfficialV13RejectsInvalidBitMetadata) {
+    RaBitQConfig config;
+    config.total_bits = 4;
+    config.ex_bits = 2;
+    config.estimator_mode = RaBitQEstimatorMode::kOfficial1PlusN;
+
+    ClusterStoreWriter writer;
+    auto status = writer.Open(TestPath("bad_official.clu"), 1, 64, config);
+    EXPECT_FALSE(status.ok());
+}
+
+TEST_F(ClusterStoreTest, OfficialV13PackedExDataHasNoSignBlocks) {
+    const Dim dim = 70;
+    const uint32_t N = 9;
+    std::string path = TestPath("official_v13.clu");
+
+    RaBitQConfig config;
+    config.total_bits = 4;
+    config.ex_bits = 3;
+    config.estimator_mode = RaBitQEstimatorMode::kOfficial1PlusN;
+
+    std::vector<RaBitQCode> codes(N);
+    const uint32_t words = (dim + 63) / 64;
+    for (uint32_t i = 0; i < N; ++i) {
+        codes[i].code.assign(words, 0);
+        codes[i].norm = 1.0f + static_cast<float>(i);
+        codes[i].sum_x = 0;
+        codes[i].bits = 3;
+        codes[i].ex_code.resize(dim);
+        codes[i].ex_code_sign_folded = true;
+        codes[i].xipnorm = 0.25f * static_cast<float>(i + 1);
+        codes[i].ex_factor_add = codes[i].norm * codes[i].norm;
+        codes[i].ex_factor_rescale = -2.0f * codes[i].norm * codes[i].xipnorm;
+        for (uint32_t d = 0; d < dim; ++d) {
+            if (((i + d) & 1u) != 0) {
+                codes[i].code[d / 64] |= (1ULL << (d % 64));
+            }
+            codes[i].ex_code[d] = static_cast<uint8_t>((i * 5u + d * 3u) & 0x07u);
+        }
+    }
+
+    std::vector<AddressEntry> addrs;
+    for (uint32_t i = 0; i < N; ++i) {
+        addrs.push_back({static_cast<uint64_t>(i) * 128u, dim * 4u});
+    }
+    auto addr_blocks = AddressColumn::Encode(addrs, 64, 1);
+    std::vector<float> centroid(dim, 0.0f);
+
+    ClusterStoreWriter writer;
+    ASSERT_TRUE(writer.Open(path, 1, dim, config).ok());
+    ASSERT_TRUE(writer.BeginCluster(0, N, centroid.data()).ok());
+    ASSERT_TRUE(writer.WriteVectors(codes).ok());
+    ASSERT_TRUE(writer.WriteAddressBlocks(addr_blocks).ok());
+    ASSERT_TRUE(writer.EndCluster().ok());
+    ASSERT_TRUE(writer.Finalize("data.dat").ok());
+
+    ClusterStoreReader reader;
+    ASSERT_TRUE(reader.Open(path).ok());
+    EXPECT_EQ(reader.file_version(), 13u);
+    EXPECT_EQ(reader.rabitq_config().estimator_mode,
+              RaBitQEstimatorMode::kOfficial1PlusN);
+    EXPECT_EQ(reader.rabitq_config().effective_total_bits(), 4u);
+    EXPECT_EQ(reader.rabitq_config().stage2_payload_bits(), 3u);
+
+    ASSERT_TRUE(reader.EnsureClusterLoaded(0).ok());
+    auto loc = reader.GetBlockLocation(0);
+    ASSERT_TRUE(loc.has_value());
+
+    constexpr size_t kAlignment = 4096;
+    const size_t alloc_size = static_cast<size_t>(loc->size);
+    const size_t padded_size =
+        ((alloc_size + kAlignment - 1) / kAlignment) * kAlignment;
+    auto* raw_block = static_cast<uint8_t*>(std::aligned_alloc(kAlignment, padded_size));
+    ASSERT_NE(raw_block, nullptr);
+    query::AlignedBufPtr block_buf(raw_block);
+    const ssize_t bytes = ::pread(reader.clu_fd(), block_buf.get(), alloc_size,
+                                  static_cast<off_t>(loc->offset));
+    ASSERT_EQ(bytes, static_cast<ssize_t>(alloc_size));
+
+    query::ParsedCluster parsed;
+    ASSERT_TRUE(reader.ParseClusterBlock(0, std::move(block_buf), loc->size, parsed).ok());
+    EXPECT_TRUE(parsed.uses_official_1_plus_n());
+    EXPECT_EQ(parsed.rabitq_total_bits, 4u);
+    EXPECT_EQ(parsed.rabitq_ex_bits, 3u);
+    EXPECT_EQ(parsed.rabitq_exdata_layout, RaBitQExDataLayout::kGenericPacked);
+    EXPECT_EQ(parsed.exrabitq_magnitude_bits, 3u);
+    EXPECT_TRUE(parsed.exrabitq_magnitude_packed);
+
+    const auto block_view = parsed.exrabitq_batch_block_view(0);
+    ASSERT_NE(block_view.abs_blocks, nullptr);
+    EXPECT_EQ(block_view.sign_blocks, nullptr);
+    EXPECT_EQ(block_view.xipnorms, nullptr);
+    ASSERT_NE(block_view.official_factor_adds, nullptr);
+    ASSERT_NE(block_view.official_factor_rescales, nullptr);
+    EXPECT_EQ(block_view.magnitude_bits, 3u);
+    EXPECT_TRUE(block_view.abs_packed);
+    EXPECT_EQ(block_view.exdata_layout, RaBitQExDataLayout::kGenericPacked);
+    EXPECT_FLOAT_EQ(block_view.official_factor_adds[0], codes[0].ex_factor_add);
+    EXPECT_FLOAT_EQ(block_view.official_factor_rescales[0],
+                    codes[0].ex_factor_rescale);
+
+    std::vector<RaBitQCode> loaded;
+    ASSERT_TRUE(reader.LoadCodes(0, {0, 8}, loaded).ok());
+    ASSERT_EQ(loaded.size(), 2u);
+    EXPECT_EQ(loaded[0].ex_code, codes[0].ex_code);
+    EXPECT_EQ(loaded[0].ex_sign_packed.size(), 0u);
+    EXPECT_FLOAT_EQ(loaded[0].xipnorm, codes[0].xipnorm);
+    EXPECT_TRUE(loaded[0].ex_code_sign_folded);
+    EXPECT_FLOAT_EQ(loaded[0].ex_factor_add, codes[0].ex_factor_add);
+    EXPECT_FLOAT_EQ(loaded[0].ex_factor_rescale, codes[0].ex_factor_rescale);
+    EXPECT_EQ(loaded[1].ex_code, codes[8].ex_code);
+    EXPECT_EQ(loaded[1].ex_sign_packed.size(), 0u);
+    EXPECT_FLOAT_EQ(loaded[1].xipnorm, codes[8].xipnorm);
+    EXPECT_TRUE(loaded[1].ex_code_sign_folded);
+    EXPECT_FLOAT_EQ(loaded[1].ex_factor_add, codes[8].ex_factor_add);
+    EXPECT_FLOAT_EQ(loaded[1].ex_factor_rescale, codes[8].ex_factor_rescale);
+
+    ClusterStoreReader resident_reader;
+    ASSERT_TRUE(resident_reader.Open(path).ok());
+    ASSERT_TRUE(resident_reader.PreloadAllClusters().ok());
+    ASSERT_TRUE(resident_reader.resident_preload_enabled());
+    const auto* resident_view = resident_reader.GetResidentClusterView(0);
+    ASSERT_NE(resident_view, nullptr);
+    const auto* resident_parsed = resident_reader.GetResidentParsedCluster(0);
+    ASSERT_NE(resident_parsed, nullptr);
+    ASSERT_FALSE(resident_view->code_storage.empty());
+    EXPECT_EQ(resident_view->code_storage_bytes, resident_view->code_storage.size());
+    EXPECT_EQ(resident_reader.resident_code_storage_bytes(),
+              resident_view->code_storage.size());
+    EXPECT_EQ(resident_view->exrabitq_parallel_abs_blocks_storage.size(), 0u);
+    EXPECT_EQ(resident_view->exrabitq_parallel_sign_words_storage.size(), 0u);
+
+    const uint8_t* resident_base = resident_view->code_storage.data();
+    const uint8_t* resident_end = resident_base + resident_view->code_storage.size();
+    EXPECT_GE(resident_parsed->fastscan_blocks, resident_base);
+    EXPECT_LT(resident_parsed->fastscan_blocks, resident_end);
+    EXPECT_GE(resident_parsed->exrabitq_batch_blocks, resident_base);
+    EXPECT_LT(resident_parsed->exrabitq_batch_blocks, resident_end);
+
+    const auto resident_block_view =
+        resident_parsed->exrabitq_batch_block_view(0);
+    ASSERT_NE(resident_block_view.abs_blocks, nullptr);
+    EXPECT_EQ(resident_block_view.sign_blocks, nullptr);
+    EXPECT_EQ(resident_block_view.exdata_layout, RaBitQExDataLayout::kGenericPacked);
+    ASSERT_NE(resident_block_view.official_factor_adds, nullptr);
+    ASSERT_NE(resident_block_view.official_factor_rescales, nullptr);
+    EXPECT_FLOAT_EQ(resident_block_view.official_factor_adds[0],
+                    codes[0].ex_factor_add);
+    EXPECT_FLOAT_EQ(resident_block_view.official_factor_rescales[0],
+                    codes[0].ex_factor_rescale);
+}
+
+TEST_F(ClusterStoreTest, OfficialV14DirectCompactExDataRoundTripsBothLayouts) {
+    const Dim dim = 70;
+    const uint32_t N = 9;
+    struct Case {
+        RaBitQExDataLayout layout;
+        uint8_t ex_bits;
+    };
+    for (const auto tc : {Case{RaBitQExDataLayout::kSplit1Bitplane, 1},
+                          Case{RaBitQExDataLayout::kSplit2Bitplanes, 2},
+                          Case{RaBitQExDataLayout::kSplit3TwoPlusOne, 3},
+                          Case{RaBitQExDataLayout::kSplit3Bitplanes, 3}}) {
+        const auto layout = tc.layout;
+        const uint8_t ex_bits = tc.ex_bits;
+        const uint8_t max_ex_code = static_cast<uint8_t>((1u << ex_bits) - 1u);
+        std::string path =
+            TestPath(std::string("official_v14_") +
+                     std::string(RaBitQExDataLayoutName(layout)) + ".clu");
+
+        RaBitQConfig config;
+        config.total_bits = static_cast<uint8_t>(ex_bits + 1u);
+        config.ex_bits = ex_bits;
+        config.estimator_mode = RaBitQEstimatorMode::kOfficial1PlusN;
+        config.exdata_layout = layout;
+
+        std::vector<RaBitQCode> codes(N);
+        const uint32_t words = (dim + 63) / 64;
+        for (uint32_t i = 0; i < N; ++i) {
+            codes[i].code.assign(words, 0);
+            codes[i].norm = 1.0f + static_cast<float>(i);
+            codes[i].sum_x = 0;
+            codes[i].bits = ex_bits;
+            codes[i].ex_code.resize(dim);
+            codes[i].ex_code_sign_folded = true;
+            codes[i].xipnorm = 0.25f * static_cast<float>(i + 1);
+            codes[i].ex_factor_add = codes[i].norm * codes[i].norm;
+            codes[i].ex_factor_rescale = -2.0f * codes[i].norm * codes[i].xipnorm;
+            for (uint32_t d = 0; d < dim; ++d) {
+                if (((i + d) & 1u) != 0) {
+                    codes[i].code[d / 64] |= (1ULL << (d % 64));
+                }
+                codes[i].ex_code[d] =
+                    static_cast<uint8_t>((i * 5u + d * 3u) & max_ex_code);
+            }
+        }
+
+        std::vector<AddressEntry> addrs;
+        for (uint32_t i = 0; i < N; ++i) {
+            addrs.push_back({static_cast<uint64_t>(i) * 128u, dim * 4u});
+        }
+        auto addr_blocks = AddressColumn::Encode(addrs, 64, 1);
+        std::vector<float> centroid(dim, 0.0f);
+
+        ClusterStoreWriter writer;
+        ASSERT_TRUE(writer.Open(path, 1, dim, config).ok());
+        ASSERT_TRUE(writer.BeginCluster(0, N, centroid.data()).ok());
+        ASSERT_TRUE(writer.WriteVectors(codes).ok());
+        ASSERT_TRUE(writer.WriteAddressBlocks(addr_blocks).ok());
+        ASSERT_TRUE(writer.EndCluster().ok());
+        ASSERT_TRUE(writer.Finalize("data.dat").ok());
+
+        ClusterStoreReader reader;
+        ASSERT_TRUE(reader.Open(path).ok());
+        EXPECT_EQ(reader.file_version(), 14u);
+        EXPECT_EQ(reader.rabitq_config().exdata_layout, layout);
+        EXPECT_EQ(reader.rabitq_config().effective_exdata_layout(), layout);
+
+        ASSERT_TRUE(reader.EnsureClusterLoaded(0).ok());
+        query::ParsedCluster parsed;
+        auto loc = reader.GetBlockLocation(0);
+        ASSERT_TRUE(loc.has_value());
+        constexpr size_t kAlignment = 4096;
+        const size_t padded_size =
+            ((static_cast<size_t>(loc->size) + kAlignment - 1) / kAlignment) * kAlignment;
+        auto* raw_block = static_cast<uint8_t*>(std::aligned_alloc(kAlignment, padded_size));
+        ASSERT_NE(raw_block, nullptr);
+        query::AlignedBufPtr block_buf(raw_block);
+        const ssize_t bytes = ::pread(reader.clu_fd(), block_buf.get(), loc->size,
+                                      static_cast<off_t>(loc->offset));
+        ASSERT_EQ(bytes, static_cast<ssize_t>(loc->size));
+        ASSERT_TRUE(reader.ParseClusterBlock(0, std::move(block_buf), loc->size, parsed).ok());
+        EXPECT_EQ(parsed.rabitq_exdata_layout, layout);
+        const auto block_view = parsed.exrabitq_batch_block_view(0);
+        EXPECT_EQ(block_view.exdata_layout, layout);
+
+        std::vector<RaBitQCode> loaded;
+        ASSERT_TRUE(reader.LoadCodes(0, {0, 8}, loaded).ok());
+        ASSERT_EQ(loaded.size(), 2u);
+        EXPECT_EQ(loaded[0].ex_code, codes[0].ex_code);
+        EXPECT_EQ(loaded[1].ex_code, codes[8].ex_code);
+
+        ClusterStoreReader resident_reader;
+        ASSERT_TRUE(resident_reader.Open(path).ok());
+        ASSERT_TRUE(resident_reader.PreloadAllClusters().ok());
+        const auto* resident_parsed = resident_reader.GetResidentParsedCluster(0);
+        ASSERT_NE(resident_parsed, nullptr);
+        EXPECT_EQ(resident_parsed->rabitq_exdata_layout, layout);
+        EXPECT_EQ(resident_parsed->exrabitq_batch_block_view(0).exdata_layout, layout);
+    }
+}
+
 TEST_F(ClusterStoreTest, ParseClusterBlock_V9RawAddressTableSupportsGaps) {
     const Dim dim = 32;
     const uint32_t N = 4;

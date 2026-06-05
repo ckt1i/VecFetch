@@ -16,6 +16,7 @@ struct FastScanPrepareTimingBreakdown {
 struct FastScanStage1EvalResult {
     uint32_t safeout_mask = 0;
     uint32_t safein_mask = 0;
+    float ip_x0_qr[32] = {};
 };
 
 /// VPSHUFB batch-32 accumulation of packed 4-bit LUT lookups.

@@ -131,13 +131,18 @@ table HnswParams {
 
 /// RaBitQ (Reduced-Bit Quantization) 量化参数
 table RaBitQParams {
-    bits: uint8;                 // 量化位数 (1/2/4/8, 默认 1)
+    bits: uint8;                 // legacy Stage2 payload bits; official mode uses ex_bits
     block_size: uint32;          // SIMD 块粒度 (默认 64)
     c_factor: float;             // (deprecated) 误差界因子，不再参与 epsilon 计算
     
     // 码本数据位置
     codebook_offset: uint64;     // 码本数据偏移
     codebook_length: uint32;     // 码本数据长度
+
+    rabitq_total_bits: uint8 = 0;        // official reported precision, or legacy bits
+    rabitq_ex_bits: uint8 = 0;           // official ExData payload bits, or legacy Stage2 bits
+    rabitq_estimator_mode: string;       // legacy_signed_magnitude / official_1_plus_n
+    cluster_clu_version: uint32 = 0;     // cluster.clu storage version
 }
 
 // ============================================================
@@ -174,6 +179,7 @@ table ConANNParams {
     safein_dk_search_scope: uint8 = 0;       // 0=full_database, 1=nprobe
     safein_dk_nprobe: uint32 = 0;
     safein_dk_bits: uint8 = 0;
+    safein_dk_estimator_mode: string;
 }
 
 // ============================================================

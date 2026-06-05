@@ -35,6 +35,11 @@ add_executable(bench_compare_stage_paths bench_compare_stage_paths.cpp)
 target_link_libraries(bench_compare_stage_paths PRIVATE vdb_query vdb_io)
 vdb_enable_target_avx512(bench_compare_stage_paths)
 
+# ----- Official 3-bit direct compact Stage2 kernel microbench -----
+add_executable(bench_direct3_kernel bench_direct3_kernel.cpp)
+target_link_libraries(bench_direct3_kernel PRIVATE vdb_simd)
+vdb_enable_target_avx512(bench_direct3_kernel)
+
 # ----- Index Geometry Utility -----
 add_executable(bench_index_geometry bench_index_geometry.cpp)
 target_link_libraries(bench_index_geometry PRIVATE vdb_index vdb_io)

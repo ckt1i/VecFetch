@@ -55,9 +55,9 @@ class ConANN {
     /// Construct from RaBitQ config and a precomputed d_k.
     ///
     /// Computes epsilon from the config:
-    ///   epsilon = cfg.c_factor * pow(2, -cfg.bits / 2.0f) / sqrt(dim)
+    ///   epsilon = cfg.c_factor * pow(2, -cfg.effective_total_bits() / 2.0f) / sqrt(dim)
     ///
-    /// @param cfg  RaBitQ configuration (provides c_factor, bits)
+    /// @param cfg  RaBitQ configuration (provides c_factor and bit semantics)
     /// @param dim  Vector dimensionality
     /// @param d_k  Precomputed global top-k reference distance
     /// @return     ConANN instance

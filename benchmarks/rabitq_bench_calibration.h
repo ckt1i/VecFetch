@@ -56,6 +56,16 @@ void EncodeAllCodes(const std::vector<float>& base_data,
                     const std::vector<std::vector<uint32_t>>& cluster_members,
                     const std::vector<float>& centroids,
                     const rabitq::RotationMatrix& rotation,
+                    const RaBitQConfig& config,
+                    const std::vector<uint32_t>* cluster_subset,
+                    std::vector<std::vector<rabitq::RaBitQCode>>* all_codes);
+
+void EncodeAllCodes(const std::vector<float>& base_data,
+                    uint32_t n,
+                    Dim dim,
+                    const std::vector<std::vector<uint32_t>>& cluster_members,
+                    const std::vector<float>& centroids,
+                    const rabitq::RotationMatrix& rotation,
                     uint8_t bits,
                     const std::vector<uint32_t>* cluster_subset,
                     std::vector<std::vector<rabitq::RaBitQCode>>* all_codes);
@@ -70,6 +80,24 @@ std::vector<float> GenerateExactSafeInDkSamples(
     uint32_t sample_queries,
     uint64_t seed,
     SafeInDkSamplingMode sampling_mode);
+
+std::vector<float> GenerateRabitqSafeInDkSamples(
+    const float* queries,
+    uint32_t q,
+    Dim dim,
+    uint32_t top_k,
+    uint32_t sample_queries,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<float>& centroids,
+    const rabitq::RotationMatrix& rotation,
+    const RaBitQConfig& config,
+    uint64_t seed,
+    SafeInDkSamplingMode sampling_mode,
+    const index::IvfIndex* index = nullptr,
+    index::SafeInDkSearchScope search_scope =
+        index::SafeInDkSearchScope::FullDatabase,
+    uint32_t nprobe = 0);
 
 std::vector<float> GenerateRabitqSafeInDkSamples(
     const float* queries,
@@ -114,12 +142,47 @@ float CalibrateRabitqSafeInDk(
     const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
     const std::vector<float>& centroids,
     const rabitq::RotationMatrix& rotation,
+    const RaBitQConfig& config,
+    uint64_t seed,
+    const index::IvfIndex* index = nullptr,
+    index::SafeInDkSearchScope search_scope =
+        index::SafeInDkSearchScope::FullDatabase,
+    uint32_t nprobe = 0);
+
+float CalibrateRabitqSafeInDk(
+    const float* queries,
+    uint32_t q,
+    Dim dim,
+    uint32_t top_k,
+    uint32_t sample_queries,
+    float percentile,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<float>& centroids,
+    const rabitq::RotationMatrix& rotation,
     uint8_t bits,
     uint64_t seed,
     const index::IvfIndex* index = nullptr,
     index::SafeInDkSearchScope search_scope =
         index::SafeInDkSearchScope::FullDatabase,
     uint32_t nprobe = 0);
+
+float CalibrateSplitEpsilon(
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const float* vectors,
+    const std::vector<float>& centroids,
+    const rabitq::RotationMatrix& rotation,
+    Dim dim,
+    uint32_t max_samples_per_cluster,
+    float percentile,
+    uint64_t seed,
+    float d_k,
+    const RaBitQConfig& config,
+    const std::vector<uint32_t>* cluster_subset,
+    EpsilonSamplingMode sampling_mode =
+        EpsilonSamplingMode::LegacyPerCluster,
+    EpsilonCalibrationStats* stats = nullptr);
 
 float CalibrateSplitEpsilon(
     const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,

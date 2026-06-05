@@ -102,6 +102,11 @@ class ClusterStoreReader {
         uint32_t exrabitq_abs_bytes_per_lane_dim_block = 0;
         uint8_t exrabitq_magnitude_bits = 0;
         bool exrabitq_magnitude_packed = false;
+        uint8_t rabitq_total_bits = 1;
+        uint8_t rabitq_ex_bits = 0;
+        RaBitQEstimatorMode rabitq_estimator_mode =
+            RaBitQEstimatorMode::kLegacySignedMagnitude;
+        RaBitQExDataLayout rabitq_exdata_layout = RaBitQExDataLayout::kGenericPacked;
         std::vector<uint8_t> exrabitq_parallel_abs_blocks_storage;
         std::vector<uint16_t> exrabitq_parallel_sign_words_storage;
         uint32_t exrabitq_parallel_abs_block_size = 0;
@@ -137,6 +142,10 @@ class ClusterStoreReader {
                 exrabitq_abs_bytes_per_lane_dim_block;
             pc.exrabitq_magnitude_bits = exrabitq_magnitude_bits;
             pc.exrabitq_magnitude_packed = exrabitq_magnitude_packed;
+            pc.rabitq_total_bits = rabitq_total_bits;
+            pc.rabitq_ex_bits = rabitq_ex_bits;
+            pc.rabitq_estimator_mode = rabitq_estimator_mode;
+            pc.rabitq_exdata_layout = rabitq_exdata_layout;
             pc.exrabitq_parallel_abs_blocks =
                 exrabitq_parallel_abs_blocks_storage.empty()
                 ? nullptr
@@ -283,6 +292,7 @@ class ClusterStoreReader {
         return fastscan_packed_size() + 32 * sizeof(float);
     }
     uint32_t exrabitq_sign_bytes() const {
+        if (info_.rabitq_config.uses_official_1_plus_n()) return 0;
         if (info_.rabitq_config.bits <= 1) return 0;
         if (file_version_ >= 10) return (info_.dim + 7) / 8;
         return info_.dim;
@@ -303,25 +313,34 @@ class ClusterStoreReader {
         return db == 0 ? 0 : (info_.dim + db - 1) / db;
     }
     bool exrabitq_magnitude_packed() const {
-        return info_.rabitq_config.bits > 1 && file_version_ >= 12;
+        return info_.rabitq_config.stage2_payload_bits() > 0 && file_version_ >= 12;
     }
     uint32_t exrabitq_abs_bytes_per_lane_dim_block() const {
-        if (info_.rabitq_config.bits <= 1 || file_version_ < 11) return 0;
+        const uint8_t stage2_bits = info_.rabitq_config.stage2_payload_bits();
+        if (stage2_bits == 0 || file_version_ < 11) return 0;
         const uint32_t db = exrabitq_dim_block();
         if (file_version_ >= 12) {
-            return (db * static_cast<uint32_t>(info_.rabitq_config.bits) + 7u) / 8u;
+            return (db * static_cast<uint32_t>(stage2_bits) + 7u) / 8u;
         }
         return db;
     }
     uint32_t exrabitq_batch_block_size() const {
-        if (info_.rabitq_config.bits <= 1 || file_version_ < 11) return 0;
+        if (info_.rabitq_config.stage2_payload_bits() == 0 || file_version_ < 11) {
+            return 0;
+        }
         const uint32_t batch = exrabitq_batch_size();
         const uint32_t db = exrabitq_dim_block();
         const uint32_t blocks = exrabitq_dim_block_count();
         const uint32_t abs_bytes =
             blocks * batch * exrabitq_abs_bytes_per_lane_dim_block();
-        const uint32_t sign_bytes = blocks * batch * (db / 8);
-        return sizeof(uint32_t) + abs_bytes + sign_bytes + batch * sizeof(float);
+        const uint32_t sign_bytes = info_.rabitq_config.uses_official_1_plus_n()
+            ? 0
+            : blocks * batch * (db / 8);
+        const uint32_t factor_count = info_.rabitq_config.uses_official_1_plus_n()
+            ? batch * 2u
+            : batch;
+        return sizeof(uint32_t) + abs_bytes + sign_bytes +
+               factor_count * sizeof(float);
     }
 
     Status ParseClusterBlockView(uint32_t cluster_id,

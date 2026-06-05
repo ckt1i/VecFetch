@@ -37,9 +37,9 @@ ConANN::ConANN(float epsilon, float legacy_d_k, float safein_d_k,
       tau_out_(legacy_d_k + 2.0f * epsilon) {}
 
 ConANN ConANN::FromConfig(const RaBitQConfig& cfg, Dim dim, float d_k) {
-    // epsilon = c_factor * 2^(-bits/2) / sqrt(dim)
+    // epsilon = c_factor * 2^(-total_bits/2) / sqrt(dim)
     float eps = cfg.c_factor
-              * std::pow(2.0f, -static_cast<float>(cfg.bits) / 2.0f)
+              * std::pow(2.0f, -static_cast<float>(cfg.effective_total_bits()) / 2.0f)
               / std::sqrt(static_cast<float>(dim));
     return ConANN(eps, d_k);
 }

@@ -582,10 +582,26 @@ TEST_F(Phase25SchemaTest, CreateRaBitQParams) {
 }
 
 TEST_F(Phase25SchemaTest, CreateConANNParams) {
+    auto safein_mode = builder_.CreateString("official_1_plus_n");
     auto conann = schema::CreateConANNParams(
         builder_,
         0.8f,       // tau_in_factor
-        1.2f        // tau_out_factor
+        1.2f,       // tau_out_factor
+        0.0f,       // epsilon
+        0.0f,       // d_k
+        0,          // calibration_samples
+        0,          // calibration_topk
+        0.0f,       // calibration_percentile
+        0.0f,       // eps_ip_fs
+        false,      // has_rotated_centroids
+        0.0f,       // safein_d_k
+        1,          // safein_dk_space
+        0.99f,      // safein_dk_percentile
+        12,         // safein_dk_calibration_samples
+        1,          // safein_dk_search_scope
+        4,          // safein_dk_nprobe
+        4,          // safein_dk_bits
+        safein_mode
     );
     
     builder_.Finish(conann);
@@ -594,6 +610,9 @@ TEST_F(Phase25SchemaTest, CreateConANNParams) {
     ASSERT_NE(read, nullptr);
     EXPECT_NEAR(read->tau_in_factor(), 0.8f, 0.001f);
     EXPECT_NEAR(read->tau_out_factor(), 1.2f, 0.001f);
+    ASSERT_NE(read->safein_dk_estimator_mode(), nullptr);
+    EXPECT_STREQ(read->safein_dk_estimator_mode()->c_str(),
+                 "official_1_plus_n");
 }
 
 TEST_F(Phase25SchemaTest, CreateAddressBlockMeta) {

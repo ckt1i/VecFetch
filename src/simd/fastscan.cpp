@@ -1163,6 +1163,11 @@ void FastScanStage1Evaluate(const uint32_t* VDB_RESTRICT raw_accu,
         const __m512 v_raw = _mm512_cvtepu32_ps(v_raw_i);
         const __m512 v_ip_raw =
             _mm512_mul_ps(_mm512_add_ps(v_raw, v_shift), v_width);
+        if (valid >= 16) {
+            _mm512_storeu_ps(local.ip_x0_qr + base, v_ip_raw);
+        } else {
+            _mm512_mask_storeu_ps(local.ip_x0_qr + base, lane_mask, v_ip_raw);
+        }
         const __m512 v_ip_est =
             _mm512_mul_ps(_mm512_fmsub_ps(v_two, v_ip_raw, v_sum_q),
                           v_inv_sqrt);
@@ -1207,6 +1212,11 @@ void FastScanStage1Evaluate(const uint32_t* VDB_RESTRICT raw_accu,
         ? FastScanSafeInMask(out_dist, block_norms, count,
                              safein_threshold_base, safein_margin_factor)
         : 0u;
+    for (uint32_t v = 0; v < count; ++v) {
+        local.ip_x0_qr[v] =
+            (static_cast<float>(raw_accu[v]) + static_cast<float>(fs_shift)) *
+            fs_width;
+    }
 #endif
     if (result != nullptr) {
         *result = local;

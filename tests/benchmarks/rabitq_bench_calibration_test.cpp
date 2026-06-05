@@ -147,6 +147,39 @@ TEST(SafeInDkCalibrationTest, CalibratesExactDkWithConannPercentileRule) {
     EXPECT_FLOAT_EQ(threshold, 36.0f);
 }
 
+TEST(SafeInDkCalibrationTest, OfficialRabitqSamplesAndSplitEpsilonAreFinite) {
+    ToyCalibrationData data;
+    RaBitQConfig config;
+    config.total_bits = 4;
+    config.ex_bits = 3;
+    config.estimator_mode = RaBitQEstimatorMode::kOfficial1PlusN;
+
+    std::vector<std::vector<rabitq::RaBitQCode>> official_codes;
+    EncodeAllCodes(data.vectors,
+                   static_cast<uint32_t>(data.vectors.size() / data.dim),
+                   data.dim, data.cluster_members, data.centroids,
+                   data.rotation, config, nullptr, &official_codes);
+
+    auto samples = GenerateRabitqSafeInDkSamples(
+        data.vectors.data(),
+        static_cast<uint32_t>(data.vectors.size() / data.dim),
+        data.dim, 2, 4, data.cluster_members, official_codes,
+        data.centroids, data.rotation, config, 42,
+        SafeInDkSamplingMode::Unique);
+    ASSERT_FALSE(samples.empty());
+    for (float sample : samples) {
+        EXPECT_TRUE(std::isfinite(sample));
+    }
+
+    EpsilonCalibrationStats stats;
+    const float eps = CalibrateSplitEpsilon(
+        official_codes, data.cluster_members, data.vectors.data(),
+        data.centroids, data.rotation, data.dim, 4, 0.95f, 42, 0.1f,
+        config, nullptr, EpsilonSamplingMode::GlobalPair, &stats);
+    EXPECT_TRUE(std::isfinite(eps));
+    EXPECT_GT(stats.valid_error_count, 0u);
+}
+
 TEST(SafeInDkCalibrationTest, NamesThresholdSources) {
     EXPECT_STREQ(SafeInThresholdSourceName(SafeInThresholdSource::ExactL2),
                  "exact_l2");

@@ -18,6 +18,8 @@ namespace storage {
 
 static constexpr uint32_t kGlobalMagic = 0x4C4D4356;
 static constexpr uint32_t kFileVersion = 12;
+static constexpr uint32_t kFileVersionV14 = 14;
+static constexpr uint32_t kFileVersionV13 = 13;
 static constexpr uint32_t kFileVersionV11 = 11;
 static constexpr uint32_t kFileVersionV10 = 10;
 static constexpr uint32_t kFileVersionV9 = 9;
@@ -45,7 +47,11 @@ inline bool SupportsPackedStage2MagnitudeBits(uint8_t bits) {
     return bits == 2 || bits == 4;
 }
 
-inline uint32_t EffectiveWriterFileVersion(uint8_t bits) {
+inline bool SupportsOfficialExDataBits(uint8_t ex_bits) {
+    return ex_bits == 0 || ex_bits == 1 || ex_bits == 2 || ex_bits == 3 || ex_bits == 4;
+}
+
+inline uint32_t EffectiveLegacyWriterFileVersion(uint8_t bits) {
     const char* env = std::getenv("VDB_CLUSTER_STORE_VERSION");
     if (env == nullptr || env[0] == '\0') {
         return (bits > 1 && !SupportsPackedStage2MagnitudeBits(bits))
@@ -59,6 +65,15 @@ inline uint32_t EffectiveWriterFileVersion(uint8_t bits) {
     return (bits > 1 && !SupportsPackedStage2MagnitudeBits(bits))
         ? kFileVersionV11
         : kFileVersion;
+}
+
+inline uint32_t EffectiveWriterFileVersion(const RaBitQConfig& cfg) {
+    if (cfg.uses_official_1_plus_n()) {
+        return RaBitQExDataLayoutIsDirect(cfg.effective_exdata_layout())
+            ? kFileVersionV14
+            : kFileVersionV13;
+    }
+    return EffectiveLegacyWriterFileVersion(cfg.bits);
 }
 
 inline void WriteRaw(std::fstream& f, const void* data, size_t len) {
@@ -116,6 +131,7 @@ void BuildResidentParallelStage2View(const query::ParsedCluster& parsed,
                                      ClusterStoreReader::ResidentClusterView* view) {
     if (view == nullptr) return;
     if (parsed.exrabitq_storage_version < kFileVersionV11 ||
+        parsed.uses_official_1_plus_n() ||
         parsed.exrabitq_batch_blocks == nullptr ||
         parsed.exrabitq_magnitude_packed ||
         parsed.exrabitq_batch_size == 0 ||
@@ -215,6 +231,10 @@ void CopyParsedMetadataToResident(const query::ParsedCluster& parsed,
         parsed.exrabitq_abs_bytes_per_lane_dim_block;
     view->exrabitq_magnitude_bits = parsed.exrabitq_magnitude_bits;
     view->exrabitq_magnitude_packed = parsed.exrabitq_magnitude_packed;
+    view->rabitq_total_bits = parsed.rabitq_total_bits;
+    view->rabitq_ex_bits = parsed.rabitq_ex_bits;
+    view->rabitq_estimator_mode = parsed.rabitq_estimator_mode;
+    view->rabitq_exdata_layout = parsed.rabitq_exdata_layout;
     view->num_records = parsed.num_records;
     view->epsilon = parsed.epsilon;
     view->address_page_size = parsed.address_page_size;
@@ -284,14 +304,44 @@ Status ClusterStoreWriter::Open(const std::string& path,
     info_.num_clusters = num_clusters;
     info_.dim = dim;
     info_.rabitq_config = rabitq_config;
+    info_.rabitq_config.storage_version =
+        static_cast<uint8_t>(EffectiveWriterFileVersion(info_.rabitq_config));
+    if (info_.rabitq_config.uses_official_1_plus_n()) {
+        if (!info_.rabitq_config.official_bits_valid()) {
+            return Status::InvalidArgument(
+                "official RaBitQ requires total_bits == ex_bits + 1");
+        }
+        if (!SupportsOfficialExDataBits(info_.rabitq_config.ex_bits)) {
+            return Status::InvalidArgument(
+                "official RaBitQ ExData supports ex_bits=0,1,2,3,4");
+        }
+        if (!info_.rabitq_config.exdata_layout_valid()) {
+            return Status::InvalidArgument(
+                "official optimized ExData layout is incompatible with ex_bits");
+        }
+        info_.rabitq_config.exdata_layout =
+            info_.rabitq_config.effective_exdata_layout();
+        info_.rabitq_config.bits =
+            info_.rabitq_config.ex_bits > 0 ? info_.rabitq_config.ex_bits : 1;
+    } else {
+        if (!info_.rabitq_config.exdata_layout_valid()) {
+            return Status::InvalidArgument(
+                "legacy RaBitQ requires generic ExData layout");
+        }
+        info_.rabitq_config.total_bits = info_.rabitq_config.bits;
+        info_.rabitq_config.ex_bits =
+            info_.rabitq_config.bits > 1 ? info_.rabitq_config.bits : 0;
+        info_.rabitq_config.exdata_layout = RaBitQExDataLayout::kGenericPacked;
+    }
     info_.lookup_table.resize(num_clusters);
     current_cluster_index_ = 0;
     in_cluster_ = false;
     finalized_ = false;
 
-    const uint32_t file_version = EffectiveWriterFileVersion(rabitq_config.bits);
-    if (file_version >= kFileVersion && rabitq_config.bits > 1 &&
-        !SupportsPackedStage2MagnitudeBits(rabitq_config.bits)) {
+    const uint32_t file_version = EffectiveWriterFileVersion(info_.rabitq_config);
+    if (file_version >= kFileVersion && !info_.rabitq_config.uses_official_1_plus_n() &&
+        info_.rabitq_config.bits > 1 &&
+        !SupportsPackedStage2MagnitudeBits(info_.rabitq_config.bits)) {
         return Status::InvalidArgument(
             "Packed ExRaBitQ Stage2 magnitude supports only bits=2 or bits=4");
     }
@@ -305,9 +355,17 @@ Status ClusterStoreWriter::Open(const std::string& path,
     WriteVal(file_, file_version);
     WriteVal(file_, num_clusters);
     WriteVal(file_, dim);
-    WriteVal(file_, rabitq_config.bits);
-    WriteVal(file_, rabitq_config.block_size);
-    WriteVal(file_, rabitq_config.c_factor);
+    WriteVal(file_, info_.rabitq_config.bits);
+    WriteVal(file_, info_.rabitq_config.block_size);
+    WriteVal(file_, info_.rabitq_config.c_factor);
+    if (file_version >= kFileVersionV13) {
+        WriteVal(file_, info_.rabitq_config.total_bits);
+        WriteVal(file_, info_.rabitq_config.ex_bits);
+        WriteVal(file_, static_cast<uint8_t>(info_.rabitq_config.estimator_mode));
+        if (file_version >= kFileVersionV14) {
+            WriteVal(file_, static_cast<uint8_t>(info_.rabitq_config.exdata_layout));
+        }
+    }
 
     header_data_file_path_offset_ = static_cast<uint64_t>(file_.tellp());
     uint32_t zero_path_len = 0;
@@ -402,10 +460,16 @@ Status ClusterStoreWriter::WriteVectors(
     current_exrabitq_region_offset_ =
         static_cast<uint32_t>(current_offset_ - block_start_);
 
-    if (info_.rabitq_config.bits > 1) {
+    if (info_.rabitq_config.stage2_payload_bits() > 0) {
         const uint32_t writer_version =
-            EffectiveWriterFileVersion(info_.rabitq_config.bits);
-        if (writer_version >= kFileVersion &&
+            EffectiveWriterFileVersion(info_.rabitq_config);
+        const bool official = info_.rabitq_config.uses_official_1_plus_n();
+        const uint8_t stage2_bits = info_.rabitq_config.stage2_payload_bits();
+        const RaBitQExDataLayout exdata_layout =
+            info_.rabitq_config.effective_exdata_layout();
+        const bool official_direct =
+            official && RaBitQExDataLayoutIsDirect(exdata_layout);
+        if (writer_version >= kFileVersion && !official &&
             !SupportsPackedStage2MagnitudeBits(info_.rabitq_config.bits)) {
             return Status::InvalidArgument(
                 "Packed ExRaBitQ Stage2 magnitude supports only bits=2 or bits=4");
@@ -421,8 +485,12 @@ Status ClusterStoreWriter::WriteVectors(
             const uint32_t sign_block_bytes = dim_block / 8;
             const uint32_t abs_lane_bytes = pack_stage2_magnitude
                 ? simd::ExRaBitQPackedMagnitudeBytes(
-                      dim_block, info_.rabitq_config.bits)
+                      dim_block, stage2_bits)
                 : dim_block;
+            if (pack_stage2_magnitude && abs_lane_bytes == 0) {
+                return Status::InvalidArgument(
+                    "unsupported ExRaBitQ packed Stage2 payload bit width");
+            }
 
             for (uint32_t bb = 0; bb < num_batch_blocks; ++bb) {
                 const uint32_t start = bb * batch_size;
@@ -435,7 +503,15 @@ Status ClusterStoreWriter::WriteVectors(
                         uint8_t abs_buf[64] = {0};
                         if (lane < valid_count) {
                             const auto& code = codes[start + lane];
-                            if (code.ex_code.size() != dim ||
+                            if (code.ex_code.size() != dim) {
+                                return Status::InvalidArgument(
+                                    "ExRaBitQ code size mismatch with dim");
+                            }
+                            if (official && !code.ex_code_sign_folded) {
+                                return Status::InvalidArgument(
+                                    "official ExRaBitQ v13 requires sign-folded ExData");
+                            }
+                            if (!official &&
                                 code.ex_sign_packed.size() != sign_bytes) {
                                 return Status::InvalidArgument(
                                     "ExRaBitQ code/sign size mismatch with dim");
@@ -445,9 +521,22 @@ Status ClusterStoreWriter::WriteVectors(
                         }
                         if (pack_stage2_magnitude) {
                             uint8_t packed_abs_buf[32] = {0};
-                            if (!simd::ExRaBitQPackMagnitudes(
-                                    abs_buf, dim_block, info_.rabitq_config.bits,
-                                    packed_abs_buf, abs_lane_bytes)) {
+                            bool packed_ok = false;
+                            if (official_direct) {
+                                packed_ok =
+                                    exdata_layout == RaBitQExDataLayout::kSplit3TwoPlusOne
+                                        ? simd::ExRaBitQPackOfficialDirect3(
+                                              abs_buf, dim_block, exdata_layout,
+                                              packed_abs_buf, abs_lane_bytes)
+                                        : simd::ExRaBitQPackOfficialDirectBitplanes(
+                                              abs_buf, dim_block, stage2_bits,
+                                              packed_abs_buf, abs_lane_bytes);
+                            } else {
+                                packed_ok = simd::ExRaBitQPackMagnitudes(
+                                    abs_buf, dim_block, stage2_bits,
+                                    packed_abs_buf, abs_lane_bytes);
+                            }
+                            if (!packed_ok) {
                                 return Status::InvalidArgument(
                                     "ExRaBitQ code contains value outside bit-width range");
                             }
@@ -457,27 +546,44 @@ Status ClusterStoreWriter::WriteVectors(
                         }
                     }
                 }
-                for (uint32_t db = 0; db < num_dim_blocks; ++db) {
-                    const uint32_t dim_start = db * dim_block;
-                    const uint32_t sign_offset = dim_start / 8;
-                    const uint32_t sign_copy =
-                        sign_offset < sign_bytes
-                            ? std::min(sign_block_bytes, sign_bytes - sign_offset)
-                            : 0;
-                    for (uint32_t lane = 0; lane < batch_size; ++lane) {
-                        uint8_t sign_buf[8] = {0};
-                        if (lane < valid_count && sign_copy > 0) {
-                            const auto& code = codes[start + lane];
-                            const uint8_t* src = code.ex_sign_packed.data() + sign_offset;
-                            std::memcpy(sign_buf, src, sign_copy);
+                if (!official) {
+                    for (uint32_t db = 0; db < num_dim_blocks; ++db) {
+                        const uint32_t dim_start = db * dim_block;
+                        const uint32_t sign_offset = dim_start / 8;
+                        const uint32_t sign_copy =
+                            sign_offset < sign_bytes
+                                ? std::min(sign_block_bytes, sign_bytes - sign_offset)
+                                : 0;
+                        for (uint32_t lane = 0; lane < batch_size; ++lane) {
+                            uint8_t sign_buf[8] = {0};
+                            if (lane < valid_count && sign_copy > 0) {
+                                const auto& code = codes[start + lane];
+                                const uint8_t* src = code.ex_sign_packed.data() + sign_offset;
+                                std::memcpy(sign_buf, src, sign_copy);
+                            }
+                            WriteRaw(file_, sign_buf, sign_block_bytes);
                         }
-                        WriteRaw(file_, sign_buf, sign_block_bytes);
                     }
                 }
-                for (uint32_t lane = 0; lane < batch_size; ++lane) {
-                    const float xipnorm =
-                        (lane < valid_count) ? codes[start + lane].xipnorm : 0.0f;
-                    WriteVal(file_, xipnorm);
+                if (official) {
+                    for (uint32_t lane = 0; lane < batch_size; ++lane) {
+                        const float factor_add =
+                            (lane < valid_count) ? codes[start + lane].ex_factor_add : 0.0f;
+                        WriteVal(file_, factor_add);
+                    }
+                    for (uint32_t lane = 0; lane < batch_size; ++lane) {
+                        const float factor_rescale =
+                            (lane < valid_count)
+                                ? codes[start + lane].ex_factor_rescale
+                                : 0.0f;
+                        WriteVal(file_, factor_rescale);
+                    }
+                } else {
+                    for (uint32_t lane = 0; lane < batch_size; ++lane) {
+                        const float xipnorm =
+                            (lane < valid_count) ? codes[start + lane].xipnorm : 0.0f;
+                        WriteVal(file_, xipnorm);
+                    }
                 }
                 if (!file_.good()) {
                     return Status::IOError("Failed to write ExRaBitQ compact block");
@@ -485,8 +591,8 @@ Status ClusterStoreWriter::WriteVectors(
                 const uint32_t block_bytes =
                     sizeof(uint32_t) +
                     num_dim_blocks * batch_size * abs_lane_bytes +
-                    num_dim_blocks * batch_size * sign_block_bytes +
-                    batch_size * sizeof(float);
+                    (official ? 0 : num_dim_blocks * batch_size * sign_block_bytes) +
+                    (official ? batch_size * 2u : batch_size) * sizeof(float);
                 current_offset_ += block_bytes;
             }
         } else {
@@ -573,9 +679,9 @@ Status ClusterStoreWriter::EndCluster() {
 
     const uint64_t trailer_start = current_offset_;
     uint32_t ex_region_bytes = 0;
-    if (info_.rabitq_config.bits > 1) {
+    if (info_.rabitq_config.stage2_payload_bits() > 0) {
         const uint32_t writer_version =
-            EffectiveWriterFileVersion(info_.rabitq_config.bits);
+            EffectiveWriterFileVersion(info_.rabitq_config);
         if (writer_version >= kFileVersionV11) {
             const uint32_t batch_size = ExRaBitQBatchSize();
             const uint32_t dim_block = ExRaBitQDimBlock();
@@ -583,13 +689,14 @@ Status ClusterStoreWriter::EndCluster() {
             const uint32_t sign_block_bytes = dim_block / 8;
             const uint32_t abs_lane_bytes = writer_version >= kFileVersion
                 ? simd::ExRaBitQPackedMagnitudeBytes(
-                      dim_block, info_.rabitq_config.bits)
+                      dim_block, info_.rabitq_config.stage2_payload_bits())
                 : dim_block;
+            const bool official = info_.rabitq_config.uses_official_1_plus_n();
             const uint32_t batch_block_size =
                 sizeof(uint32_t) +
                 num_dim_blocks * batch_size * abs_lane_bytes +
-                num_dim_blocks * batch_size * sign_block_bytes +
-                batch_size * sizeof(float);
+                (official ? 0 : num_dim_blocks * batch_size * sign_block_bytes) +
+                (official ? batch_size * 2u : batch_size) * sizeof(float);
             ex_region_bytes =
                 ((info_.lookup_table[current_cluster_index_].num_records + batch_size - 1) /
                  batch_size) *
@@ -851,7 +958,9 @@ Status ClusterStoreReader::Open(const std::string& path, bool use_direct_io) {
         }
         std::memcpy(&version, p, 4);
         p += 4;
-        if (version != kFileVersion && version != kFileVersionV11 &&
+        if (version != kFileVersionV14 &&
+            version != kFileVersionV13 &&
+            version != kFileVersion && version != kFileVersionV11 &&
             version != kFileVersionV10 && version != kFileVersionV9 &&
             version != kFileVersionV8 &&
             version != kFileVersionV7) {
@@ -872,7 +981,63 @@ Status ClusterStoreReader::Open(const std::string& path, bool use_direct_io) {
         p += 4;
         std::memcpy(&info_.rabitq_config.c_factor, p, 4);
         p += 4;
-        if (version >= kFileVersion && info_.rabitq_config.bits > 1 &&
+        info_.rabitq_config.storage_version = static_cast<uint8_t>(version);
+        if (version >= kFileVersionV13) {
+            std::memcpy(&info_.rabitq_config.total_bits, p, 1);
+            p += 1;
+            std::memcpy(&info_.rabitq_config.ex_bits, p, 1);
+            p += 1;
+            uint8_t estimator_mode = 0;
+            std::memcpy(&estimator_mode, p, 1);
+            p += 1;
+            info_.rabitq_config.estimator_mode =
+                RaBitQEstimatorModeFromByte(estimator_mode);
+            info_.rabitq_config.exdata_layout = RaBitQExDataLayout::kGenericPacked;
+            if (version >= kFileVersionV14) {
+                uint8_t exdata_layout = 0;
+                std::memcpy(&exdata_layout, p, 1);
+                p += 1;
+                if (!RaBitQExDataLayoutByteValid(exdata_layout)) {
+                    std::free(hdr_buf);
+                    Close();
+                    return Status::Corruption("unknown RaBitQ ExData layout byte");
+                }
+                info_.rabitq_config.exdata_layout =
+                    RaBitQExDataLayoutFromByte(exdata_layout);
+            }
+            if (!info_.rabitq_config.uses_official_1_plus_n()) {
+                std::free(hdr_buf);
+                Close();
+                return Status::Corruption("v13 ClusterStore requires official_1_plus_n mode");
+            }
+            if (!info_.rabitq_config.official_bits_valid()) {
+                std::free(hdr_buf);
+                Close();
+                return Status::Corruption(
+                    "official RaBitQ metadata violates total_bits == ex_bits + 1");
+            }
+            if (!SupportsOfficialExDataBits(info_.rabitq_config.ex_bits)) {
+                std::free(hdr_buf);
+                Close();
+                return Status::NotSupported(
+                    "official RaBitQ ExData supports only ex_bits=0,1,2,3,4");
+            }
+            if (!info_.rabitq_config.exdata_layout_valid()) {
+                std::free(hdr_buf);
+                Close();
+                return Status::Corruption(
+                    "official RaBitQ ExData layout is incompatible with ex_bits");
+            }
+        } else {
+            info_.rabitq_config.estimator_mode =
+                RaBitQEstimatorMode::kLegacySignedMagnitude;
+            info_.rabitq_config.total_bits = info_.rabitq_config.bits;
+            info_.rabitq_config.ex_bits =
+                info_.rabitq_config.bits > 1 ? info_.rabitq_config.bits : 0;
+            info_.rabitq_config.exdata_layout = RaBitQExDataLayout::kGenericPacked;
+        }
+        if (version >= kFileVersion && version < kFileVersionV13 &&
+            info_.rabitq_config.bits > 1 &&
             !SupportsPackedStage2MagnitudeBits(info_.rabitq_config.bits)) {
             std::free(hdr_buf);
             Close();
@@ -1397,7 +1562,8 @@ Status ClusterStoreReader::ParseClusterBlockView(
     out.exrabitq_sign_packed = (file_version_ >= kFileVersionV10);
     out.exrabitq_storage_version = file_version_;
     out.exrabitq_batch_blocks =
-        (file_version_ >= kFileVersionV11 && info_.rabitq_config.bits > 1)
+        (file_version_ >= kFileVersionV11 &&
+         info_.rabitq_config.stage2_payload_bits() > 0)
             ? block_ptr + region1_size
             : nullptr;
     out.exrabitq_batch_block_size = exrabitq_batch_block_size();
@@ -1407,8 +1573,12 @@ Status ClusterStoreReader::ParseClusterBlockView(
     out.exrabitq_num_batch_blocks = exrabitq_num_batch_blocks(entry.num_records);
     out.exrabitq_abs_bytes_per_lane_dim_block =
         exrabitq_abs_bytes_per_lane_dim_block();
-    out.exrabitq_magnitude_bits = info_.rabitq_config.bits;
+    out.exrabitq_magnitude_bits = info_.rabitq_config.stage2_payload_bits();
     out.exrabitq_magnitude_packed = exrabitq_magnitude_packed();
+    out.rabitq_total_bits = info_.rabitq_config.effective_total_bits();
+    out.rabitq_ex_bits = info_.rabitq_config.stage2_payload_bits();
+    out.rabitq_estimator_mode = info_.rabitq_config.estimator_mode;
+    out.rabitq_exdata_layout = info_.rabitq_config.effective_exdata_layout();
     out.num_records = entry.num_records;
     out.epsilon = entry.epsilon;
     out.raw_addresses = raw_addresses;
@@ -1621,6 +1791,10 @@ Status ClusterStoreReader::PreloadAllClusters() {
             parsed.exrabitq_abs_bytes_per_lane_dim_block;
         view.exrabitq_magnitude_bits = parsed.exrabitq_magnitude_bits;
         view.exrabitq_magnitude_packed = parsed.exrabitq_magnitude_packed;
+        view.rabitq_total_bits = parsed.rabitq_total_bits;
+        view.rabitq_ex_bits = parsed.rabitq_ex_bits;
+        view.rabitq_estimator_mode = parsed.rabitq_estimator_mode;
+        view.rabitq_exdata_layout = parsed.rabitq_exdata_layout;
         view.num_records = parsed.num_records;
         view.epsilon = parsed.epsilon;
         view.raw_addresses = parsed.raw_addresses;
@@ -1777,6 +1951,7 @@ Status ClusterStoreReader::LoadCodes(
         std::vector<uint64_t> code;
         VDB_RETURN_IF_ERROR(LoadCode(cluster_id, indices[i], code));
         out_codes[i].code = std::move(code);
+        out_codes[i].bits = info_.rabitq_config.active_code_bits();
 
         const auto& cluster_data = loaded_clusters_.at(cluster_id);
         const uint32_t block_idx = indices[i] / 32;
@@ -1794,7 +1969,8 @@ Status ClusterStoreReader::LoadCodes(
         if (file_version_ >= kFileVersionV11 || ex_entry_sz > 0) {
             const uint32_t region1_size = entry.num_fastscan_blocks * fb_bytes;
             const uint32_t sign_bytes = exrabitq_sign_bytes();
-            out_codes[i].ex_sign_packed.resize(PackedSignBytes(dim));
+            const bool official = info_.rabitq_config.uses_official_1_plus_n();
+            out_codes[i].ex_sign_packed.resize(official ? 0 : PackedSignBytes(dim));
             if (file_version_ >= kFileVersionV11) {
                 const uint32_t batch_size = exrabitq_batch_size();
                 const uint32_t dim_block = exrabitq_dim_block();
@@ -1812,8 +1988,10 @@ Status ClusterStoreReader::LoadCodes(
                 const uint8_t* sign_base =
                     abs_base + num_dim_blocks * batch_size * abs_lane_bytes;
                 out_codes[i].ex_code.resize(dim);
-                std::fill(out_codes[i].ex_sign_packed.begin(),
-                          out_codes[i].ex_sign_packed.end(), 0);
+                if (!official) {
+                    std::fill(out_codes[i].ex_sign_packed.begin(),
+                              out_codes[i].ex_sign_packed.end(), 0);
+                }
                 for (uint32_t db = 0; db < num_dim_blocks; ++db) {
                     const uint32_t dim_start = db * dim_block;
                     const uint32_t copy = std::min(dim_block, dim - dim_start);
@@ -1822,9 +2000,27 @@ Status ClusterStoreReader::LoadCodes(
                         lane_id * abs_lane_bytes;
                     if (exrabitq_magnitude_packed()) {
                         uint8_t unpacked_abs[64] = {0};
-                        if (!simd::ExRaBitQUnpackMagnitudes(
-                                abs_ptr, dim_block, info_.rabitq_config.bits,
-                                unpacked_abs)) {
+                        const RaBitQExDataLayout exdata_layout =
+                            info_.rabitq_config.effective_exdata_layout();
+                        const bool direct =
+                            official && RaBitQExDataLayoutIsDirect(exdata_layout);
+                        bool unpacked_ok = false;
+                        if (direct) {
+                            unpacked_ok =
+                                exdata_layout == RaBitQExDataLayout::kSplit3TwoPlusOne
+                                    ? simd::ExRaBitQUnpackOfficialDirect3(
+                                          abs_ptr, dim_block, exdata_layout, unpacked_abs)
+                                    : simd::ExRaBitQUnpackOfficialDirectBitplanes(
+                                          abs_ptr, dim_block,
+                                          info_.rabitq_config.stage2_payload_bits(),
+                                          unpacked_abs);
+                        } else {
+                            unpacked_ok = simd::ExRaBitQUnpackMagnitudes(
+                                abs_ptr, dim_block,
+                                info_.rabitq_config.stage2_payload_bits(),
+                                unpacked_abs);
+                        }
+                        if (!unpacked_ok) {
                             return Status::Corruption(
                                 "Failed to unpack ExRaBitQ packed magnitude block");
                         }
@@ -1834,25 +2030,40 @@ Status ClusterStoreReader::LoadCodes(
                         std::memcpy(out_codes[i].ex_code.data() + dim_start,
                                     abs_ptr, copy);
                     }
-                    const uint8_t* sign_ptr =
-                        sign_base + static_cast<size_t>(db) * batch_size * sign_block_bytes +
-                        lane_id * sign_block_bytes;
-                    const uint32_t sign_offset = dim_start / 8;
-                    const uint32_t sign_copy =
-                        sign_offset < out_codes[i].ex_sign_packed.size()
-                            ? std::min<uint32_t>(
-                                  sign_block_bytes,
-                                  static_cast<uint32_t>(
-                                      out_codes[i].ex_sign_packed.size() - sign_offset))
-                            : 0;
-                    if (sign_copy > 0) {
-                        std::memcpy(out_codes[i].ex_sign_packed.data() + sign_offset,
-                                    sign_ptr, sign_copy);
+                    if (!official) {
+                        const uint8_t* sign_ptr =
+                            sign_base + static_cast<size_t>(db) * batch_size * sign_block_bytes +
+                            lane_id * sign_block_bytes;
+                        const uint32_t sign_offset = dim_start / 8;
+                        const uint32_t sign_copy =
+                            sign_offset < out_codes[i].ex_sign_packed.size()
+                                ? std::min<uint32_t>(
+                                      sign_block_bytes,
+                                      static_cast<uint32_t>(
+                                          out_codes[i].ex_sign_packed.size() - sign_offset))
+                                : 0;
+                        if (sign_copy > 0) {
+                            std::memcpy(out_codes[i].ex_sign_packed.data() + sign_offset,
+                                        sign_ptr, sign_copy);
+                        }
                     }
                 }
-                const float* xipnorms = reinterpret_cast<const float*>(
-                    block + batch_block_size - batch_size * sizeof(float));
-                out_codes[i].xipnorm = xipnorms[lane_id];
+                if (official) {
+                    const float* factors = reinterpret_cast<const float*>(
+                        block + batch_block_size - batch_size * 2u * sizeof(float));
+                    out_codes[i].ex_code_sign_folded = true;
+                    out_codes[i].ex_factor_add = factors[lane_id];
+                    out_codes[i].ex_factor_rescale = factors[batch_size + lane_id];
+                    out_codes[i].xipnorm =
+                        out_codes[i].norm > 1e-30f
+                            ? -0.5f * out_codes[i].ex_factor_rescale /
+                                  out_codes[i].norm
+                            : 0.0f;
+                } else {
+                    const float* xipnorms = reinterpret_cast<const float*>(
+                        block + batch_block_size - batch_size * sizeof(float));
+                    out_codes[i].xipnorm = xipnorms[lane_id];
+                }
             } else {
                 const uint8_t* ex_ptr = cluster_data.codes_buffer.data() + region1_size +
                                         static_cast<size_t>(indices[i]) * ex_entry_sz;

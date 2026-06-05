@@ -42,6 +42,9 @@ struct RaBitQCode {
     std::vector<uint8_t> ex_code;  // per-dimension code_abs values [0, 2^M-1]
     std::vector<uint8_t> ex_sign_packed;  // packed sign bits, little-endian by dimension
     float xipnorm = 0.0f;                 // 1 / Σ(code_abs[i]+0.5)*|o'[i]|
+    bool ex_code_sign_folded = false;     // official 1+n stores sign in ex_code.
+    float ex_factor_add = 0.0f;           // official f_add_ex.
+    float ex_factor_rescale = 0.0f;       // official f_rescale_ex, excluding query norm.
 };
 
 // ============================================================================
@@ -82,6 +85,9 @@ class RaBitQEncoder {
     /// @param t_const_seed RNG seed for t_const precomputation (default 42).
     ///                     Use the same seed for reproducible results.
     RaBitQEncoder(Dim dim, const RotationMatrix& rotation, uint8_t bits = 1,
+                  uint64_t t_const_seed = 42);
+    RaBitQEncoder(Dim dim, const RotationMatrix& rotation,
+                  const RaBitQConfig& config,
                   uint64_t t_const_seed = 42);
 
     ~RaBitQEncoder() = default;
@@ -130,6 +136,9 @@ class RaBitQEncoder {
  private:
     Dim dim_;
     uint8_t bits_;                    // M: quantization bits (1, 2, or 4)
+    uint8_t total_bits_ = 1;
+    uint8_t ex_bits_ = 0;
+    bool official_1_plus_n_ = false;
     uint32_t words_per_plane_;        // ceil(dim / 64)
     uint32_t total_words_;            // bits_ * words_per_plane_
     const RotationMatrix& rotation_;

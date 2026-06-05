@@ -223,6 +223,16 @@ class RaBitQEstimator {
     float EstimateDistanceMultiBit(const PreparedQuery& pq,
                                     const RaBitQCode& code) const;
 
+    /// Official RaBitQ 1+n Stage 2 distance estimate over sign-folded ExData.
+    ///
+    /// Uses the first bit plane for the BinData contribution and `code.ex_code`
+    /// for sign-folded ExData. This is intentionally separate from the legacy
+    /// signed-magnitude Stage 2 estimator so calibration and diagnostics cannot
+    /// silently mix the two bit semantics.
+    float EstimateDistanceOfficial1PlusN(const PreparedQuery& pq,
+                                         const RaBitQCode& code,
+                                         uint8_t ex_bits) const;
+
     /// Stage 2: Zero-copy M-bit distance estimate from raw memory.
     ///
     /// Uses xipnorm correction factor for accurate inner product estimation.

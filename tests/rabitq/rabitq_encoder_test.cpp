@@ -11,6 +11,8 @@
 using vdb::rabitq::RotationMatrix;
 using vdb::rabitq::RaBitQEncoder;
 using vdb::rabitq::RaBitQCode;
+using vdb::RaBitQConfig;
+using vdb::RaBitQEstimatorMode;
 using vdb::Dim;
 
 namespace {
@@ -525,4 +527,62 @@ TEST(RaBitQEncoderTest, FastVsSlowConsistency_Bits2) {
         EXPECT_GT(fast.xipnorm, 0.0f);
         EXPECT_TRUE(std::isfinite(fast.xipnorm));
     }
+}
+
+TEST(RaBitQEncoderTest, OfficialOnePlusNComplementsNegativeExDataCodes) {
+    Dim dim = 96;
+    RotationMatrix P(dim);
+    P.GenerateRandom(42);
+
+    RaBitQEncoder legacy(dim, P, 3, 77);
+    RaBitQConfig official_cfg;
+    official_cfg.total_bits = 4;
+    official_cfg.ex_bits = 3;
+    official_cfg.estimator_mode = RaBitQEstimatorMode::kOfficial1PlusN;
+    RaBitQEncoder official(dim, P, official_cfg, 77);
+
+    auto vec = RandomVec(dim, 500);
+    const auto legacy_code = legacy.Encode(vec.data());
+    const auto official_code = official.Encode(vec.data());
+    const int max_code = (1 << 3) - 1;
+
+    ASSERT_EQ(legacy_code.ex_code.size(), official_code.ex_code.size());
+    EXPECT_FALSE(legacy_code.ex_code_sign_folded);
+    EXPECT_TRUE(official_code.ex_code_sign_folded);
+    EXPECT_FALSE(legacy_code.ex_sign_packed.empty());
+    EXPECT_TRUE(official_code.ex_sign_packed.empty());
+    EXPECT_FLOAT_EQ(official_code.ex_factor_add,
+                    official_code.norm * official_code.norm);
+    EXPECT_FLOAT_EQ(official_code.ex_factor_rescale,
+                    -2.0f * official_code.norm * official_code.xipnorm);
+
+    for (Dim d = 0; d < dim; ++d) {
+        const bool positive =
+            ((legacy_code.ex_sign_packed[d / 8] >> (d % 8)) & 1u) != 0;
+        const uint8_t expected = positive
+            ? legacy_code.ex_code[d]
+            : static_cast<uint8_t>(max_code - legacy_code.ex_code[d]);
+        EXPECT_EQ(official_code.ex_code[d], expected) << "dim=" << d;
+    }
+}
+
+TEST(RaBitQEncoderTest, OfficialTotalBitsOneHasNoExDataPayload) {
+    Dim dim = 64;
+    RotationMatrix P(dim);
+    P.GenerateRandom(42);
+
+    RaBitQConfig official_cfg;
+    official_cfg.total_bits = 1;
+    official_cfg.ex_bits = 0;
+    official_cfg.estimator_mode = RaBitQEstimatorMode::kOfficial1PlusN;
+    RaBitQEncoder official(dim, P, official_cfg, 77);
+
+    auto vec = RandomVec(dim, 501);
+    const auto code = official.Encode(vec.data());
+    EXPECT_EQ(code.bits, 1u);
+    EXPECT_TRUE(code.ex_code.empty());
+    EXPECT_TRUE(code.ex_sign_packed.empty());
+    EXPECT_FALSE(code.ex_code_sign_folded);
+    EXPECT_EQ(code.ex_factor_add, 0.0f);
+    EXPECT_EQ(code.ex_factor_rescale, 0.0f);
 }
