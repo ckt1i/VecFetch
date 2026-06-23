@@ -461,6 +461,16 @@ enum class RaBitQExDataLayout : uint8_t {
   kSelectedDirect = 3,
   kSplit1Bitplane = 4,
   kSplit2Bitplanes = 5,
+  kSplit3TrimmedBitplanes = 6,
+  kSplit3ZeroPlaneElide = 7,
+  kVectorBitplanes = 8,
+  kVectorBitplanesPrefetch = 9,
+  kVectorNibble4 = 10,
+  kVector2Bit = 11,
+  kSmallLane4Bitplanes = 12,
+  kSmallLane2Bitplanes = 13,
+  kVectorBitplanesMicroBatch = 14,
+  kVectorBitMajorTiles = 15,
 };
 
 constexpr std::string_view RaBitQExDataLayoutName(RaBitQExDataLayout layout) {
@@ -473,6 +483,26 @@ constexpr std::string_view RaBitQExDataLayoutName(RaBitQExDataLayout layout) {
       return "split1_bitplane";
     case RaBitQExDataLayout::kSplit2Bitplanes:
       return "split2_bitplanes";
+    case RaBitQExDataLayout::kSplit3TrimmedBitplanes:
+      return "split3_trimmed_bitplanes";
+    case RaBitQExDataLayout::kSplit3ZeroPlaneElide:
+      return "split3_zero_plane_elide";
+    case RaBitQExDataLayout::kVectorBitplanes:
+      return "vector_bitplanes";
+    case RaBitQExDataLayout::kVectorBitplanesPrefetch:
+      return "vector_bitplanes_prefetch";
+    case RaBitQExDataLayout::kVectorBitplanesMicroBatch:
+      return "vector_bitplanes_microbatch";
+    case RaBitQExDataLayout::kVectorBitMajorTiles:
+      return "vector_bitmajor_tiles";
+    case RaBitQExDataLayout::kVectorNibble4:
+      return "vector_nibble4";
+    case RaBitQExDataLayout::kVector2Bit:
+      return "vector_2bit";
+    case RaBitQExDataLayout::kSmallLane4Bitplanes:
+      return "small_lane4_bitplanes";
+    case RaBitQExDataLayout::kSmallLane2Bitplanes:
+      return "small_lane2_bitplanes";
     case RaBitQExDataLayout::kSelectedDirect:
       return "selected_direct";
     case RaBitQExDataLayout::kGenericPacked:
@@ -517,6 +547,80 @@ inline bool ParseRaBitQExDataLayout(std::string_view value,
     }
     return true;
   }
+  if (value == "split3_trimmed_bitplanes" || value == "trimmed_bitplanes" ||
+      value == "trim_valid_lanes") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kSplit3TrimmedBitplanes;
+    }
+    return true;
+  }
+  if (value == "split3_zero_plane_elide" || value == "zero_plane_elide" ||
+      value == "zero_elide") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kSplit3ZeroPlaneElide;
+    }
+    return true;
+  }
+  if (value == "vector_bitplanes" || value == "per_vector_bitplanes" ||
+      value == "vector_compact" || value == "lane_major_bitplanes") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kVectorBitplanes;
+    }
+    return true;
+  }
+  if (value == "vector_bitplanes_prefetch" || value == "per_vector_bitplanes_prefetch" ||
+      value == "vector_compact_prefetch" || value == "lane_major_bitplanes_prefetch") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kVectorBitplanesPrefetch;
+    }
+    return true;
+  }
+  if (value == "vector_bitplanes_microbatch" ||
+      value == "per_vector_bitplanes_microbatch" ||
+      value == "vector_compact_microbatch" ||
+      value == "lane_major_bitplanes_microbatch" ||
+      value == "vector_microbatch") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kVectorBitplanesMicroBatch;
+    }
+    return true;
+  }
+  if (value == "vector_bitmajor_tiles" || value == "bitmajor_tiles" ||
+      value == "vector_bitplane_tiles" || value == "cacheline_bitplanes" ||
+      value == "cacheline_tiles") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kVectorBitMajorTiles;
+    }
+    return true;
+  }
+  if (value == "vector_nibble4" || value == "per_vector_nibble4" ||
+      value == "vector_4bit_nibble" || value == "official_4bit_nibble") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kVectorNibble4;
+    }
+    return true;
+  }
+  if (value == "vector_2bit" || value == "per_vector_2bit" ||
+      value == "vector_twobit" || value == "official_2bit") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kVector2Bit;
+    }
+    return true;
+  }
+  if (value == "small_lane4_bitplanes" || value == "small_lane4" ||
+      value == "lane4_bitplanes" || value == "batch4_bitplanes") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kSmallLane4Bitplanes;
+    }
+    return true;
+  }
+  if (value == "small_lane2_bitplanes" || value == "small_lane2" ||
+      value == "lane2_bitplanes" || value == "batch2_bitplanes") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kSmallLane2Bitplanes;
+    }
+    return true;
+  }
   if (value == "selected" || value == "selected_direct") {
     if (layout != nullptr) {
       *layout = RaBitQExDataLayout::kSelectedDirect;
@@ -538,6 +642,26 @@ constexpr RaBitQExDataLayout RaBitQExDataLayoutFromByte(uint8_t layout) {
       return RaBitQExDataLayout::kSplit1Bitplane;
     case static_cast<uint8_t>(RaBitQExDataLayout::kSplit2Bitplanes):
       return RaBitQExDataLayout::kSplit2Bitplanes;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kSplit3TrimmedBitplanes):
+      return RaBitQExDataLayout::kSplit3TrimmedBitplanes;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kSplit3ZeroPlaneElide):
+      return RaBitQExDataLayout::kSplit3ZeroPlaneElide;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitplanes):
+      return RaBitQExDataLayout::kVectorBitplanes;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitplanesPrefetch):
+      return RaBitQExDataLayout::kVectorBitplanesPrefetch;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitplanesMicroBatch):
+      return RaBitQExDataLayout::kVectorBitplanesMicroBatch;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitMajorTiles):
+      return RaBitQExDataLayout::kVectorBitMajorTiles;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kVectorNibble4):
+      return RaBitQExDataLayout::kVectorNibble4;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kVector2Bit):
+      return RaBitQExDataLayout::kVector2Bit;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kSmallLane4Bitplanes):
+      return RaBitQExDataLayout::kSmallLane4Bitplanes;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kSmallLane2Bitplanes):
+      return RaBitQExDataLayout::kSmallLane2Bitplanes;
     case static_cast<uint8_t>(RaBitQExDataLayout::kGenericPacked):
     default:
       return RaBitQExDataLayout::kGenericPacked;
@@ -550,14 +674,17 @@ constexpr bool RaBitQExDataLayoutByteValid(uint8_t layout) {
          layout == static_cast<uint8_t>(RaBitQExDataLayout::kSplit3Bitplanes) ||
          layout == static_cast<uint8_t>(RaBitQExDataLayout::kSelectedDirect) ||
          layout == static_cast<uint8_t>(RaBitQExDataLayout::kSplit1Bitplane) ||
-         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSplit2Bitplanes);
-}
-
-constexpr RaBitQExDataLayout RaBitQResolveSelectedExDataLayout(
-    RaBitQExDataLayout layout) {
-  return layout == RaBitQExDataLayout::kSelectedDirect
-      ? RaBitQExDataLayout::kSplit3Bitplanes
-      : layout;
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSplit2Bitplanes) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSplit3TrimmedBitplanes) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSplit3ZeroPlaneElide) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitplanes) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitplanesPrefetch) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitplanesMicroBatch) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitMajorTiles) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kVectorNibble4) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kVector2Bit) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSmallLane4Bitplanes) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kSmallLane2Bitplanes);
 }
 
 constexpr RaBitQExDataLayout RaBitQResolveSelectedExDataLayoutForBits(
@@ -565,10 +692,21 @@ constexpr RaBitQExDataLayout RaBitQResolveSelectedExDataLayoutForBits(
   if (layout != RaBitQExDataLayout::kSelectedDirect) {
     return layout;
   }
-  if (ex_bits == 1) return RaBitQExDataLayout::kSplit1Bitplane;
-  if (ex_bits == 2) return RaBitQExDataLayout::kSplit2Bitplanes;
-  if (ex_bits == 3) return RaBitQExDataLayout::kSplit3Bitplanes;
+  if (ex_bits >= 1 && ex_bits <= 3) return RaBitQExDataLayout::kVectorBitMajorTiles;
+  if (ex_bits == 4) return RaBitQExDataLayout::kVectorNibble4;
   return RaBitQExDataLayout::kSelectedDirect;
+}
+
+constexpr RaBitQExDataLayout RaBitQResolveSelectedExDataLayout(
+    RaBitQExDataLayout layout) {
+  return RaBitQResolveSelectedExDataLayoutForBits(layout, 3);
+}
+
+constexpr RaBitQExDataLayout RaBitQDefaultOfficialExDataLayoutForBits(
+    uint8_t ex_bits) {
+  if (ex_bits >= 1 && ex_bits <= 3) return RaBitQExDataLayout::kVectorBitMajorTiles;
+  if (ex_bits == 4) return RaBitQExDataLayout::kVectorNibble4;
+  return RaBitQExDataLayout::kGenericPacked;
 }
 
 constexpr uint8_t RaBitQExDataLayoutDirectBits(RaBitQExDataLayout layout) {
@@ -580,7 +718,20 @@ constexpr uint8_t RaBitQExDataLayoutDirectBits(RaBitQExDataLayout layout) {
       return 2;
     case RaBitQExDataLayout::kSplit3TwoPlusOne:
     case RaBitQExDataLayout::kSplit3Bitplanes:
+    case RaBitQExDataLayout::kSplit3TrimmedBitplanes:
+    case RaBitQExDataLayout::kSplit3ZeroPlaneElide:
       return 3;
+    case RaBitQExDataLayout::kVectorBitplanes:
+    case RaBitQExDataLayout::kVectorBitplanesPrefetch:
+    case RaBitQExDataLayout::kVectorBitplanesMicroBatch:
+    case RaBitQExDataLayout::kVectorBitMajorTiles:
+    case RaBitQExDataLayout::kSmallLane4Bitplanes:
+    case RaBitQExDataLayout::kSmallLane2Bitplanes:
+      return 0;
+    case RaBitQExDataLayout::kVectorNibble4:
+      return 4;
+    case RaBitQExDataLayout::kVector2Bit:
+      return 2;
     case RaBitQExDataLayout::kGenericPacked:
     case RaBitQExDataLayout::kSelectedDirect:
     default:
@@ -593,7 +744,17 @@ constexpr bool RaBitQExDataLayoutIsDirect(RaBitQExDataLayout layout) {
   return resolved == RaBitQExDataLayout::kSplit3TwoPlusOne ||
          resolved == RaBitQExDataLayout::kSplit3Bitplanes ||
          resolved == RaBitQExDataLayout::kSplit1Bitplane ||
-         resolved == RaBitQExDataLayout::kSplit2Bitplanes;
+         resolved == RaBitQExDataLayout::kSplit2Bitplanes ||
+         resolved == RaBitQExDataLayout::kSplit3TrimmedBitplanes ||
+         resolved == RaBitQExDataLayout::kSplit3ZeroPlaneElide ||
+         resolved == RaBitQExDataLayout::kVectorBitplanes ||
+         resolved == RaBitQExDataLayout::kVectorBitplanesPrefetch ||
+         resolved == RaBitQExDataLayout::kVectorBitplanesMicroBatch ||
+         resolved == RaBitQExDataLayout::kVectorBitMajorTiles ||
+         resolved == RaBitQExDataLayout::kVectorNibble4 ||
+         resolved == RaBitQExDataLayout::kVector2Bit ||
+         resolved == RaBitQExDataLayout::kSmallLane4Bitplanes ||
+         resolved == RaBitQExDataLayout::kSmallLane2Bitplanes;
 }
 
 /// RaBitQ (Reduced-Bit Quantization) configuration
@@ -647,6 +808,16 @@ struct RaBitQConfig {
     }
     if (effective == RaBitQExDataLayout::kSplit3TwoPlusOne) {
       return ex_bits == 3;
+    }
+    if (effective == RaBitQExDataLayout::kVectorBitplanes ||
+        effective == RaBitQExDataLayout::kVectorBitplanesPrefetch ||
+        effective == RaBitQExDataLayout::kVectorBitplanesMicroBatch ||
+        effective == RaBitQExDataLayout::kSmallLane4Bitplanes ||
+        effective == RaBitQExDataLayout::kSmallLane2Bitplanes) {
+      return ex_bits >= 1 && ex_bits <= 4;
+    }
+    if (effective == RaBitQExDataLayout::kVectorBitMajorTiles) {
+      return ex_bits >= 1 && ex_bits <= 3;
     }
     const uint8_t direct_bits = RaBitQExDataLayoutDirectBits(effective);
     return direct_bits != 0 && direct_bits == ex_bits;

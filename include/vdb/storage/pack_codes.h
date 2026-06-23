@@ -37,7 +37,7 @@ void UnpackSignBitsFromFastScan(const uint8_t* packed_block,
                                  uint64_t* out_words);
 
 /// Compute the packed code size for one FastScan block.
-inline uint32_t FastScanPackedSize(uint32_t dim) { return dim * 4; }
+inline uint32_t FastScanPackedSize(uint32_t dim) { return ((dim + 7) / 8) * 32; }
 
 /// Compute the full FastScan block size (packed codes + 32 norm_oc floats).
 inline uint32_t FastScanBlockSize(uint32_t dim) {

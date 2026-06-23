@@ -1379,11 +1379,39 @@ TEST_F(ClusterStoreTest, OfficialV14DirectCompactExDataRoundTripsBothLayouts) {
     struct Case {
         RaBitQExDataLayout layout;
         uint8_t ex_bits;
+        uint32_t expected_version;
     };
-    for (const auto tc : {Case{RaBitQExDataLayout::kSplit1Bitplane, 1},
-                          Case{RaBitQExDataLayout::kSplit2Bitplanes, 2},
-                          Case{RaBitQExDataLayout::kSplit3TwoPlusOne, 3},
-                          Case{RaBitQExDataLayout::kSplit3Bitplanes, 3}}) {
+    for (const auto tc : {Case{RaBitQExDataLayout::kSplit1Bitplane, 1, 14},
+                          Case{RaBitQExDataLayout::kSplit2Bitplanes, 2, 14},
+                          Case{RaBitQExDataLayout::kSplit3TwoPlusOne, 3, 14},
+                          Case{RaBitQExDataLayout::kSplit3Bitplanes, 3, 14},
+                          Case{RaBitQExDataLayout::kSplit3TrimmedBitplanes, 3, 15},
+                          Case{RaBitQExDataLayout::kSplit3ZeroPlaneElide, 3, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanes, 1, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanes, 2, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanes, 3, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanes, 4, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanesPrefetch, 1, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanesPrefetch, 2, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanesPrefetch, 3, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanesPrefetch, 4, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanesMicroBatch, 1, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanesMicroBatch, 2, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanesMicroBatch, 3, 15},
+                          Case{RaBitQExDataLayout::kVectorBitplanesMicroBatch, 4, 15},
+                          Case{RaBitQExDataLayout::kVectorBitMajorTiles, 1, 15},
+                          Case{RaBitQExDataLayout::kVectorBitMajorTiles, 2, 15},
+                          Case{RaBitQExDataLayout::kVectorBitMajorTiles, 3, 15},
+                          Case{RaBitQExDataLayout::kSmallLane4Bitplanes, 1, 15},
+                          Case{RaBitQExDataLayout::kSmallLane4Bitplanes, 2, 15},
+                          Case{RaBitQExDataLayout::kSmallLane4Bitplanes, 3, 15},
+                          Case{RaBitQExDataLayout::kSmallLane4Bitplanes, 4, 15},
+                          Case{RaBitQExDataLayout::kSmallLane2Bitplanes, 1, 15},
+                          Case{RaBitQExDataLayout::kSmallLane2Bitplanes, 2, 15},
+                          Case{RaBitQExDataLayout::kSmallLane2Bitplanes, 3, 15},
+                          Case{RaBitQExDataLayout::kSmallLane2Bitplanes, 4, 15},
+                          Case{RaBitQExDataLayout::kVectorNibble4, 4, 15},
+                          Case{RaBitQExDataLayout::kVector2Bit, 2, 15}}) {
         const auto layout = tc.layout;
         const uint8_t ex_bits = tc.ex_bits;
         const uint8_t max_ex_code = static_cast<uint8_t>((1u << ex_bits) - 1u);
@@ -1435,7 +1463,7 @@ TEST_F(ClusterStoreTest, OfficialV14DirectCompactExDataRoundTripsBothLayouts) {
 
         ClusterStoreReader reader;
         ASSERT_TRUE(reader.Open(path).ok());
-        EXPECT_EQ(reader.file_version(), 14u);
+        EXPECT_EQ(reader.file_version(), tc.expected_version);
         EXPECT_EQ(reader.rabitq_config().exdata_layout, layout);
         EXPECT_EQ(reader.rabitq_config().effective_exdata_layout(), layout);
 

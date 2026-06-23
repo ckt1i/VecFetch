@@ -396,6 +396,66 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
                                     rotated_query, kernel_abs_blocks, block_view.exdata_layout,
                                     requested_mask, block_view.valid_count, dim_,
                                     pc.exrabitq_dim_block, ip_raw_batch, kernel_timing_ptr);
+                            } else if (block_view.exdata_layout ==
+                                       RaBitQExDataLayout::kSplit3TrimmedBitplanes) {
+                                simd::IPOfficialRaBitQBatchCompactDirectBitplanesStridedMasked(
+                                    rotated_query, kernel_abs_blocks, block_view.magnitude_bits,
+                                    block_view.valid_count, requested_mask, block_view.valid_count,
+                                    dim_, pc.exrabitq_dim_block, ip_raw_batch, kernel_timing_ptr);
+                            } else if (block_view.exdata_layout ==
+                                       RaBitQExDataLayout::kVectorBitplanes) {
+                                simd::IPOfficialRaBitQBatchCompactVectorBitplanesMasked(
+                                    rotated_query, kernel_abs_blocks, block_view.magnitude_bits,
+                                    requested_mask, block_view.valid_count, dim_,
+                                    pc.exrabitq_dim_block, ip_raw_batch, kernel_timing_ptr);
+                            } else if (block_view.exdata_layout ==
+                                       RaBitQExDataLayout::kVectorBitplanesPrefetch) {
+                                simd::IPOfficialRaBitQBatchCompactVectorBitplanesPrefetchMasked(
+                                    rotated_query, kernel_abs_blocks, block_view.magnitude_bits,
+                                    requested_mask, block_view.valid_count, dim_,
+                                    pc.exrabitq_dim_block, ip_raw_batch, kernel_timing_ptr);
+                            } else if (block_view.exdata_layout ==
+                                       RaBitQExDataLayout::kVectorBitplanesMicroBatch) {
+                                simd::IPOfficialRaBitQBatchCompactVectorBitplanesMicroBatchMasked(
+                                    rotated_query, kernel_abs_blocks, block_view.magnitude_bits,
+                                    requested_mask, block_view.valid_count, dim_,
+                                    pc.exrabitq_dim_block, ip_raw_batch, kernel_timing_ptr);
+                            } else if (block_view.exdata_layout ==
+                                       RaBitQExDataLayout::kVectorBitMajorTiles) {
+                                simd::IPOfficialRaBitQBatchCompactVectorBitMajorTilesMasked(
+                                    rotated_query, kernel_abs_blocks, block_view.magnitude_bits,
+                                    requested_mask, block_view.valid_count, dim_,
+                                    pc.exrabitq_dim_block, ip_raw_batch, kernel_timing_ptr);
+                            } else if (block_view.exdata_layout ==
+                                       RaBitQExDataLayout::kSmallLane4Bitplanes) {
+                                simd::IPOfficialRaBitQBatchCompactSmallLane4BitplanesMasked(
+                                    rotated_query, kernel_abs_blocks, block_view.magnitude_bits,
+                                    requested_mask, block_view.valid_count, dim_,
+                                    pc.exrabitq_dim_block, ip_raw_batch, kernel_timing_ptr);
+                            } else if (block_view.exdata_layout ==
+                                       RaBitQExDataLayout::kSmallLane2Bitplanes) {
+                                simd::IPOfficialRaBitQBatchCompactSmallLane2BitplanesMasked(
+                                    rotated_query, kernel_abs_blocks, block_view.magnitude_bits,
+                                    requested_mask, block_view.valid_count, dim_,
+                                    pc.exrabitq_dim_block, ip_raw_batch, kernel_timing_ptr);
+                            } else if (block_view.exdata_layout ==
+                                       RaBitQExDataLayout::kVectorNibble4) {
+                                simd::IPOfficialRaBitQBatchCompactVectorNibble4Masked(
+                                    rotated_query, kernel_abs_blocks, requested_mask,
+                                    block_view.valid_count, dim_, pc.exrabitq_dim_block,
+                                    ip_raw_batch, kernel_timing_ptr);
+                            } else if (block_view.exdata_layout ==
+                                       RaBitQExDataLayout::kVector2Bit) {
+                                simd::IPOfficialRaBitQBatchCompactVector2BitMasked(
+                                    rotated_query, kernel_abs_blocks, requested_mask,
+                                    block_view.valid_count, dim_, pc.exrabitq_dim_block,
+                                    ip_raw_batch, kernel_timing_ptr);
+                            } else if (block_view.exdata_layout ==
+                                       RaBitQExDataLayout::kSplit3ZeroPlaneElide) {
+                                simd::IPOfficialRaBitQBatchCompactDirect3ZeroPlaneElideMasked(
+                                    rotated_query, kernel_abs_blocks, requested_mask,
+                                    block_view.valid_count, dim_, pc.exrabitq_dim_block,
+                                    ip_raw_batch, kernel_timing_ptr);
                             } else {
                                 simd::IPOfficialRaBitQBatchCompactDirectBitplanesMasked(
                                     rotated_query, kernel_abs_blocks, block_view.magnitude_bits,

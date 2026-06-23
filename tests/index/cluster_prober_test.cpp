@@ -190,11 +190,39 @@ TEST(ClusterProberTest, OfficialV14DirectStage2ScoresBypassDecode) {
     struct Case {
         vdb::RaBitQExDataLayout layout;
         uint8_t ex_bits;
+        uint32_t expected_version;
     };
-    for (const auto tc : {Case{vdb::RaBitQExDataLayout::kSplit1Bitplane, 1},
-                          Case{vdb::RaBitQExDataLayout::kSplit2Bitplanes, 2},
-                          Case{vdb::RaBitQExDataLayout::kSplit3TwoPlusOne, 3},
-                          Case{vdb::RaBitQExDataLayout::kSplit3Bitplanes, 3}}) {
+    for (const auto tc : {Case{vdb::RaBitQExDataLayout::kSplit1Bitplane, 1, 14},
+                          Case{vdb::RaBitQExDataLayout::kSplit2Bitplanes, 2, 14},
+                          Case{vdb::RaBitQExDataLayout::kSplit3TwoPlusOne, 3, 14},
+                          Case{vdb::RaBitQExDataLayout::kSplit3Bitplanes, 3, 14},
+                          Case{vdb::RaBitQExDataLayout::kSplit3TrimmedBitplanes, 3, 15},
+                          Case{vdb::RaBitQExDataLayout::kSplit3ZeroPlaneElide, 3, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanes, 1, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanes, 2, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanes, 3, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanes, 4, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanesPrefetch, 1, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanesPrefetch, 2, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanesPrefetch, 3, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanesPrefetch, 4, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanesMicroBatch, 1, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanesMicroBatch, 2, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanesMicroBatch, 3, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitplanesMicroBatch, 4, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitMajorTiles, 1, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitMajorTiles, 2, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorBitMajorTiles, 3, 15},
+                          Case{vdb::RaBitQExDataLayout::kSmallLane4Bitplanes, 1, 15},
+                          Case{vdb::RaBitQExDataLayout::kSmallLane4Bitplanes, 2, 15},
+                          Case{vdb::RaBitQExDataLayout::kSmallLane4Bitplanes, 3, 15},
+                          Case{vdb::RaBitQExDataLayout::kSmallLane4Bitplanes, 4, 15},
+                          Case{vdb::RaBitQExDataLayout::kSmallLane2Bitplanes, 1, 15},
+                          Case{vdb::RaBitQExDataLayout::kSmallLane2Bitplanes, 2, 15},
+                          Case{vdb::RaBitQExDataLayout::kSmallLane2Bitplanes, 3, 15},
+                          Case{vdb::RaBitQExDataLayout::kSmallLane2Bitplanes, 4, 15},
+                          Case{vdb::RaBitQExDataLayout::kVectorNibble4, 4, 15},
+                          Case{vdb::RaBitQExDataLayout::kVector2Bit, 2, 15}}) {
         const auto layout = tc.layout;
         const uint8_t ex_bits = tc.ex_bits;
         const std::filesystem::path test_dir = TestDir();
@@ -250,7 +278,7 @@ TEST(ClusterProberTest, OfficialV14DirectStage2ScoresBypassDecode) {
 
         vdb::storage::ClusterStoreReader reader;
         ASSERT_TRUE(reader.Open(path).ok());
-        EXPECT_EQ(reader.file_version(), 14u);
+        EXPECT_EQ(reader.file_version(), tc.expected_version);
         ASSERT_TRUE(reader.EnsureClusterLoaded(0).ok());
         const auto loc = reader.GetBlockLocation(0);
         ASSERT_TRUE(loc.has_value());
@@ -306,6 +334,46 @@ TEST(ClusterProberTest, OfficialV14DirectStage2ScoresBypassDecode) {
         if (layout == vdb::RaBitQExDataLayout::kSplit3TwoPlusOne) {
             vdb::simd::IPOfficialRaBitQBatchCompactDirect3Masked(
                 pq.rotated.data(), block_view.abs_blocks, layout, 0xFFu, kRecords, dim,
+                parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kSplit3TrimmedBitplanes) {
+            vdb::simd::IPOfficialRaBitQBatchCompactDirectBitplanesStridedMasked(
+                pq.rotated.data(), block_view.abs_blocks, ex_bits, block_view.valid_count,
+                0xFFu, kRecords, dim, parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kVectorBitplanes) {
+            vdb::simd::IPOfficialRaBitQBatchCompactVectorBitplanesMasked(
+                pq.rotated.data(), block_view.abs_blocks, ex_bits, 0xFFu, kRecords, dim,
+                parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kVectorBitplanesPrefetch) {
+            vdb::simd::IPOfficialRaBitQBatchCompactVectorBitplanesPrefetchMasked(
+                pq.rotated.data(), block_view.abs_blocks, ex_bits, 0xFFu, kRecords, dim,
+                parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kVectorBitplanesMicroBatch) {
+            vdb::simd::IPOfficialRaBitQBatchCompactVectorBitplanesMicroBatchMasked(
+                pq.rotated.data(), block_view.abs_blocks, ex_bits, 0xFFu, kRecords, dim,
+                parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kVectorBitMajorTiles) {
+            vdb::simd::IPOfficialRaBitQBatchCompactVectorBitMajorTilesMasked(
+                pq.rotated.data(), block_view.abs_blocks, ex_bits, 0xFFu, kRecords, dim,
+                parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kSmallLane4Bitplanes) {
+            vdb::simd::IPOfficialRaBitQBatchCompactSmallLane4BitplanesMasked(
+                pq.rotated.data(), block_view.abs_blocks, ex_bits, 0xFFu, kRecords, dim,
+                parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kSmallLane2Bitplanes) {
+            vdb::simd::IPOfficialRaBitQBatchCompactSmallLane2BitplanesMasked(
+                pq.rotated.data(), block_view.abs_blocks, ex_bits, 0xFFu, kRecords, dim,
+                parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kVectorNibble4) {
+            vdb::simd::IPOfficialRaBitQBatchCompactVectorNibble4Masked(
+                pq.rotated.data(), block_view.abs_blocks, 0xFFu, kRecords, dim,
+                parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kVector2Bit) {
+            vdb::simd::IPOfficialRaBitQBatchCompactVector2BitMasked(
+                pq.rotated.data(), block_view.abs_blocks, 0xFFu, kRecords, dim,
+                parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kSplit3ZeroPlaneElide) {
+            vdb::simd::IPOfficialRaBitQBatchCompactDirect3ZeroPlaneElideMasked(
+                pq.rotated.data(), block_view.abs_blocks, 0xFFu, kRecords, dim,
                 parsed.exrabitq_dim_block, ip_ex);
         } else {
             vdb::simd::IPOfficialRaBitQBatchCompactDirectBitplanesMasked(

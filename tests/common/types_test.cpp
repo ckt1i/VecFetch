@@ -333,9 +333,80 @@ TEST(TypesTest, RaBitQConfigOfficialBitSemantics) {
 
   config.exdata_layout = RaBitQExDataLayout::kSelectedDirect;
   EXPECT_TRUE(config.exdata_layout_valid());
-  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kSplit1Bitplane);
+  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kVectorBitMajorTiles);
   EXPECT_EQ(RaBitQFormatKey(config),
-            "official_1_plus_n_total2_ex1_split1_bitplane");
+            "official_1_plus_n_total2_ex1_vector_bitmajor_tiles");
+
+  config.ex_bits = 3;
+  config.total_bits = 4;
+  config.exdata_layout = RaBitQExDataLayout::kSplit3TrimmedBitplanes;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total4_ex3_split3_trimmed_bitplanes");
+
+  config.exdata_layout = RaBitQExDataLayout::kSplit3ZeroPlaneElide;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total4_ex3_split3_zero_plane_elide");
+
+  config.ex_bits = 4;
+  config.total_bits = 5;
+  config.exdata_layout = RaBitQExDataLayout::kVectorBitplanes;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kVectorBitplanes);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total5_ex4_vector_bitplanes");
+
+  config.exdata_layout = RaBitQExDataLayout::kVectorBitplanesPrefetch;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(),
+            RaBitQExDataLayout::kVectorBitplanesPrefetch);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total5_ex4_vector_bitplanes_prefetch");
+
+  config.exdata_layout = RaBitQExDataLayout::kVectorBitplanesMicroBatch;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(),
+            RaBitQExDataLayout::kVectorBitplanesMicroBatch);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total5_ex4_vector_bitplanes_microbatch");
+
+  config.ex_bits = 3;
+  config.total_bits = 4;
+  config.exdata_layout = RaBitQExDataLayout::kVectorBitMajorTiles;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(),
+            RaBitQExDataLayout::kVectorBitMajorTiles);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total4_ex3_vector_bitmajor_tiles");
+
+  config.ex_bits = 4;
+  config.total_bits = 5;
+  config.exdata_layout = RaBitQExDataLayout::kSmallLane4Bitplanes;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kSmallLane4Bitplanes);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total5_ex4_small_lane4_bitplanes");
+
+  config.exdata_layout = RaBitQExDataLayout::kSmallLane2Bitplanes;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kSmallLane2Bitplanes);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total5_ex4_small_lane2_bitplanes");
+
+  config.exdata_layout = RaBitQExDataLayout::kVectorNibble4;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kVectorNibble4);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total5_ex4_vector_nibble4");
+
+  config.ex_bits = 2;
+  config.total_bits = 3;
+  config.exdata_layout = RaBitQExDataLayout::kVector2Bit;
+  EXPECT_TRUE(config.exdata_layout_valid());
+  EXPECT_EQ(config.effective_exdata_layout(), RaBitQExDataLayout::kVector2Bit);
+  EXPECT_EQ(RaBitQFormatKey(config),
+            "official_1_plus_n_total3_ex2_vector_2bit");
 }
 
 TEST(TypesTest, RaBitQEstimatorModeParser) {
@@ -357,16 +428,48 @@ TEST(TypesTest, RaBitQExDataLayoutParser) {
   EXPECT_EQ(layout, RaBitQExDataLayout::kSplit2Bitplanes);
   EXPECT_TRUE(ParseRaBitQExDataLayout("split1_bitplane", &layout));
   EXPECT_EQ(layout, RaBitQExDataLayout::kSplit1Bitplane);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("trim_valid_lanes", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kSplit3TrimmedBitplanes);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("zero_plane_elide", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kSplit3ZeroPlaneElide);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("vector_compact", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kVectorBitplanes);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("vector_compact_prefetch", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kVectorBitplanesPrefetch);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("vector_microbatch", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kVectorBitplanesMicroBatch);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("cacheline_tiles", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kVectorBitMajorTiles);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("official_4bit_nibble", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kVectorNibble4);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("official_2bit", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kVector2Bit);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("small_lane4", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kSmallLane4Bitplanes);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("small_lane2", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kSmallLane2Bitplanes);
   EXPECT_TRUE(ParseRaBitQExDataLayout("selected_direct", &layout));
   EXPECT_EQ(layout, RaBitQExDataLayout::kSelectedDirect);
   EXPECT_EQ(RaBitQResolveSelectedExDataLayout(layout),
-            RaBitQExDataLayout::kSplit3Bitplanes);
+            RaBitQExDataLayout::kVectorBitMajorTiles);
   EXPECT_EQ(RaBitQResolveSelectedExDataLayoutForBits(layout, 1),
-            RaBitQExDataLayout::kSplit1Bitplane);
+            RaBitQExDataLayout::kVectorBitMajorTiles);
   EXPECT_EQ(RaBitQResolveSelectedExDataLayoutForBits(layout, 2),
-            RaBitQExDataLayout::kSplit2Bitplanes);
+            RaBitQExDataLayout::kVectorBitMajorTiles);
   EXPECT_EQ(RaBitQResolveSelectedExDataLayoutForBits(layout, 3),
-            RaBitQExDataLayout::kSplit3Bitplanes);
+            RaBitQExDataLayout::kVectorBitMajorTiles);
+  EXPECT_EQ(RaBitQResolveSelectedExDataLayoutForBits(layout, 4),
+            RaBitQExDataLayout::kVectorNibble4);
+  EXPECT_EQ(RaBitQDefaultOfficialExDataLayoutForBits(0),
+            RaBitQExDataLayout::kGenericPacked);
+  EXPECT_EQ(RaBitQDefaultOfficialExDataLayoutForBits(1),
+            RaBitQExDataLayout::kVectorBitMajorTiles);
+  EXPECT_EQ(RaBitQDefaultOfficialExDataLayoutForBits(2),
+            RaBitQExDataLayout::kVectorBitMajorTiles);
+  EXPECT_EQ(RaBitQDefaultOfficialExDataLayoutForBits(3),
+            RaBitQExDataLayout::kVectorBitMajorTiles);
+  EXPECT_EQ(RaBitQDefaultOfficialExDataLayoutForBits(4),
+            RaBitQExDataLayout::kVectorNibble4);
   EXPECT_FALSE(ParseRaBitQExDataLayout("packed3", &layout));
 }
 

@@ -126,6 +126,143 @@ void BuildOfficialDirectBitplanesLayout(uint32_t dim, uint32_t dim_block, uint8_
     }
 }
 
+void BuildOfficialVectorBitplanesLayout(uint32_t dim, uint32_t dim_block, uint8_t bits,
+                                        const std::vector<std::vector<uint8_t>>& lane_ex_code,
+                                        std::vector<uint8_t>& compact_blocks) {
+    const uint32_t num_dim_blocks = (dim + dim_block - 1) / dim_block;
+    const uint32_t packed_lane_bytes = vdb::simd::ExRaBitQPackedMagnitudeBytes(dim_block, bits);
+    compact_blocks.assign(static_cast<size_t>(8u) * num_dim_blocks * packed_lane_bytes, 0);
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+        for (uint32_t db = 0; db < num_dim_blocks; ++db) {
+            const uint32_t dim_start = db * dim_block;
+            uint8_t decoded[64] = {};
+            const uint32_t copy = std::min(dim_block, dim - dim_start);
+            for (uint32_t offset = 0; offset < copy; ++offset) {
+                decoded[offset] = lane_ex_code[lane][dim_start + offset];
+            }
+            uint8_t* dst =
+                compact_blocks.data() +
+                (static_cast<size_t>(lane) * num_dim_blocks + db) * packed_lane_bytes;
+            ASSERT_TRUE(vdb::simd::ExRaBitQPackOfficialDirectBitplanes(
+                decoded, dim_block, bits, dst, packed_lane_bytes));
+        }
+    }
+}
+
+void BuildOfficialVectorBitMajorTilesLayout(
+    uint32_t dim, uint8_t bits, const std::vector<std::vector<uint8_t>>& lane_ex_code,
+    std::vector<uint8_t>& compact_blocks) {
+    const uint32_t vector_bytes = vdb::simd::ExRaBitQBitMajorTileVectorBytes(dim, bits);
+    compact_blocks.assign(static_cast<size_t>(8u) * vector_bytes, 0);
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+        uint8_t* dst = compact_blocks.data() + static_cast<size_t>(lane) * vector_bytes;
+        ASSERT_TRUE(vdb::simd::ExRaBitQPackOfficialBitMajorTiles(
+            lane_ex_code[lane].data(), dim, bits, dst, vector_bytes));
+    }
+}
+
+void BuildOfficialSmallLane4BitplanesLayout(
+    uint32_t dim, uint32_t dim_block, uint8_t bits,
+    const std::vector<std::vector<uint8_t>>& lane_ex_code,
+    std::vector<uint8_t>& compact_blocks) {
+    constexpr uint32_t kSubgroupLanes = 4;
+    const uint32_t num_dim_blocks = (dim + dim_block - 1) / dim_block;
+    const uint32_t packed_lane_bytes = vdb::simd::ExRaBitQPackedMagnitudeBytes(dim_block, bits);
+    compact_blocks.assign(static_cast<size_t>(8u) * num_dim_blocks * packed_lane_bytes, 0);
+    uint8_t* dst = compact_blocks.data();
+    for (uint32_t group_start = 0; group_start < 8; group_start += kSubgroupLanes) {
+        const uint32_t group_lanes = std::min(kSubgroupLanes, 8u - group_start);
+        for (uint32_t db = 0; db < num_dim_blocks; ++db) {
+            const uint32_t dim_start = db * dim_block;
+            for (uint32_t local_lane = 0; local_lane < group_lanes; ++local_lane) {
+                const uint32_t lane = group_start + local_lane;
+                uint8_t decoded[64] = {};
+                const uint32_t copy = std::min(dim_block, dim - dim_start);
+                for (uint32_t offset = 0; offset < copy; ++offset) {
+                    decoded[offset] = lane_ex_code[lane][dim_start + offset];
+                }
+                ASSERT_TRUE(vdb::simd::ExRaBitQPackOfficialDirectBitplanes(
+                    decoded, dim_block, bits, dst, packed_lane_bytes));
+                dst += packed_lane_bytes;
+            }
+        }
+    }
+}
+
+void BuildOfficialSmallLane2BitplanesLayout(
+    uint32_t dim, uint32_t dim_block, uint8_t bits,
+    const std::vector<std::vector<uint8_t>>& lane_ex_code,
+    std::vector<uint8_t>& compact_blocks) {
+    constexpr uint32_t kSubgroupLanes = 2;
+    const uint32_t num_dim_blocks = (dim + dim_block - 1) / dim_block;
+    const uint32_t packed_lane_bytes = vdb::simd::ExRaBitQPackedMagnitudeBytes(dim_block, bits);
+    compact_blocks.assign(static_cast<size_t>(8u) * num_dim_blocks * packed_lane_bytes, 0);
+    uint8_t* dst = compact_blocks.data();
+    for (uint32_t group_start = 0; group_start < 8; group_start += kSubgroupLanes) {
+        const uint32_t group_lanes = std::min(kSubgroupLanes, 8u - group_start);
+        for (uint32_t db = 0; db < num_dim_blocks; ++db) {
+            const uint32_t dim_start = db * dim_block;
+            for (uint32_t local_lane = 0; local_lane < group_lanes; ++local_lane) {
+                const uint32_t lane = group_start + local_lane;
+                uint8_t decoded[64] = {};
+                const uint32_t copy = std::min(dim_block, dim - dim_start);
+                for (uint32_t offset = 0; offset < copy; ++offset) {
+                    decoded[offset] = lane_ex_code[lane][dim_start + offset];
+                }
+                ASSERT_TRUE(vdb::simd::ExRaBitQPackOfficialDirectBitplanes(
+                    decoded, dim_block, bits, dst, packed_lane_bytes));
+                dst += packed_lane_bytes;
+            }
+        }
+    }
+}
+
+void BuildOfficialVectorNibble4Layout(uint32_t dim, uint32_t dim_block,
+                                      const std::vector<std::vector<uint8_t>>& lane_ex_code,
+                                      std::vector<uint8_t>& compact_blocks) {
+    const uint32_t num_dim_blocks = (dim + dim_block - 1) / dim_block;
+    const uint32_t packed_lane_bytes = vdb::simd::ExRaBitQPackedMagnitudeBytes(dim_block, 4);
+    compact_blocks.assign(static_cast<size_t>(8u) * num_dim_blocks * packed_lane_bytes, 0);
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+        for (uint32_t db = 0; db < num_dim_blocks; ++db) {
+            const uint32_t dim_start = db * dim_block;
+            uint8_t decoded[64] = {};
+            const uint32_t copy = std::min(dim_block, dim - dim_start);
+            for (uint32_t offset = 0; offset < copy; ++offset) {
+                decoded[offset] = lane_ex_code[lane][dim_start + offset];
+            }
+            uint8_t* dst =
+                compact_blocks.data() +
+                (static_cast<size_t>(lane) * num_dim_blocks + db) * packed_lane_bytes;
+            ASSERT_TRUE(vdb::simd::ExRaBitQPackOfficialNibble4(
+                decoded, dim_block, dst, packed_lane_bytes));
+        }
+    }
+}
+
+void BuildOfficialVector2BitLayout(uint32_t dim, uint32_t dim_block,
+                                   const std::vector<std::vector<uint8_t>>& lane_ex_code,
+                                   std::vector<uint8_t>& compact_blocks) {
+    const uint32_t num_dim_blocks = (dim + dim_block - 1) / dim_block;
+    const uint32_t packed_lane_bytes = vdb::simd::ExRaBitQPackedMagnitudeBytes(dim_block, 2);
+    compact_blocks.assign(static_cast<size_t>(8u) * num_dim_blocks * packed_lane_bytes, 0);
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+        for (uint32_t db = 0; db < num_dim_blocks; ++db) {
+            const uint32_t dim_start = db * dim_block;
+            uint8_t decoded[64] = {};
+            const uint32_t copy = std::min(dim_block, dim - dim_start);
+            for (uint32_t offset = 0; offset < copy; ++offset) {
+                decoded[offset] = lane_ex_code[lane][dim_start + offset];
+            }
+            uint8_t* dst =
+                compact_blocks.data() +
+                (static_cast<size_t>(lane) * num_dim_blocks + db) * packed_lane_bytes;
+            ASSERT_TRUE(vdb::simd::ExRaBitQPackOfficial2Bit(
+                decoded, dim_block, dst, packed_lane_bytes));
+        }
+    }
+}
+
 void BuildParallelCompactLayout(uint32_t dim, uint32_t dim_block,
                                 const std::vector<std::vector<uint8_t>>& lane_abs,
                                 const std::vector<std::vector<uint8_t>>& lane_sign,
@@ -207,8 +344,8 @@ TEST(IPExRaBitQTest, OfficialDirect3RoundTripBothLayouts) {
     }
 }
 
-TEST(IPExRaBitQTest, OfficialDirectBitplanesRoundTripBits123) {
-    for (uint8_t bits : {1u, 2u, 3u}) {
+TEST(IPExRaBitQTest, OfficialDirectBitplanesRoundTripBits1234) {
+    for (uint8_t bits : {1u, 2u, 3u, 4u}) {
         const uint8_t max_value = static_cast<uint8_t>((1u << bits) - 1u);
         for (uint32_t dim : {1u, 7u, 16u, 63u, 64u, 70u, 512u}) {
             std::vector<uint8_t> decoded(dim);
@@ -229,6 +366,80 @@ TEST(IPExRaBitQTest, OfficialDirectBitplanesRoundTripBits123) {
                 << "bits=" << static_cast<int>(bits) << " dim=" << dim;
         }
     }
+}
+
+TEST(IPExRaBitQTest, OfficialBitMajorTilesRoundTripBits123) {
+    EXPECT_EQ(vdb::simd::ExRaBitQBitMajorTileVectorBytes(192, 1), 32u);
+    EXPECT_EQ(vdb::simd::ExRaBitQBitMajorTileVectorBytes(512, 1), 64u);
+    EXPECT_EQ(vdb::simd::ExRaBitQBitMajorTileVectorBytes(768, 1), 96u);
+    for (uint8_t bits : {1u, 2u, 3u}) {
+        const uint8_t max_value = static_cast<uint8_t>((1u << bits) - 1u);
+        for (uint32_t dim : {1u, 7u, 16u, 63u, 64u, 70u, 128u, 192u, 512u, 768u}) {
+            std::vector<uint8_t> decoded(dim);
+            for (uint32_t i = 0; i < dim; ++i) {
+                decoded[i] = static_cast<uint8_t>((i * 11u + 7u) & max_value);
+            }
+            const uint32_t packed_bytes =
+                vdb::simd::ExRaBitQBitMajorTileVectorBytes(dim, bits);
+            std::vector<uint8_t> packed(packed_bytes, 0xA5u);
+            std::vector<uint8_t> unpacked(dim, 0);
+
+            ASSERT_TRUE(vdb::simd::ExRaBitQPackOfficialBitMajorTiles(
+                decoded.data(), dim, bits, packed.data(), packed_bytes));
+            ASSERT_TRUE(vdb::simd::ExRaBitQUnpackOfficialBitMajorTiles(
+                packed.data(), dim, bits, unpacked.data()));
+            EXPECT_EQ(unpacked, decoded)
+                << "bits=" << static_cast<int>(bits) << " dim=" << dim;
+        }
+    }
+}
+
+TEST(IPExRaBitQTest, OfficialNibble4RoundTrip) {
+    for (uint32_t dim : {1u, 7u, 16u, 31u, 64u, 70u, 512u}) {
+        std::vector<uint8_t> decoded(dim);
+        for (uint32_t i = 0; i < dim; ++i) {
+            decoded[i] = static_cast<uint8_t>((i * 5u + 3u) & 0x0Fu);
+        }
+        const uint32_t groups = (dim + 15u) / 16u;
+        std::vector<uint8_t> packed(groups * 8u, 0xA5u);
+        std::vector<uint8_t> unpacked(dim, 0);
+
+        ASSERT_TRUE(vdb::simd::ExRaBitQPackOfficialNibble4(
+            decoded.data(), dim, packed.data(), static_cast<uint32_t>(packed.size())));
+        ASSERT_TRUE(vdb::simd::ExRaBitQUnpackOfficialNibble4(
+            packed.data(), dim, unpacked.data()));
+        EXPECT_EQ(unpacked, decoded) << "dim=" << dim;
+    }
+
+    uint8_t invalid[16] = {};
+    invalid[3] = 16;
+    uint8_t packed[8] = {};
+    EXPECT_FALSE(vdb::simd::ExRaBitQPackOfficialNibble4(
+        invalid, 16, packed, static_cast<uint32_t>(sizeof(packed))));
+}
+
+TEST(IPExRaBitQTest, Official2BitRoundTrip) {
+    for (uint32_t dim : {1u, 7u, 16u, 31u, 64u, 70u, 512u}) {
+        std::vector<uint8_t> decoded(dim);
+        for (uint32_t i = 0; i < dim; ++i) {
+            decoded[i] = static_cast<uint8_t>((i * 3u + 1u) & 0x03u);
+        }
+        const uint32_t blocks = (dim + 63u) / 64u;
+        std::vector<uint8_t> packed(blocks * 16u, 0xA5u);
+        std::vector<uint8_t> unpacked(dim, 0);
+
+        ASSERT_TRUE(vdb::simd::ExRaBitQPackOfficial2Bit(
+            decoded.data(), dim, packed.data(), static_cast<uint32_t>(packed.size())));
+        ASSERT_TRUE(vdb::simd::ExRaBitQUnpackOfficial2Bit(
+            packed.data(), dim, unpacked.data()));
+        EXPECT_EQ(unpacked, decoded) << "dim=" << dim;
+    }
+
+    uint8_t invalid[64] = {};
+    invalid[4] = 4;
+    uint8_t packed[16] = {};
+    EXPECT_FALSE(vdb::simd::ExRaBitQPackOfficial2Bit(
+        invalid, 64, packed, static_cast<uint32_t>(sizeof(packed))));
 }
 
 TEST(IPExRaBitQTest, PackedMagnitudeRejectsUnsupportedBitsAndOutOfRangeValues) {
@@ -462,7 +673,7 @@ TEST(IPExRaBitQTest, OfficialDirect3CompactMaskedMatchesDecodedAndScalar) {
 }
 
 TEST(IPExRaBitQTest, OfficialDirectBitplanesCompactMaskedMatchesDecodedAndScalar) {
-    for (uint8_t bits : {1u, 2u, 3u}) {
+    for (uint8_t bits : {1u, 2u, 3u, 4u}) {
         const uint8_t max_value = static_cast<uint8_t>((1u << bits) - 1u);
         for (uint32_t dim : {31u, 64u, 70u, 512u}) {
             constexpr uint32_t dim_block = 64;
@@ -505,6 +716,248 @@ TEST(IPExRaBitQTest, OfficialDirectBitplanesCompactMaskedMatchesDecodedAndScalar
                         << "bits=" << static_cast<int>(bits)
                         << " dim=" << dim << " lane=" << lane;
                 }
+            }
+        }
+    }
+}
+
+TEST(IPExRaBitQTest, OfficialVectorBitplanesMaskedMatchesDecodedAndScalar) {
+    for (uint8_t bits : {1u, 2u, 3u, 4u}) {
+        const uint8_t max_value = static_cast<uint8_t>((1u << bits) - 1u);
+        for (uint32_t dim : {31u, 64u, 70u, 512u}) {
+            constexpr uint32_t dim_block = 64;
+            const auto query = MakeQuery(dim);
+            std::vector<std::vector<uint8_t>> lane_ex_code(8);
+            for (uint32_t lane = 0; lane < 8; ++lane) {
+                lane_ex_code[lane].resize(dim);
+                for (uint32_t d = 0; d < dim; ++d) {
+                    lane_ex_code[lane][d] =
+                        static_cast<uint8_t>((lane * 7u + d * 3u + bits) & max_value);
+                }
+            }
+
+            std::vector<uint8_t> vector_blocks;
+            BuildOfficialVectorBitplanesLayout(dim, dim_block, bits, lane_ex_code, vector_blocks);
+
+            for (uint32_t mask : {0x00u, 0x01u, 0x80u, 0x55u, 0xA6u, 0xFFu}) {
+                std::vector<float> direct(8, 0.0f);
+                vdb::simd::IPOfficialRaBitQBatchCompactVectorBitplanesMasked(
+                    query.data(), vector_blocks.data(), bits, mask, 8, dim, dim_block,
+                    direct.data());
+                std::vector<float> prefetch(8, 0.0f);
+                vdb::simd::IPOfficialRaBitQBatchCompactVectorBitplanesPrefetchMasked(
+                    query.data(), vector_blocks.data(), bits, mask, 8, dim, dim_block,
+                    prefetch.data());
+                std::vector<float> microbatch(8, 0.0f);
+                vdb::simd::IPOfficialRaBitQBatchCompactVectorBitplanesMicroBatchMasked(
+                    query.data(), vector_blocks.data(), bits, mask, 8, dim, dim_block,
+                    microbatch.data());
+                for (uint32_t lane = 0; lane < 8; ++lane) {
+                    if ((mask & (1u << lane)) == 0) {
+                        EXPECT_FLOAT_EQ(direct[lane], 0.0f);
+                        EXPECT_FLOAT_EQ(prefetch[lane], 0.0f);
+                        EXPECT_FLOAT_EQ(microbatch[lane], 0.0f);
+                        continue;
+                    }
+                    const float expected =
+                        ScalarOfficialExDataDot(query.data(), lane_ex_code[lane].data(), dim);
+                    EXPECT_NEAR(direct[lane], expected, 1e-3f)
+                        << "bits=" << static_cast<int>(bits) << " dim=" << dim
+                        << " lane=" << lane;
+                    EXPECT_NEAR(prefetch[lane], expected, 1e-3f)
+                        << "prefetch bits=" << static_cast<int>(bits) << " dim=" << dim
+                        << " lane=" << lane;
+                    EXPECT_NEAR(microbatch[lane], expected, 1e-3f)
+                        << "microbatch bits=" << static_cast<int>(bits) << " dim=" << dim
+                        << " lane=" << lane;
+                }
+            }
+        }
+    }
+}
+
+TEST(IPExRaBitQTest, OfficialVectorBitMajorTilesMaskedMatchesDecodedAndScalar) {
+    for (uint8_t bits : {1u, 2u, 3u}) {
+        const uint8_t max_value = static_cast<uint8_t>((1u << bits) - 1u);
+        for (uint32_t dim : {31u, 64u, 70u, 192u, 512u, 768u}) {
+            constexpr uint32_t dim_block = 64;
+            const auto query = MakeQuery(dim);
+            std::vector<std::vector<uint8_t>> lane_ex_code(8);
+            for (uint32_t lane = 0; lane < 8; ++lane) {
+                lane_ex_code[lane].resize(dim);
+                for (uint32_t d = 0; d < dim; ++d) {
+                    lane_ex_code[lane][d] =
+                        static_cast<uint8_t>((lane * 17u + d * 5u + bits) & max_value);
+                }
+            }
+
+            std::vector<uint8_t> tile_blocks;
+            BuildOfficialVectorBitMajorTilesLayout(dim, bits, lane_ex_code, tile_blocks);
+
+            for (uint32_t mask : {0x00u, 0x01u, 0x80u, 0x55u, 0xA6u, 0xFFu}) {
+                std::vector<float> direct(8, 0.0f);
+                vdb::simd::IPOfficialRaBitQBatchCompactVectorBitMajorTilesMasked(
+                    query.data(), tile_blocks.data(), bits, mask, 8, dim, dim_block,
+                    direct.data());
+                for (uint32_t lane = 0; lane < 8; ++lane) {
+                    if ((mask & (1u << lane)) == 0) {
+                        EXPECT_FLOAT_EQ(direct[lane], 0.0f);
+                        continue;
+                    }
+                    const float expected =
+                        ScalarOfficialExDataDot(query.data(), lane_ex_code[lane].data(), dim);
+                    EXPECT_NEAR(direct[lane], expected, 1e-3f)
+                        << "bits=" << static_cast<int>(bits) << " dim=" << dim
+                        << " lane=" << lane;
+                }
+            }
+        }
+    }
+}
+
+TEST(IPExRaBitQTest, OfficialSmallLane4BitplanesMaskedMatchesDecodedAndScalar) {
+    for (uint8_t bits : {1u, 2u, 3u, 4u}) {
+        const uint8_t max_value = static_cast<uint8_t>((1u << bits) - 1u);
+        for (uint32_t dim : {31u, 64u, 70u, 512u}) {
+            constexpr uint32_t dim_block = 64;
+            const auto query = MakeQuery(dim);
+            std::vector<std::vector<uint8_t>> lane_ex_code(8);
+            for (uint32_t lane = 0; lane < 8; ++lane) {
+                lane_ex_code[lane].resize(dim);
+                for (uint32_t d = 0; d < dim; ++d) {
+                    lane_ex_code[lane][d] =
+                        static_cast<uint8_t>((lane * 13u + d * 5u + bits) & max_value);
+                }
+            }
+
+            std::vector<uint8_t> compact_blocks;
+            BuildOfficialSmallLane4BitplanesLayout(
+                dim, dim_block, bits, lane_ex_code, compact_blocks);
+
+            for (uint32_t mask : {0x00u, 0x01u, 0x80u, 0x55u, 0xA6u, 0xFFu}) {
+                std::vector<float> direct(8, 0.0f);
+                vdb::simd::IPOfficialRaBitQBatchCompactSmallLane4BitplanesMasked(
+                    query.data(), compact_blocks.data(), bits, mask, 8, dim, dim_block,
+                    direct.data());
+                for (uint32_t lane = 0; lane < 8; ++lane) {
+                    if ((mask & (1u << lane)) == 0) {
+                        EXPECT_FLOAT_EQ(direct[lane], 0.0f);
+                        continue;
+                    }
+                    const float expected =
+                        ScalarOfficialExDataDot(query.data(), lane_ex_code[lane].data(), dim);
+                    EXPECT_NEAR(direct[lane], expected, 1e-3f)
+                        << "bits=" << static_cast<int>(bits) << " dim=" << dim
+                        << " lane=" << lane;
+                }
+            }
+        }
+    }
+}
+
+TEST(IPExRaBitQTest, OfficialSmallLane2BitplanesMaskedMatchesDecodedAndScalar) {
+    for (uint8_t bits : {1u, 2u, 3u, 4u}) {
+        const uint8_t max_value = static_cast<uint8_t>((1u << bits) - 1u);
+        for (uint32_t dim : {31u, 64u, 70u, 512u}) {
+            constexpr uint32_t dim_block = 64;
+            const auto query = MakeQuery(dim);
+            std::vector<std::vector<uint8_t>> lane_ex_code(8);
+            for (uint32_t lane = 0; lane < 8; ++lane) {
+                lane_ex_code[lane].resize(dim);
+                for (uint32_t d = 0; d < dim; ++d) {
+                    lane_ex_code[lane][d] =
+                        static_cast<uint8_t>((lane * 17u + d * 7u + bits) & max_value);
+                }
+            }
+
+            std::vector<uint8_t> compact_blocks;
+            BuildOfficialSmallLane2BitplanesLayout(
+                dim, dim_block, bits, lane_ex_code, compact_blocks);
+
+            for (uint32_t mask : {0x00u, 0x01u, 0x80u, 0x55u, 0xA6u, 0xFFu}) {
+                std::vector<float> direct(8, 0.0f);
+                vdb::simd::IPOfficialRaBitQBatchCompactSmallLane2BitplanesMasked(
+                    query.data(), compact_blocks.data(), bits, mask, 8, dim, dim_block,
+                    direct.data());
+                for (uint32_t lane = 0; lane < 8; ++lane) {
+                    if ((mask & (1u << lane)) == 0) {
+                        EXPECT_FLOAT_EQ(direct[lane], 0.0f);
+                        continue;
+                    }
+                    const float expected =
+                        ScalarOfficialExDataDot(query.data(), lane_ex_code[lane].data(), dim);
+                    EXPECT_NEAR(direct[lane], expected, 1e-3f)
+                        << "bits=" << static_cast<int>(bits) << " dim=" << dim
+                        << " lane=" << lane;
+                }
+            }
+        }
+    }
+}
+
+TEST(IPExRaBitQTest, OfficialVectorNibble4MaskedMatchesDecodedAndScalar) {
+    for (uint32_t dim : {31u, 64u, 70u, 512u}) {
+        constexpr uint32_t dim_block = 64;
+        const auto query = MakeQuery(dim);
+        std::vector<std::vector<uint8_t>> lane_ex_code(8);
+        for (uint32_t lane = 0; lane < 8; ++lane) {
+            lane_ex_code[lane].resize(dim);
+            for (uint32_t d = 0; d < dim; ++d) {
+                lane_ex_code[lane][d] =
+                    static_cast<uint8_t>((lane * 11u + d * 5u + 7u) & 0x0Fu);
+            }
+        }
+
+        std::vector<uint8_t> nibble_blocks;
+        BuildOfficialVectorNibble4Layout(dim, dim_block, lane_ex_code, nibble_blocks);
+
+        for (uint32_t mask : {0x00u, 0x01u, 0x80u, 0x55u, 0xA6u, 0xFFu}) {
+            std::vector<float> direct(8, 0.0f);
+            vdb::simd::IPOfficialRaBitQBatchCompactVectorNibble4Masked(
+                query.data(), nibble_blocks.data(), mask, 8, dim, dim_block, direct.data());
+            for (uint32_t lane = 0; lane < 8; ++lane) {
+                if ((mask & (1u << lane)) == 0) {
+                    EXPECT_FLOAT_EQ(direct[lane], 0.0f);
+                    continue;
+                }
+                const float expected =
+                    ScalarOfficialExDataDot(query.data(), lane_ex_code[lane].data(), dim);
+                EXPECT_NEAR(direct[lane], expected, 1e-3f)
+                    << "dim=" << dim << " lane=" << lane;
+            }
+        }
+    }
+}
+
+TEST(IPExRaBitQTest, OfficialVector2BitMaskedMatchesDecodedAndScalar) {
+    for (uint32_t dim : {31u, 64u, 70u, 512u}) {
+        constexpr uint32_t dim_block = 64;
+        const auto query = MakeQuery(dim);
+        std::vector<std::vector<uint8_t>> lane_ex_code(8);
+        for (uint32_t lane = 0; lane < 8; ++lane) {
+            lane_ex_code[lane].resize(dim);
+            for (uint32_t d = 0; d < dim; ++d) {
+                lane_ex_code[lane][d] =
+                    static_cast<uint8_t>((lane * 5u + d * 3u + 1u) & 0x03u);
+            }
+        }
+
+        std::vector<uint8_t> compact_blocks;
+        BuildOfficialVector2BitLayout(dim, dim_block, lane_ex_code, compact_blocks);
+
+        for (uint32_t mask : {0x00u, 0x01u, 0x80u, 0x55u, 0xA6u, 0xFFu}) {
+            std::vector<float> direct(8, 0.0f);
+            vdb::simd::IPOfficialRaBitQBatchCompactVector2BitMasked(
+                query.data(), compact_blocks.data(), mask, 8, dim, dim_block, direct.data());
+            for (uint32_t lane = 0; lane < 8; ++lane) {
+                if ((mask & (1u << lane)) == 0) {
+                    EXPECT_FLOAT_EQ(direct[lane], 0.0f);
+                    continue;
+                }
+                const float expected =
+                    ScalarOfficialExDataDot(query.data(), lane_ex_code[lane].data(), dim);
+                EXPECT_NEAR(direct[lane], expected, 1e-3f)
+                    << "dim=" << dim << " lane=" << lane;
             }
         }
     }

@@ -48,6 +48,35 @@ bool ExRaBitQUnpackOfficialDirectBitplanes(const uint8_t* VDB_RESTRICT packed,
                                            uint32_t count, uint8_t bits,
                                            uint8_t* VDB_RESTRICT decoded);
 
+bool ExRaBitQPackOfficialNibble4(const uint8_t* VDB_RESTRICT decoded,
+                                 uint32_t count, uint8_t* VDB_RESTRICT packed,
+                                 uint32_t packed_bytes);
+
+bool ExRaBitQUnpackOfficialNibble4(const uint8_t* VDB_RESTRICT packed,
+                                   uint32_t count, uint8_t* VDB_RESTRICT decoded);
+
+bool ExRaBitQPackOfficial2Bit(const uint8_t* VDB_RESTRICT decoded,
+                              uint32_t count, uint8_t* VDB_RESTRICT packed,
+                              uint32_t packed_bytes);
+
+bool ExRaBitQUnpackOfficial2Bit(const uint8_t* VDB_RESTRICT packed,
+                                uint32_t count, uint8_t* VDB_RESTRICT decoded);
+
+/// Cacheline-aware bit-major vector tile layout. Each lane record is split into
+/// dimension tiles whose bitplanes target 64B, then 32B, then smaller powers of
+/// two when the remaining dimensionality cannot fill a 64B bitplane.
+uint32_t ExRaBitQBitMajorTileDims(uint32_t remaining_dims);
+uint32_t ExRaBitQBitMajorTileVectorBytes(uint32_t dim, uint8_t bits);
+
+bool ExRaBitQPackOfficialBitMajorTiles(const uint8_t* VDB_RESTRICT decoded,
+                                       uint32_t count, uint8_t bits,
+                                       uint8_t* VDB_RESTRICT packed,
+                                       uint32_t packed_bytes);
+
+bool ExRaBitQUnpackOfficialBitMajorTiles(const uint8_t* VDB_RESTRICT packed,
+                                         uint32_t count, uint8_t bits,
+                                         uint8_t* VDB_RESTRICT decoded);
+
 /// Compute the signed inner product for ExRaBitQ Stage 2:
 ///
 ///   result = Σ query[i] * sign[i] * (code_abs[i] + 0.5)
@@ -141,6 +170,87 @@ void IPOfficialRaBitQBatchCompactDirectBitplanesMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+void IPOfficialRaBitQBatchCompactDirectBitplanesStridedMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint32_t stored_lanes, uint32_t lane_mask, uint32_t valid_count,
+    Dim dim, uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Mask-aware official ExData kernel over lane-major vector bitplane layout.
+/// `compact_blocks` layout is [valid_count][num_dim_blocks][ceil(dim_block * bits / 8)].
+void IPOfficialRaBitQBatchCompactVectorBitplanesMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Same storage contract as IPOfficialRaBitQBatchCompactVectorBitplanesMasked,
+/// but prefetches the next requested lane record before computing the current
+/// one.
+void IPOfficialRaBitQBatchCompactVectorBitplanesPrefetchMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Same storage contract as IPOfficialRaBitQBatchCompactVectorBitplanesMasked,
+/// but processes requested lanes in small survivor chunks so each query block is
+/// loaded once per chunk instead of once per lane.
+void IPOfficialRaBitQBatchCompactVectorBitplanesMicroBatchMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Mask-aware official ExData kernel over lane-major bit-major tile layout.
+/// `compact_blocks` layout is [valid_count][tile][bit][tile_dims / 8], where
+/// tile_dims is selected from 512/256/128/64 according to the remaining dims.
+void IPOfficialRaBitQBatchCompactVectorBitMajorTilesMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Mask-aware official ExData kernel over 4-lane subgroup bitplane layout.
+/// `compact_blocks` layout is [subgroup4][dim_block][local_lane][bitplanes].
+void IPOfficialRaBitQBatchCompactSmallLane4BitplanesMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Mask-aware official ExData kernel over 2-lane subgroup bitplane layout.
+/// `compact_blocks` layout is [subgroup2][dim_block][local_lane][bitplanes].
+void IPOfficialRaBitQBatchCompactSmallLane2BitplanesMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Mask-aware official ExData kernel over lane-major vector 4-bit nibble
+/// layout. `compact_blocks` layout is [valid_count][num_dim_blocks][32B],
+/// where each 64-dim block is four official RaBitQ 16-dim nibble groups.
+void IPOfficialRaBitQBatchCompactVectorNibble4Masked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint32_t lane_mask, uint32_t valid_count, Dim dim, uint32_t dim_block,
+    float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Mask-aware official ExData kernel over lane-major vector 2-bit compact
+/// layout. `compact_blocks` layout is [valid_count][num_dim_blocks][16B],
+/// where each 64-dim block stores dimensions j, j+16, j+32, j+48 in byte j.
+void IPOfficialRaBitQBatchCompactVector2BitMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint32_t lane_mask, uint32_t valid_count, Dim dim, uint32_t dim_block,
+    float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+void IPOfficialRaBitQBatchCompactDirect3ZeroPlaneElideMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint32_t lane_mask, uint32_t valid_count, Dim dim, uint32_t dim_block,
+    float* VDB_RESTRICT out_ip_ex,
     IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
 
 /// Mask-aware official ExData kernel over legacy direct-compact 3-bit layouts.

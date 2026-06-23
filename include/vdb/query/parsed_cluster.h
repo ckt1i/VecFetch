@@ -58,6 +58,7 @@ struct ParsedCluster {
         uint8_t magnitude_bits = 0;
         bool abs_packed = false;
         RaBitQExDataLayout exdata_layout = RaBitQExDataLayout::kGenericPacked;
+        uint32_t batch_block_bytes = 0;
     };
 
     struct ExRaBitQBatchParallelBlockView {
@@ -84,6 +85,9 @@ struct ParsedCluster {
     uint32_t exrabitq_storage_version = 0;
     const uint8_t* exrabitq_batch_blocks = nullptr;
     uint32_t exrabitq_batch_block_size = 0;
+    const uint32_t* exrabitq_batch_block_offsets = nullptr;
+    uint32_t exrabitq_batch_region_bytes = 0;
+    bool exrabitq_variable_batch_blocks = false;
     uint32_t exrabitq_batch_size = 0;
     uint32_t exrabitq_dim_block = 0;
     uint32_t exrabitq_num_dim_blocks = 0;
@@ -158,32 +162,61 @@ struct ParsedCluster {
         ExRaBitQBatchBlockView view;
         if (exrabitq_batch_blocks == nullptr ||
             batch_block_id >= exrabitq_num_batch_blocks ||
-            exrabitq_batch_block_size == 0 ||
             exrabitq_batch_size == 0 ||
             exrabitq_dim_block == 0) {
             return view;
         }
-        const uint8_t* block =
-            exrabitq_batch_blocks +
-            static_cast<size_t>(batch_block_id) * exrabitq_batch_block_size;
+        const uint8_t* block = nullptr;
+        uint32_t block_bytes = exrabitq_batch_block_size;
+        if (exrabitq_variable_batch_blocks) {
+            if (exrabitq_batch_block_offsets == nullptr ||
+                batch_block_id + 1 >= exrabitq_num_batch_blocks + 1) {
+                return view;
+            }
+            const uint32_t begin = exrabitq_batch_block_offsets[batch_block_id];
+            const uint32_t end = exrabitq_batch_block_offsets[batch_block_id + 1];
+            if (end < begin || end > exrabitq_batch_region_bytes) {
+                return view;
+            }
+            block = exrabitq_batch_blocks + begin;
+            block_bytes = end - begin;
+        } else {
+            if (exrabitq_batch_block_size == 0) {
+                return view;
+            }
+            block =
+                exrabitq_batch_blocks +
+                static_cast<size_t>(batch_block_id) * exrabitq_batch_block_size;
+        }
+        if (block_bytes < sizeof(uint32_t)) {
+            return view;
+        }
         const uint32_t abs_lane_bytes =
             exrabitq_abs_bytes_per_lane_dim_block != 0
                 ? exrabitq_abs_bytes_per_lane_dim_block
                 : exrabitq_dim_block;
-        const uint32_t abs_total_bytes =
-            exrabitq_num_dim_blocks * exrabitq_batch_size * abs_lane_bytes;
         view.batch_block_id = batch_block_id;
         std::memcpy(&view.valid_count, block, sizeof(uint32_t));
+        if (view.valid_count > exrabitq_batch_size) {
+            return ExRaBitQBatchBlockView{};
+        }
         const uint8_t* payload = block + sizeof(uint32_t);
+        const uint32_t stored_lanes =
+            exrabitq_variable_batch_blocks ? view.valid_count : exrabitq_batch_size;
+        const uint32_t abs_total_bytes =
+            exrabitq_num_dim_blocks * stored_lanes * abs_lane_bytes;
         view.abs_blocks = payload;
         view.sign_blocks = uses_official_1_plus_n() ? nullptr : payload + abs_total_bytes;
         const uint32_t factor_count =
-            uses_official_1_plus_n() ? exrabitq_batch_size * 2u : exrabitq_batch_size;
+            uses_official_1_plus_n() ? stored_lanes * 2u : stored_lanes;
+        if (block_bytes < factor_count * sizeof(float)) {
+            return ExRaBitQBatchBlockView{};
+        }
         const float* factors = reinterpret_cast<const float*>(
-            block + exrabitq_batch_block_size - factor_count * sizeof(float));
+            block + block_bytes - factor_count * sizeof(float));
         if (uses_official_1_plus_n()) {
             view.official_factor_adds = factors;
-            view.official_factor_rescales = factors + exrabitq_batch_size;
+            view.official_factor_rescales = factors + stored_lanes;
         } else {
             view.xipnorms = factors;
         }
@@ -191,6 +224,7 @@ struct ParsedCluster {
         view.magnitude_bits = exrabitq_magnitude_bits;
         view.abs_packed = exrabitq_magnitude_packed;
         view.exdata_layout = rabitq_exdata_layout;
+        view.batch_block_bytes = block_bytes;
         return view;
     }
 

@@ -305,6 +305,7 @@ static bool ResolveRaBitQBuildConfig(int argc, char* argv[],
                      mode_arg.c_str());
         return false;
     }
+    const bool layout_explicit = HasFlag(argc, argv, "--rabitq-exdata-layout");
     const std::string layout_arg =
         GetStringArg(argc, argv, "--rabitq-exdata-layout", "generic_packed");
     RaBitQExDataLayout exdata_layout = RaBitQExDataLayout::kGenericPacked;
@@ -312,7 +313,8 @@ static bool ResolveRaBitQBuildConfig(int argc, char* argv[],
         std::fprintf(stderr,
                      "Invalid --rabitq-exdata-layout: %s "
                      "(expected generic_packed, split1_bitplane, split2_bitplanes, "
-                     "split3_2plus1, split3_bitplanes, or selected_direct)\n",
+                     "split3_2plus1, split3_bitplanes, split3_trimmed_bitplanes, "
+                     "split3_zero_plane_elide, vector_bitmajor_tiles, or selected_direct)\n",
                      layout_arg.c_str());
         return false;
     }
@@ -338,6 +340,10 @@ static bool ResolveRaBitQBuildConfig(int argc, char* argv[],
         config.total_bits = static_cast<uint8_t>(total_bits);
         config.ex_bits = static_cast<uint8_t>(ex_bits);
         config.bits = config.ex_bits > 0 ? config.ex_bits : 1;
+        if (!layout_explicit) {
+            config.exdata_layout =
+                RaBitQDefaultOfficialExDataLayoutForBits(config.ex_bits);
+        }
         if (!config.official_bits_valid()) {
             std::fprintf(stderr,
                          "official RaBitQ requires total_bits == ex_bits + 1 "

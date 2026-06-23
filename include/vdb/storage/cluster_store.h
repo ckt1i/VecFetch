@@ -95,6 +95,9 @@ class ClusterStoreReader {
         uint32_t exrabitq_storage_version = 0;
         const uint8_t* exrabitq_batch_blocks = nullptr;
         uint32_t exrabitq_batch_block_size = 0;
+        const uint32_t* exrabitq_batch_block_offsets = nullptr;
+        uint32_t exrabitq_batch_region_bytes = 0;
+        bool exrabitq_variable_batch_blocks = false;
         uint32_t exrabitq_batch_size = 0;
         uint32_t exrabitq_dim_block = 0;
         uint32_t exrabitq_num_dim_blocks = 0;
@@ -134,6 +137,9 @@ class ClusterStoreReader {
             pc.exrabitq_storage_version = exrabitq_storage_version;
             pc.exrabitq_batch_blocks = exrabitq_batch_blocks;
             pc.exrabitq_batch_block_size = exrabitq_batch_block_size;
+            pc.exrabitq_batch_block_offsets = exrabitq_batch_block_offsets;
+            pc.exrabitq_batch_region_bytes = exrabitq_batch_region_bytes;
+            pc.exrabitq_variable_batch_blocks = exrabitq_variable_batch_blocks;
             pc.exrabitq_batch_size = exrabitq_batch_size;
             pc.exrabitq_dim_block = exrabitq_dim_block;
             pc.exrabitq_num_dim_blocks = exrabitq_num_dim_blocks;
@@ -287,7 +293,7 @@ class ClusterStoreReader {
     double resident_parallel_view_build_ms_ = 0.0;
 
     uint32_t num_code_words() const { return (info_.dim + 63) / 64; }
-    uint32_t fastscan_packed_size() const { return info_.dim * 4; }
+    uint32_t fastscan_packed_size() const { return ((info_.dim + 7) / 8) * 32; }
     uint32_t fastscan_block_bytes() const {
         return fastscan_packed_size() + 32 * sizeof(float);
     }

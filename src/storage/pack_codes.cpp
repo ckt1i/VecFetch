@@ -19,16 +19,16 @@ void PackSignBitsForFastScan(const rabitq::RaBitQCode* codes,
     // Each sub-quantizer packs 4 sign bits (one per dimension in the group).
     const uint32_t M = dim / 4;
 
-    // Zero the output buffer: dim * 4 bytes
-    std::memset(out, 0, static_cast<size_t>(dim) * 4);
+    // Zero the output buffer: one 32-byte packed pair per 8 dimensions.
+    std::memset(out, 0, FastScanPackedSize(dim));
 
     // Step 1: Extract per-vector nibble codes.
     // For each vector, extract M nibbles (one per dim-group of 4).
-    // Store as M/2 bytes per vector (2 nibbles per byte).
+    // Store as ceil(M/2) bytes per vector (2 nibbles per byte).
     //
     // nibble[m] for vector v = sign[v][m*4+3] | sign[v][m*4+2]<<1
     //                        | sign[v][m*4+1]<<2 | sign[v][m*4+0]<<3
-    const uint32_t bytes_per_vec = M / 2;  // M nibbles, 2 per byte
+    const uint32_t bytes_per_vec = (M + 1) / 2;  // M nibbles, 2 per byte
     std::vector<uint8_t> flat(32 * bytes_per_vec, 0);
 
     for (uint32_t v = 0; v < num_codes; ++v) {
