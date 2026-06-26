@@ -6,12 +6,18 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "vdb/simd/ip_exrabitq.h"
 #include "vdb/simd/popcount.h"
 #include "vdb/storage/pack_codes.h"
+
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
 
 namespace vdb {
 namespace storage {
@@ -263,13 +269,14 @@ void BuildResidentParallelStage2View(const query::ParsedCluster& parsed,
 }
 
 bool UseCompactResidentPreload() {
-    const char* mode = std::getenv("VDB_RESIDENT_PRELOAD_MODE");
-    if (mode != nullptr && mode[0] != '\0') {
-        if (std::strcmp(mode, "full_file") == 0 ||
-            std::strcmp(mode, "legacy_full_file") == 0 ||
-            std::strcmp(mode, "legacy") == 0) {
-            return false;
-        }
+	    const char* mode = std::getenv("VDB_RESIDENT_PRELOAD_MODE");
+	    if (mode != nullptr && mode[0] != '\0') {
+	        if (std::strcmp(mode, "full_file") == 0 ||
+	            std::strcmp(mode, "full_file_mmap_2mb") == 0 ||
+	            std::strcmp(mode, "legacy_full_file") == 0 ||
+	            std::strcmp(mode, "legacy") == 0) {
+	            return false;
+	        }
         return true;
     }
     const char* compact = std::getenv("VDB_COMPACT_RESIDENT_PRELOAD");
@@ -280,6 +287,189 @@ bool UseCompactResidentPreload() {
         return false;
     }
     return true;
+}
+
+bool UseResidentHugePages() {
+    const char* env = std::getenv("VDB_RESIDENT_HUGEPAGE");
+    if (env == nullptr || env[0] == '\0') {
+        env = std::getenv("VDB_MADVISE_HUGEPAGE");
+    }
+    return env != nullptr && env[0] != '\0' && env[0] != '0' &&
+           std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
+}
+
+bool UseResidentHugePageCollapse() {
+    const char* env = std::getenv("VDB_RESIDENT_HUGEPAGE_COLLAPSE");
+    return env != nullptr && env[0] != '\0' && env[0] != '0' &&
+           std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
+}
+
+bool UseAlignedMmapResidentFile() {
+    const char* mode = std::getenv("VDB_RESIDENT_PRELOAD_MODE");
+    if (mode != nullptr && std::strcmp(mode, "full_file_mmap_2mb") == 0) {
+        return true;
+    }
+    const char* alloc = std::getenv("VDB_RESIDENT_FILE_ALLOC");
+    if (alloc != nullptr &&
+        (std::strcmp(alloc, "mmap_2mb") == 0 ||
+         std::strcmp(alloc, "aligned_mmap") == 0 ||
+         std::strcmp(alloc, "mmap") == 0)) {
+        return true;
+    }
+    const char* env = std::getenv("VDB_RESIDENT_MMAP_2MB");
+    return env != nullptr && env[0] != '\0' && env[0] != '0' &&
+           std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
+}
+
+bool UseCompactCodeSlabResidentPreload() {
+    const char* mode = std::getenv("VDB_RESIDENT_PRELOAD_MODE");
+    if (mode != nullptr &&
+        (std::strcmp(mode, "compact_code_mmap_2mb") == 0 ||
+         std::strcmp(mode, "compact_code_slab_mmap_2mb") == 0)) {
+        return true;
+    }
+    const char* env = std::getenv("VDB_RESIDENT_CODE_SLAB_MMAP_2MB");
+    return env != nullptr && env[0] != '\0' && env[0] != '0' &&
+           std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
+}
+
+bool UseStage1EnvelopePrecompute() {
+    const char* env = std::getenv("VDB_STAGE1_PRECOMPUTE_ENVELOPE");
+    return env != nullptr && env[0] != '\0' && env[0] != '0' &&
+           std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
+}
+
+uintptr_t AlignUp(uintptr_t value, uintptr_t alignment) {
+    return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+uint64_t AlignUp64(uint64_t value, uint64_t alignment) {
+    return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+void MAdviseHugePageRange(void* ptr, size_t len) {
+    if (!UseResidentHugePages() || ptr == nullptr || len < (2u << 20)) {
+        return;
+    }
+    const long page_size_long = ::sysconf(_SC_PAGESIZE);
+    const uintptr_t page_size =
+        page_size_long > 0 ? static_cast<uintptr_t>(page_size_long) : 4096u;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t end = begin + len;
+    const uintptr_t aligned_begin = begin & ~(page_size - 1u);
+    const uintptr_t aligned_end = (end + page_size - 1u) & ~(page_size - 1u);
+    if (aligned_end <= aligned_begin) {
+        return;
+    }
+    (void)::madvise(reinterpret_cast<void*>(aligned_begin),
+                    static_cast<size_t>(aligned_end - aligned_begin),
+                    MADV_HUGEPAGE);
+    if (UseResidentHugePageCollapse()) {
+        (void)::madvise(reinterpret_cast<void*>(aligned_begin),
+                        static_cast<size_t>(aligned_end - aligned_begin),
+                        MADV_COLLAPSE);
+    }
+}
+
+template <typename T>
+void MAdviseHugePageVector(std::vector<T>& vec) {
+    if (!vec.empty()) {
+        MAdviseHugePageRange(vec.data(), vec.size() * sizeof(T));
+    }
+}
+
+constexpr uint8_t kFastScanInvPerm[16] = {
+    0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15
+};
+
+VDB_FORCE_INLINE uint16_t FastScanPresenceMaskFull(const uint8_t* group_bytes) {
+    uint16_t mask = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+        const uint8_t byte = group_bytes[i];
+        mask |= static_cast<uint16_t>(1u << (byte & 0x0Fu));
+        mask |= static_cast<uint16_t>(1u << ((byte >> 4) & 0x0Fu));
+    }
+    return mask;
+}
+
+VDB_FORCE_INLINE uint16_t FastScanPresenceMaskTail(const uint8_t* group_bytes,
+                                                   uint32_t count) {
+    uint16_t mask = 0;
+    for (uint32_t lane = 0; lane < count; ++lane) {
+        const bool high_half = lane >= 16u;
+        const uint32_t lane_in_half = high_half ? (lane - 16u) : lane;
+        const uint32_t perm_pos = kFastScanInvPerm[lane_in_half];
+        const uint8_t byte = group_bytes[perm_pos];
+        const uint8_t nibble =
+            high_half ? static_cast<uint8_t>((byte >> 4) & 0x0Fu)
+                      : static_cast<uint8_t>(byte & 0x0Fu);
+        mask |= static_cast<uint16_t>(1u << nibble);
+    }
+    return mask;
+}
+
+VDB_FORCE_INLINE uint16_t FastScanPresenceMaskForGroup(const uint8_t* packed_codes,
+                                                       uint32_t group_idx,
+                                                       uint32_t count) {
+    const uint8_t* pair = packed_codes + (group_idx / 2u) * 32u;
+    const uint8_t* group_bytes = pair + ((group_idx & 1u) ? 16u : 0u);
+    return count >= 32u ? FastScanPresenceMaskFull(group_bytes)
+                        : FastScanPresenceMaskTail(group_bytes, count);
+}
+
+uint64_t ResidentStage1EnvelopeBytes(
+    const ClusterStoreReader::ResidentClusterView& view) {
+    return static_cast<uint64_t>(view.stage1_envelope_presence_masks.size()) *
+               sizeof(uint16_t) +
+           static_cast<uint64_t>(view.stage1_envelope_norm_min.size()) *
+               sizeof(float) +
+           static_cast<uint64_t>(view.stage1_envelope_norm_max.size()) *
+               sizeof(float);
+}
+
+void BuildResidentStage1EnvelopeSummary(
+    const query::ParsedCluster& parsed,
+    Dim dim,
+    ClusterStoreReader::ResidentClusterView* view) {
+    if (view == nullptr || parsed.fastscan_blocks == nullptr ||
+        parsed.num_fastscan_blocks == 0 || parsed.fastscan_block_size == 0 ||
+        dim < 4) {
+        return;
+    }
+    const uint32_t groups = dim >> 2;
+    const uint32_t packed_sz = FastScanPackedSize(dim);
+    if (groups == 0 ||
+        parsed.fastscan_block_size < packed_sz + 32u * sizeof(float)) {
+        return;
+    }
+
+    view->stage1_envelope_groups_per_block = groups;
+    view->stage1_envelope_presence_masks.assign(
+        static_cast<size_t>(parsed.num_fastscan_blocks) * groups, 0);
+    view->stage1_envelope_norm_min.assign(parsed.num_fastscan_blocks, 0.0f);
+    view->stage1_envelope_norm_max.assign(parsed.num_fastscan_blocks, 0.0f);
+
+    for (uint32_t b = 0; b < parsed.num_fastscan_blocks; ++b) {
+        const uint32_t base_idx = b * 32u;
+        const uint32_t count = std::min(32u, parsed.num_records - base_idx);
+        const uint8_t* block_ptr =
+            parsed.fastscan_blocks +
+            static_cast<size_t>(b) * parsed.fastscan_block_size;
+        for (uint32_t group = 0; group < groups; ++group) {
+            view->stage1_envelope_presence_masks[
+                static_cast<size_t>(b) * groups + group] =
+                FastScanPresenceMaskForGroup(block_ptr, group, count);
+        }
+        const float* norms = reinterpret_cast<const float*>(block_ptr + packed_sz);
+        float norm_min = std::numeric_limits<float>::infinity();
+        float norm_max = -std::numeric_limits<float>::infinity();
+        for (uint32_t i = 0; i < count; ++i) {
+            norm_min = std::min(norm_min, norms[i]);
+            norm_max = std::max(norm_max, norms[i]);
+        }
+        view->stage1_envelope_norm_min[b] = norm_min;
+        view->stage1_envelope_norm_max[b] = norm_max;
+    }
 }
 
 void CopyParsedMetadataToResident(const query::ParsedCluster& parsed,
@@ -311,10 +501,10 @@ void CopyParsedMetadataToResident(const query::ParsedCluster& parsed,
     view->address_page_size = parsed.address_page_size;
 }
 
-void RelocateResidentCodePointers(const query::ParsedCluster& parsed,
-                                  ClusterStoreReader::ResidentClusterView* view) {
-    const uint8_t* base = view->code_storage.empty() ? nullptr
-                                                     : view->code_storage.data();
+void RelocateResidentCodePointersToBase(
+    const query::ParsedCluster& parsed,
+    const uint8_t* base,
+    ClusterStoreReader::ResidentClusterView* view) {
     view->fastscan_blocks = base == nullptr ? nullptr
                                             : base + parsed.fastscan_region_offset;
     view->exrabitq_entries =
@@ -331,6 +521,13 @@ void RelocateResidentCodePointers(const query::ParsedCluster& parsed,
             : nullptr;
 }
 
+void RelocateResidentCodePointers(const query::ParsedCluster& parsed,
+                                  ClusterStoreReader::ResidentClusterView* view) {
+    const uint8_t* base = view->code_storage.empty() ? nullptr
+                                                     : view->code_storage.data();
+    RelocateResidentCodePointersToBase(parsed, base, view);
+}
+
 ClusterStoreReader::ResidentClusterView MakeCompactResidentView(
     query::ParsedCluster& parsed) {
     ClusterStoreReader::ResidentClusterView view;
@@ -338,6 +535,7 @@ ClusterStoreReader::ResidentClusterView MakeCompactResidentView(
     if (parsed.code_region_bytes > 0) {
         view.code_storage.assign(parsed.fastscan_blocks,
                                  parsed.fastscan_blocks + parsed.code_region_bytes);
+        MAdviseHugePageVector(view.code_storage);
     }
     view.code_storage_bytes = static_cast<uint64_t>(view.code_storage.size());
     RelocateResidentCodePointers(parsed, &view);
@@ -1123,12 +1321,117 @@ ClusterStoreReader::~ClusterStoreReader() {
     Close();
 }
 
+Status ClusterStoreReader::AllocateResidentMmapFileBuffer(uint64_t payload_size) {
+    ReleaseResidentMmapFileBuffer();
+    if (payload_size == 0) {
+        resident_mmap_data_bytes_ = 0;
+        return Status::OK();
+    }
+    static constexpr uint64_t kHugePageBytes = 2ull << 20;
+    const uint64_t mapping_bytes = payload_size + kHugePageBytes - 1u;
+    void* base = ::mmap(nullptr, static_cast<size_t>(mapping_bytes),
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        return Status::IOError("Failed to mmap resident .clu buffer");
+    }
+    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t aligned_addr = AlignUp(base_addr, kHugePageBytes);
+    resident_mmap_base_ = static_cast<uint8_t*>(base);
+    resident_mmap_mapping_bytes_ = mapping_bytes;
+    resident_mmap_data_ = reinterpret_cast<uint8_t*>(aligned_addr);
+    resident_mmap_data_bytes_ = payload_size;
+    return Status::OK();
+}
+
+Status ClusterStoreReader::AllocateResidentCodeSlabBuffer(uint64_t payload_size) {
+    ReleaseResidentCodeSlabBuffer();
+    if (payload_size == 0) {
+        resident_code_slab_data_bytes_ = 0;
+        return Status::OK();
+    }
+    static constexpr uint64_t kHugePageBytes = 2ull << 20;
+    const uint64_t mapping_bytes = payload_size + kHugePageBytes - 1u;
+    void* base = ::mmap(nullptr, static_cast<size_t>(mapping_bytes),
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED) {
+        return Status::IOError("Failed to mmap resident code slab buffer");
+    }
+    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t aligned_addr = AlignUp(base_addr, kHugePageBytes);
+    resident_code_slab_base_ = static_cast<uint8_t*>(base);
+    resident_code_slab_mapping_bytes_ = mapping_bytes;
+    resident_code_slab_data_ = reinterpret_cast<uint8_t*>(aligned_addr);
+    resident_code_slab_data_bytes_ = payload_size;
+    return Status::OK();
+}
+
+void ClusterStoreReader::ReleaseResidentMmapFileBuffer() {
+    if (resident_mmap_base_ != nullptr) {
+        (void)::munmap(resident_mmap_base_,
+                       static_cast<size_t>(resident_mmap_mapping_bytes_));
+    }
+    resident_mmap_base_ = nullptr;
+    resident_mmap_data_ = nullptr;
+    resident_mmap_mapping_bytes_ = 0;
+    resident_mmap_data_bytes_ = 0;
+}
+
+void ClusterStoreReader::ReleaseResidentCodeSlabBuffer() {
+    if (resident_code_slab_base_ != nullptr) {
+        (void)::munmap(resident_code_slab_base_,
+                       static_cast<size_t>(resident_code_slab_mapping_bytes_));
+    }
+    resident_code_slab_base_ = nullptr;
+    resident_code_slab_data_ = nullptr;
+    resident_code_slab_mapping_bytes_ = 0;
+    resident_code_slab_data_bytes_ = 0;
+}
+
+uint8_t* ClusterStoreReader::ResidentFileBufferData() {
+    if (resident_mmap_data_ != nullptr) {
+        return resident_mmap_data_;
+    }
+    return resident_file_buffer_.empty() ? nullptr : resident_file_buffer_.data();
+}
+
+const uint8_t* ClusterStoreReader::ResidentFileBufferData() const {
+    if (resident_mmap_data_ != nullptr) {
+        return resident_mmap_data_;
+    }
+    return resident_file_buffer_.empty() ? nullptr : resident_file_buffer_.data();
+}
+
+uint64_t ClusterStoreReader::ResidentFileBufferSize() const {
+    if (resident_mmap_data_ != nullptr) {
+        return resident_mmap_data_bytes_;
+    }
+    return static_cast<uint64_t>(resident_file_buffer_.size());
+}
+
+uint8_t* ClusterStoreReader::ResidentCodeSlabData() {
+    return resident_code_slab_data_;
+}
+
+const uint8_t* ClusterStoreReader::ResidentCodeSlabData() const {
+    return resident_code_slab_data_;
+}
+
 ClusterStoreReader::ClusterStoreReader(ClusterStoreReader&& other) noexcept
     : fd_(other.fd_),
       info_(std::move(other.info_)),
       cluster_index_(std::move(other.cluster_index_)),
       loaded_clusters_(std::move(other.loaded_clusters_)),
       resident_file_buffer_(std::move(other.resident_file_buffer_)),
+      resident_mmap_base_(other.resident_mmap_base_),
+      resident_mmap_data_(other.resident_mmap_data_),
+      resident_mmap_mapping_bytes_(other.resident_mmap_mapping_bytes_),
+      resident_mmap_data_bytes_(other.resident_mmap_data_bytes_),
+      resident_code_slab_base_(other.resident_code_slab_base_),
+      resident_code_slab_data_(other.resident_code_slab_data_),
+      resident_code_slab_mapping_bytes_(other.resident_code_slab_mapping_bytes_),
+      resident_code_slab_data_bytes_(other.resident_code_slab_data_bytes_),
       resident_clusters_(std::move(other.resident_clusters_)),
       resident_parsed_clusters_(std::move(other.resident_parsed_clusters_)),
       resident_preload_ready_(other.resident_preload_ready_),
@@ -1145,8 +1448,17 @@ ClusterStoreReader::ClusterStoreReader(ClusterStoreReader&& other) noexcept
       resident_preload_mode_(std::move(other.resident_preload_mode_)),
       resident_preload_time_ms_(other.resident_preload_time_ms_),
       resident_parallel_view_bytes_(other.resident_parallel_view_bytes_),
-      resident_parallel_view_build_ms_(other.resident_parallel_view_build_ms_) {
+      resident_parallel_view_build_ms_(other.resident_parallel_view_build_ms_),
+      resident_stage1_envelope_bytes_(other.resident_stage1_envelope_bytes_) {
     other.fd_ = -1;
+    other.resident_mmap_base_ = nullptr;
+    other.resident_mmap_data_ = nullptr;
+    other.resident_mmap_mapping_bytes_ = 0;
+    other.resident_mmap_data_bytes_ = 0;
+    other.resident_code_slab_base_ = nullptr;
+    other.resident_code_slab_data_ = nullptr;
+    other.resident_code_slab_mapping_bytes_ = 0;
+    other.resident_code_slab_data_bytes_ = 0;
     other.resident_preload_ready_ = false;
     other.resident_preload_bytes_ = 0;
     other.resident_cluster_mem_bytes_ = 0;
@@ -1161,6 +1473,7 @@ ClusterStoreReader::ClusterStoreReader(ClusterStoreReader&& other) noexcept
     other.resident_preload_time_ms_ = 0.0;
     other.resident_parallel_view_bytes_ = 0;
     other.resident_parallel_view_build_ms_ = 0.0;
+    other.resident_stage1_envelope_bytes_ = 0;
 }
 
 ClusterStoreReader& ClusterStoreReader::operator=(
@@ -1172,6 +1485,14 @@ ClusterStoreReader& ClusterStoreReader::operator=(
         cluster_index_ = std::move(other.cluster_index_);
         loaded_clusters_ = std::move(other.loaded_clusters_);
         resident_file_buffer_ = std::move(other.resident_file_buffer_);
+        resident_mmap_base_ = other.resident_mmap_base_;
+        resident_mmap_data_ = other.resident_mmap_data_;
+        resident_mmap_mapping_bytes_ = other.resident_mmap_mapping_bytes_;
+        resident_mmap_data_bytes_ = other.resident_mmap_data_bytes_;
+        resident_code_slab_base_ = other.resident_code_slab_base_;
+        resident_code_slab_data_ = other.resident_code_slab_data_;
+        resident_code_slab_mapping_bytes_ = other.resident_code_slab_mapping_bytes_;
+        resident_code_slab_data_bytes_ = other.resident_code_slab_data_bytes_;
         resident_clusters_ = std::move(other.resident_clusters_);
         resident_parsed_clusters_ = std::move(other.resident_parsed_clusters_);
         resident_preload_ready_ = other.resident_preload_ready_;
@@ -1189,7 +1510,16 @@ ClusterStoreReader& ClusterStoreReader::operator=(
         resident_preload_time_ms_ = other.resident_preload_time_ms_;
         resident_parallel_view_bytes_ = other.resident_parallel_view_bytes_;
         resident_parallel_view_build_ms_ = other.resident_parallel_view_build_ms_;
+        resident_stage1_envelope_bytes_ = other.resident_stage1_envelope_bytes_;
         other.fd_ = -1;
+        other.resident_mmap_base_ = nullptr;
+        other.resident_mmap_data_ = nullptr;
+        other.resident_mmap_mapping_bytes_ = 0;
+        other.resident_mmap_data_bytes_ = 0;
+        other.resident_code_slab_base_ = nullptr;
+        other.resident_code_slab_data_ = nullptr;
+        other.resident_code_slab_mapping_bytes_ = 0;
+        other.resident_code_slab_data_bytes_ = 0;
         other.resident_preload_ready_ = false;
         other.resident_preload_bytes_ = 0;
         other.resident_cluster_mem_bytes_ = 0;
@@ -1204,6 +1534,7 @@ ClusterStoreReader& ClusterStoreReader::operator=(
         other.resident_preload_time_ms_ = 0.0;
         other.resident_parallel_view_bytes_ = 0;
         other.resident_parallel_view_build_ms_ = 0.0;
+        other.resident_stage1_envelope_bytes_ = 0;
     }
     return *this;
 }
@@ -1217,6 +1548,8 @@ void ClusterStoreReader::Close() {
     resident_clusters_.clear();
     resident_parsed_clusters_.clear();
     resident_file_buffer_.clear();
+    ReleaseResidentMmapFileBuffer();
+    ReleaseResidentCodeSlabBuffer();
     resident_preload_ready_ = false;
     resident_preload_bytes_ = 0;
     resident_cluster_mem_bytes_ = 0;
@@ -1231,6 +1564,7 @@ void ClusterStoreReader::Close() {
     resident_preload_time_ms_ = 0.0;
     resident_parallel_view_bytes_ = 0;
     resident_parallel_view_build_ms_ = 0.0;
+    resident_stage1_envelope_bytes_ = 0;
     cluster_index_.clear();
     file_version_ = 0;
 }
@@ -1979,11 +2313,14 @@ Status ClusterStoreReader::PreloadAllClusters() {
         return Status::IOError("Failed to determine .clu file size");
     }
 
-    if (UseCompactResidentPreload()) {
-        std::map<uint32_t, ResidentClusterView> resident_clusters;
-        std::map<uint32_t, query::ParsedCluster> resident_parsed_clusters;
-        uint64_t resident_cluster_mem_bytes = 0;
+	    if (UseCompactResidentPreload()) {
+	        const bool use_code_slab = UseCompactCodeSlabResidentPreload();
+	        const bool precompute_stage1_envelope = UseStage1EnvelopePrecompute();
+	        std::map<uint32_t, ResidentClusterView> resident_clusters;
+	        std::map<uint32_t, query::ParsedCluster> resident_parsed_clusters;
+	        uint64_t resident_cluster_mem_bytes = 0;
         uint64_t resident_parallel_view_bytes = 0;
+        uint64_t resident_stage1_envelope_bytes = 0;
         uint64_t resident_code_storage_bytes = 0;
         uint64_t resident_decoded_address_bytes = 0;
         uint64_t resident_preload_bytes = 0;
@@ -1999,14 +2336,185 @@ Status ClusterStoreReader::PreloadAllClusters() {
             ordered.push_back(&entry);
         }
         std::sort(ordered.begin(), ordered.end(),
-                  [](const auto* a, const auto* b) {
-                      return a->block_offset < b->block_offset;
-                  });
+	                  [](const auto* a, const auto* b) {
+	                      return a->block_offset < b->block_offset;
+	                  });
 
         constexpr size_t kBatchSize = 16;
         constexpr uint64_t kMaxSpanWasteRatio = 4;
-        size_t i = 0;
-        while (i < ordered.size()) {
+        constexpr uint64_t kCodeSlabClusterAlign = 64;
+        std::map<uint32_t, uint64_t> code_slab_offsets;
+        uint64_t code_slab_bytes = 0;
+        auto read_code_region_bytes =
+            [&](const ClusterStoreWriter::ClusterLookupEntry& entry,
+                uint32_t* code_region_bytes,
+                uint64_t* io_bytes) -> Status {
+            if (entry.block_size < 8) {
+                return Status::Corruption("Block too small for trailer footer");
+            }
+            const uint64_t block_end = entry.block_offset + entry.block_size;
+            uint32_t mini_trailer_size = 0;
+            uint32_t block_magic = 0;
+            if (!PreadValue(fd_, static_cast<off_t>(block_end - 8),
+                            mini_trailer_size)) {
+                return Status::IOError("Failed to read mini_trailer_size");
+            }
+            if (!PreadValue(fd_, static_cast<off_t>(block_end - 4),
+                            block_magic)) {
+                return Status::IOError("Failed to read block_magic");
+            }
+            if (block_magic != kBlockMagic) {
+                return Status::Corruption("Invalid block magic");
+            }
+            if (mini_trailer_size > entry.block_size) {
+                return Status::Corruption("Mini-trailer size exceeds block");
+            }
+
+            const uint64_t trailer_start = block_end - mini_trailer_size;
+            std::vector<uint8_t> trailer_buf(mini_trailer_size);
+            if (!PreadBytes(fd_, static_cast<off_t>(trailer_start),
+                            trailer_buf.data(), mini_trailer_size)) {
+                return Status::IOError("Failed to read block mini-trailer");
+            }
+            if (io_bytes != nullptr) {
+                *io_bytes += 8ull + mini_trailer_size;
+            }
+
+            size_t tpos = 0;
+            auto ReadT = [&](auto& val) -> bool {
+                if (tpos + sizeof(val) > trailer_buf.size()) return false;
+                std::memcpy(&val, trailer_buf.data() + tpos, sizeof(val));
+                tpos += sizeof(val);
+                return true;
+            };
+
+            AddressColumnLayout address_layout;
+            uint32_t num_blocks = 0;
+            uint32_t v9_payload_offset = 0;
+            uint32_t v9_payload_bytes = 0;
+            uint64_t expected_payload_bytes = 0;
+
+            if (file_version_ >= kFileVersionV9) {
+                uint32_t address_format_version = 0;
+                uint32_t address_page_size = 0;
+                uint32_t address_entry_size = 0;
+                uint32_t num_entries = 0;
+                if (!ReadT(address_format_version) ||
+                    !ReadT(address_page_size) ||
+                    !ReadT(address_entry_size) ||
+                    !ReadT(num_entries) ||
+                    !ReadT(v9_payload_offset) ||
+                    !ReadT(v9_payload_bytes)) {
+                    return Status::Corruption(
+                        "Mini-trailer: failed to read V9 address metadata");
+                }
+                (void)address_page_size;
+                if (address_format_version != kAddressFormatV2) {
+                    return Status::Corruption("Unsupported V9 address format");
+                }
+                if (address_entry_size != sizeof(RawAddressEntryV2)) {
+                    return Status::Corruption(
+                        "Unexpected V9 raw address entry size");
+                }
+                if (num_entries != entry.num_records) {
+                    return Status::Corruption("V9 raw address entry count mismatch");
+                }
+                expected_payload_bytes = v9_payload_bytes;
+            } else {
+                if (!ReadT(address_layout.page_size) ||
+                    !ReadT(address_layout.bit_width) ||
+                    !ReadT(address_layout.block_granularity) ||
+                    !ReadT(address_layout.fixed_packed_size) ||
+                    !ReadT(address_layout.last_packed_size) ||
+                    !ReadT(address_layout.num_address_blocks)) {
+                    return Status::Corruption(
+                        "Mini-trailer: failed to read shared address layout");
+                }
+
+                num_blocks = address_layout.num_address_blocks;
+                if (entry.num_records == 0) {
+                    if (num_blocks != 0 || address_layout.last_packed_size != 0) {
+                        return Status::Corruption(
+                            "Empty cluster has invalid address layout");
+                    }
+                } else if (num_blocks == 0) {
+                    return Status::Corruption("Non-empty cluster has zero address blocks");
+                }
+                for (uint32_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+                    uint32_t base_offset = 0;
+                    if (!ReadT(base_offset)) {
+                        return Status::Corruption(
+                            "Mini-trailer: failed to parse address block");
+                    }
+                }
+                if (num_blocks > 0 && address_layout.block_granularity == 0) {
+                    return Status::Corruption("Invalid address block granularity");
+                }
+                if (num_blocks > 0) {
+                    expected_payload_bytes =
+                        static_cast<uint64_t>(num_blocks - 1) *
+                            address_layout.fixed_packed_size +
+                        address_layout.last_packed_size;
+                }
+            }
+
+            uint32_t stored_trailer_size = 0;
+            uint32_t stored_block_magic = 0;
+            if (!ReadT(stored_trailer_size) || !ReadT(stored_block_magic)) {
+                return Status::Corruption(
+                    "Mini-trailer: failed to read trailer footer");
+            }
+            if (stored_trailer_size != mini_trailer_size ||
+                stored_block_magic != kBlockMagic) {
+                return Status::Corruption("Mini-trailer footer mismatch");
+            }
+            if (tpos != trailer_buf.size()) {
+                return Status::Corruption("Mini-trailer has trailing bytes");
+            }
+
+            const uint32_t region1_size =
+                entry.num_fastscan_blocks * fastscan_block_bytes();
+            const uint32_t region2_size =
+                (file_version_ >= kFileVersionV11)
+                    ? (v9_payload_offset >= region1_size
+                           ? v9_payload_offset - region1_size
+                           : 0)
+                    : entry.num_records * exrabitq_entry_size();
+            const uint32_t codes_length = region1_size + region2_size;
+            if (codes_length > entry.block_size) {
+                return Status::Corruption(
+                    "Cluster block shorter than code regions");
+            }
+            const uint64_t payload_and_trailer = entry.block_size - codes_length;
+            if (payload_and_trailer < mini_trailer_size) {
+                return Status::Corruption("Cluster block shorter than trailer");
+            }
+            const uint64_t actual_payload_bytes =
+                payload_and_trailer - mini_trailer_size;
+            if (actual_payload_bytes != expected_payload_bytes) {
+                return Status::Corruption("Address payload size mismatch");
+            }
+            *code_region_bytes = codes_length;
+            return Status::OK();
+        };
+        if (use_code_slab) {
+            uint64_t trailer_prepass_bytes = 0;
+            for (const auto* entry : ordered) {
+                uint32_t code_region_bytes = 0;
+                VDB_RETURN_IF_ERROR(read_code_region_bytes(
+                    *entry, &code_region_bytes, &trailer_prepass_bytes));
+                code_slab_bytes = AlignUp64(code_slab_bytes, kCodeSlabClusterAlign);
+                code_slab_offsets[entry->cluster_id] = code_slab_bytes;
+                code_slab_bytes += code_region_bytes;
+            }
+            resident_preload_bytes += trailer_prepass_bytes;
+            VDB_RETURN_IF_ERROR(AllocateResidentCodeSlabBuffer(code_slab_bytes));
+        } else {
+            ReleaseResidentCodeSlabBuffer();
+        }
+
+	        size_t i = 0;
+	        while (i < ordered.size()) {
             size_t batch_end = i + 1;
             uint64_t span_begin = ordered[i]->block_offset;
             uint64_t span_end = ordered[i]->block_offset + ordered[i]->block_size;
@@ -2046,9 +2554,48 @@ Status ClusterStoreReader::PreloadAllClusters() {
                     batch_buffer.data() + static_cast<size_t>(relative);
                 VDB_RETURN_IF_ERROR(ParseClusterBlockView(
                     entry->cluster_id, block_ptr, entry->block_size, parsed));
-                ResidentClusterView view = MakeCompactResidentView(parsed);
-                auto pb0 = std::chrono::steady_clock::now();
-                BuildResidentParallelStage2View(parsed, &view);
+	                ResidentClusterView view;
+	                if (use_code_slab) {
+	                    CopyParsedMetadataToResident(parsed, &view);
+	                    const uint64_t slab_offset =
+	                        code_slab_offsets[entry->cluster_id];
+	                    uint8_t* slab_base = ResidentCodeSlabData();
+	                    if (parsed.code_region_bytes > 0) {
+	                        if (slab_base == nullptr ||
+	                            slab_offset + parsed.code_region_bytes >
+	                                code_slab_bytes) {
+	                            return Status::Corruption(
+	                                "Resident code slab offset exceeds allocation");
+	                        }
+	                        std::memcpy(slab_base + slab_offset,
+	                                    parsed.fastscan_blocks,
+	                                    parsed.code_region_bytes);
+	                    }
+	                    view.code_storage_bytes = parsed.code_region_bytes;
+	                    RelocateResidentCodePointersToBase(
+	                        parsed,
+	                        slab_base == nullptr ? nullptr : slab_base + slab_offset,
+	                        &view);
+	                    view.raw_addresses = nullptr;
+	                    view.addresses_are_raw_v2 = false;
+	                    view.raw_address_bytes = 0;
+	                    view.decoded_addresses = std::move(parsed.decoded_addresses);
+	                    view.decoded_address_bytes =
+	                        static_cast<uint64_t>(view.decoded_addresses.size()) *
+	                        sizeof(AddressEntry);
+	                } else {
+	                    view = MakeCompactResidentView(parsed);
+	                }
+	                uint64_t stage1_envelope_bytes = 0;
+	                if (precompute_stage1_envelope) {
+	                    BuildResidentStage1EnvelopeSummary(parsed, info_.dim, &view);
+	                    stage1_envelope_bytes = ResidentStage1EnvelopeBytes(view);
+	                    resident_stage1_envelope_bytes += stage1_envelope_bytes;
+	                }
+	                auto pb0 = std::chrono::steady_clock::now();
+	                BuildResidentParallelStage2View(parsed, &view);
+                MAdviseHugePageVector(view.exrabitq_parallel_abs_blocks_storage);
+                MAdviseHugePageVector(view.exrabitq_parallel_sign_words_storage);
                 parallel_build_ms += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - pb0).count();
                 const uint64_t parallel_bytes =
@@ -2064,63 +2611,95 @@ Status ClusterStoreReader::PreloadAllClusters() {
                 if (!inserted.second) {
                     return Status::Corruption("Duplicate resident cluster");
                 }
-                resident_cluster_mem_bytes += inserted.first->second.code_storage_bytes;
-                resident_cluster_mem_bytes +=
-                    inserted.first->second.decoded_address_bytes;
+	                if (!use_code_slab) {
+	                    resident_cluster_mem_bytes +=
+	                        inserted.first->second.code_storage_bytes;
+	                }
+	                resident_cluster_mem_bytes +=
+	                    inserted.first->second.decoded_address_bytes;
                 resident_cluster_mem_bytes += parallel_bytes;
+                resident_cluster_mem_bytes += stage1_envelope_bytes;
                 resident_parsed_clusters.emplace(
                     entry->cluster_id, inserted.first->second.ToParsedCluster());
             }
             i = batch_end;
         }
 
+        if (use_code_slab) {
+            MAdviseHugePageRange(ResidentCodeSlabData(),
+                                  static_cast<size_t>(code_slab_bytes));
+        }
+
         resident_file_buffer_.clear();
-        resident_file_buffer_.shrink_to_fit();
-        resident_clusters_ = std::move(resident_clusters);
+	        resident_file_buffer_.shrink_to_fit();
+	        ReleaseResidentMmapFileBuffer();
+	        resident_clusters_ = std::move(resident_clusters);
         resident_parsed_clusters_ = std::move(resident_parsed_clusters);
         resident_preload_ready_ = true;
         resident_preload_bytes_ = resident_preload_bytes;
         resident_cluster_mem_bytes_ = resident_cluster_mem_bytes;
         resident_file_size_bytes_ = static_cast<uint64_t>(file_size);
-        resident_file_buffer_bytes_ = 0;
-        resident_code_storage_bytes_ = resident_code_storage_bytes;
+	        resident_file_buffer_bytes_ = 0;
+	        resident_code_storage_bytes_ = resident_code_storage_bytes;
         resident_decoded_address_bytes_ = resident_decoded_address_bytes;
         resident_raw_address_bytes_ = 0;
         resident_parsed_address_duplicate_bytes_ = 0;
         resident_preload_batch_size_ = 16;
-        resident_preload_mode_ = "compact_batched";
+	        if (use_code_slab) {
+	            resident_cluster_mem_bytes_ += code_slab_bytes;
+	            resident_preload_mode_ = "compact_code_mmap_2mb";
+	        } else {
+	            resident_preload_mode_ = "compact_batched";
+	        }
         resident_preload_time_ms_ = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
         resident_parallel_view_bytes_ = resident_parallel_view_bytes;
         resident_parallel_view_build_ms_ = parallel_build_ms;
+        resident_stage1_envelope_bytes_ = resident_stage1_envelope_bytes;
         return Status::OK();
     }
 
-    resident_file_buffer_.resize(static_cast<size_t>(file_size));
-    if (file_size > 0 &&
-        !PreadBytes(fd_, 0, resident_file_buffer_.data(),
-                    resident_file_buffer_.size())) {
-        resident_file_buffer_.clear();
-        return Status::IOError("Failed to preload .clu file");
-    }
+    const bool use_aligned_mmap = UseAlignedMmapResidentFile();
+    ReleaseResidentCodeSlabBuffer();
+    if (use_aligned_mmap) {
+	        resident_file_buffer_.clear();
+	        resident_file_buffer_.shrink_to_fit();
+	        VDB_RETURN_IF_ERROR(
+	            AllocateResidentMmapFileBuffer(static_cast<uint64_t>(file_size)));
+	    } else {
+	        ReleaseResidentMmapFileBuffer();
+	        resident_file_buffer_.resize(static_cast<size_t>(file_size));
+	    }
+	    uint8_t* resident_file_data = ResidentFileBufferData();
+	    const uint64_t resident_file_size = ResidentFileBufferSize();
+	    if (file_size > 0 &&
+	        !PreadBytes(fd_, 0, resident_file_data,
+	                    static_cast<size_t>(resident_file_size))) {
+	        resident_file_buffer_.clear();
+	        ReleaseResidentMmapFileBuffer();
+	        return Status::IOError("Failed to preload .clu file");
+	    }
+	    MAdviseHugePageRange(resident_file_data, static_cast<size_t>(resident_file_size));
 
     std::map<uint32_t, ResidentClusterView> resident_clusters;
     std::map<uint32_t, query::ParsedCluster> resident_parsed_clusters;
     uint64_t resident_cluster_mem_bytes = 0;
     uint64_t resident_parallel_view_bytes = 0;
+    uint64_t resident_stage1_envelope_bytes = 0;
     uint64_t resident_decoded_address_bytes = 0;
     uint64_t resident_raw_address_bytes = 0;
+    const bool precompute_stage1_envelope = UseStage1EnvelopePrecompute();
     auto parallel_build_start = std::chrono::steady_clock::now();
     for (const auto& entry : info_.lookup_table) {
-        if (entry.block_offset + entry.block_size >
-            static_cast<uint64_t>(resident_file_buffer_.size())) {
-            resident_file_buffer_.clear();
-            return Status::Corruption("Cluster block exceeds resident .clu buffer");
-        }
+	        if (entry.block_offset + entry.block_size > resident_file_size) {
+	            resident_file_buffer_.clear();
+	            ReleaseResidentMmapFileBuffer();
+	            return Status::Corruption("Cluster block exceeds resident .clu buffer");
+	        }
 
-        query::ParsedCluster parsed;
-        const uint8_t* block_ptr =
-            resident_file_buffer_.data() + static_cast<size_t>(entry.block_offset);
+	        query::ParsedCluster parsed;
+	        const uint8_t* block_ptr =
+	            resident_file_data + static_cast<size_t>(entry.block_offset);
         VDB_RETURN_IF_ERROR(
             ParseClusterBlockView(entry.cluster_id, block_ptr, entry.block_size, parsed));
 
@@ -2159,7 +2738,15 @@ Status ClusterStoreReader::PreloadAllClusters() {
         view.decoded_address_bytes =
             static_cast<uint64_t>(view.decoded_addresses.size()) * sizeof(AddressEntry);
         view.raw_address_bytes = parsed.address_payload_bytes;
+        uint64_t stage1_envelope_bytes = 0;
+        if (precompute_stage1_envelope) {
+            BuildResidentStage1EnvelopeSummary(parsed, info_.dim, &view);
+            stage1_envelope_bytes = ResidentStage1EnvelopeBytes(view);
+            resident_stage1_envelope_bytes += stage1_envelope_bytes;
+        }
         BuildResidentParallelStage2View(parsed, &view);
+        MAdviseHugePageVector(view.exrabitq_parallel_abs_blocks_storage);
+        MAdviseHugePageVector(view.exrabitq_parallel_sign_words_storage);
         resident_parallel_view_bytes +=
             static_cast<uint64_t>(view.exrabitq_parallel_abs_blocks_storage.size());
         resident_parallel_view_bytes +=
@@ -2177,6 +2764,7 @@ Status ClusterStoreReader::PreloadAllClusters() {
         resident_cluster_mem_bytes +=
             static_cast<uint64_t>(inserted.first->second.exrabitq_parallel_sign_words_storage.size()) *
             sizeof(uint16_t);
+        resident_cluster_mem_bytes += stage1_envelope_bytes;
         resident_parsed_clusters.emplace(
             entry.cluster_id, inserted.first->second.ToParsedCluster());
     }
@@ -2184,22 +2772,23 @@ Status ClusterStoreReader::PreloadAllClusters() {
     resident_clusters_ = std::move(resident_clusters);
     resident_parsed_clusters_ = std::move(resident_parsed_clusters);
     resident_preload_ready_ = true;
-    resident_preload_bytes_ = static_cast<uint64_t>(resident_file_buffer_.size());
-    resident_cluster_mem_bytes_ =
-        resident_cluster_mem_bytes + static_cast<uint64_t>(resident_file_buffer_.size());
-    resident_file_size_bytes_ = static_cast<uint64_t>(file_size);
-    resident_file_buffer_bytes_ = static_cast<uint64_t>(resident_file_buffer_.size());
+	    resident_preload_bytes_ = resident_file_size;
+	    resident_cluster_mem_bytes_ =
+	        resident_cluster_mem_bytes + resident_file_size;
+	    resident_file_size_bytes_ = static_cast<uint64_t>(file_size);
+	    resident_file_buffer_bytes_ = resident_file_size;
     resident_code_storage_bytes_ = 0;
     resident_decoded_address_bytes_ = resident_decoded_address_bytes;
     resident_raw_address_bytes_ = resident_raw_address_bytes;
     resident_parsed_address_duplicate_bytes_ = 0;
     resident_preload_batch_size_ = 0;
-    resident_preload_mode_ = "full_file";
+	    resident_preload_mode_ = use_aligned_mmap ? "full_file_mmap_2mb" : "full_file";
     resident_preload_time_ms_ = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
     resident_parallel_view_bytes_ = resident_parallel_view_bytes;
     resident_parallel_view_build_ms_ = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - parallel_build_start).count();
+    resident_stage1_envelope_bytes_ = resident_stage1_envelope_bytes;
     return Status::OK();
 }
 

@@ -76,6 +76,14 @@ struct ParsedCluster {
     const uint8_t* fastscan_blocks = nullptr;  // Pointer to first block
     uint32_t fastscan_block_size = 0;          // Bytes per block (packed_codes + norms)
     uint32_t num_fastscan_blocks = 0;          // ceil(num_records / 32)
+    const uint16_t* stage1_envelope_presence_masks = nullptr;
+    const float* stage1_envelope_norm_min = nullptr;
+    const float* stage1_envelope_norm_max = nullptr;
+    uint32_t stage1_envelope_groups_per_block = 0;
+    uint32_t stage1_envelope_block_count = 0;
+    std::vector<uint16_t> stage1_envelope_presence_masks_storage;
+    std::vector<float> stage1_envelope_norm_min_storage;
+    std::vector<float> stage1_envelope_norm_max_storage;
 
     // --- Region 2: ExRaBitQ ---
     const uint8_t* exrabitq_entries = nullptr;  // Pointer to first entry (nullptr if bits=1)
@@ -141,6 +149,14 @@ struct ParsedCluster {
         const uint32_t packed_codes_size = fastscan_block_size - 32 * sizeof(float);
         const float* norms = reinterpret_cast<const float*>(block + packed_codes_size);
         return norms[vec_in_block];
+    }
+
+    bool has_stage1_envelope_summary() const {
+        return stage1_envelope_presence_masks != nullptr &&
+               stage1_envelope_norm_min != nullptr &&
+               stage1_envelope_norm_max != nullptr &&
+               stage1_envelope_groups_per_block > 0 &&
+               stage1_envelope_block_count >= num_fastscan_blocks;
     }
 
     ExRaBitQView exrabitq_view(uint32_t vec_idx, Dim dim) const {

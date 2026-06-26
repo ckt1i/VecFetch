@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <map>
@@ -88,6 +89,10 @@ class ClusterStoreReader {
         const uint8_t* fastscan_blocks = nullptr;
         uint32_t fastscan_block_size = 0;
         uint32_t num_fastscan_blocks = 0;
+        std::vector<uint16_t> stage1_envelope_presence_masks;
+        std::vector<float> stage1_envelope_norm_min;
+        std::vector<float> stage1_envelope_norm_max;
+        uint32_t stage1_envelope_groups_per_block = 0;
         const uint8_t* exrabitq_entries = nullptr;
         uint32_t exrabitq_entry_size = 0;
         uint32_t exrabitq_sign_bytes = 0;
@@ -130,6 +135,17 @@ class ClusterStoreReader {
             pc.fastscan_blocks = fastscan_blocks;
             pc.fastscan_block_size = fastscan_block_size;
             pc.num_fastscan_blocks = num_fastscan_blocks;
+            pc.stage1_envelope_presence_masks =
+                stage1_envelope_presence_masks.empty()
+                    ? nullptr
+                    : stage1_envelope_presence_masks.data();
+            pc.stage1_envelope_norm_min =
+                stage1_envelope_norm_min.empty() ? nullptr : stage1_envelope_norm_min.data();
+            pc.stage1_envelope_norm_max =
+                stage1_envelope_norm_max.empty() ? nullptr : stage1_envelope_norm_max.data();
+            pc.stage1_envelope_groups_per_block = stage1_envelope_groups_per_block;
+            pc.stage1_envelope_block_count =
+                static_cast<uint32_t>(stage1_envelope_norm_min.size());
             pc.exrabitq_entries = exrabitq_entries;
             pc.exrabitq_entry_size = exrabitq_entry_size;
             pc.exrabitq_sign_bytes = exrabitq_sign_bytes;
@@ -254,6 +270,9 @@ class ClusterStoreReader {
     const std::string& resident_preload_mode() const { return resident_preload_mode_; }
     uint64_t resident_parallel_view_bytes() const { return resident_parallel_view_bytes_; }
     double resident_parallel_view_build_ms() const { return resident_parallel_view_build_ms_; }
+    uint64_t resident_stage1_envelope_bytes() const {
+        return resident_stage1_envelope_bytes_;
+    }
     bool is_open() const { return fd_ >= 0; }
 
  private:
@@ -275,6 +294,14 @@ class ClusterStoreReader {
 
     std::map<uint32_t, ClusterData> loaded_clusters_;
     std::vector<uint8_t> resident_file_buffer_;
+    uint8_t* resident_mmap_base_ = nullptr;
+    uint8_t* resident_mmap_data_ = nullptr;
+    uint64_t resident_mmap_mapping_bytes_ = 0;
+    uint64_t resident_mmap_data_bytes_ = 0;
+    uint8_t* resident_code_slab_base_ = nullptr;
+    uint8_t* resident_code_slab_data_ = nullptr;
+    uint64_t resident_code_slab_mapping_bytes_ = 0;
+    uint64_t resident_code_slab_data_bytes_ = 0;
     std::map<uint32_t, ResidentClusterView> resident_clusters_;
     std::map<uint32_t, query::ParsedCluster> resident_parsed_clusters_;
     bool resident_preload_ready_ = false;
@@ -291,6 +318,17 @@ class ClusterStoreReader {
     double resident_preload_time_ms_ = 0.0;
     uint64_t resident_parallel_view_bytes_ = 0;
     double resident_parallel_view_build_ms_ = 0.0;
+    uint64_t resident_stage1_envelope_bytes_ = 0;
+
+    Status AllocateResidentMmapFileBuffer(uint64_t payload_size);
+    void ReleaseResidentMmapFileBuffer();
+    Status AllocateResidentCodeSlabBuffer(uint64_t payload_size);
+    void ReleaseResidentCodeSlabBuffer();
+    uint8_t* ResidentFileBufferData();
+    const uint8_t* ResidentFileBufferData() const;
+    uint64_t ResidentFileBufferSize() const;
+    uint8_t* ResidentCodeSlabData();
+    const uint8_t* ResidentCodeSlabData() const;
 
     uint32_t num_code_words() const { return (info_.dim + 63) / 64; }
     uint32_t fastscan_packed_size() const { return ((info_.dim + 7) / 8) * 32; }

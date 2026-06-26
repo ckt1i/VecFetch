@@ -188,6 +188,27 @@ static ProcRss ReadProcRss() {
     return out;
 }
 
+struct SmapsRollupStats {
+    int64_t anon_huge_pages_kib = 0;
+    int64_t file_pmd_mapped_kib = 0;
+};
+
+static SmapsRollupStats ReadSmapsRollupStats() {
+    std::ifstream f("/proc/self/smaps_rollup");
+    SmapsRollupStats out;
+    std::string key;
+    while (f >> key) {
+        if (key == "AnonHugePages:") {
+            f >> out.anon_huge_pages_kib;
+        } else if (key == "FilePmdMapped:") {
+            f >> out.file_pmd_mapped_kib;
+        }
+        std::string rest;
+        std::getline(f, rest);
+    }
+    return out;
+}
+
 struct NpyHeader {
     std::string descr;
     bool fortran_order = false;
@@ -471,20 +492,42 @@ struct QueryMetrics {
     uint64_t s2_safe_out = 0;
     uint64_t s2_uncertain = 0;
     uint64_t candidates_reranked = 0;
+    uint64_t budgeted_early_submitted_candidates = 0;
     uint64_t vec_only_reads = 0;
     uint64_t all_reads = 0;
     uint64_t payload_reads = 0;
+    uint64_t stage1_envelope_tested_blocks = 0;
+    uint64_t stage1_envelope_skipped_blocks = 0;
+    uint64_t stage1_envelope_safeout_lanes = 0;
     uint64_t stage2_decode_blocks = 0;
     uint64_t stage2_decode_input_bytes = 0;
     uint64_t stage2_decode_output_bytes = 0;
     double probe_ms = 0.0;
     double coarse_select_ms = 0.0;
+    double coarse_score_ms = 0.0;
+    double coarse_topn_ms = 0.0;
+    uint64_t coarse_routing_mode = 0;
+    uint64_t coarse_super_count = 0;
+    uint64_t coarse_super_probes = 0;
+    uint64_t coarse_child_candidates_scored = 0;
+    uint64_t coarse_candidate_budget = 0;
+    uint64_t coarse_exact_fallback = 0;
+    uint64_t coarse_exact_overlap = 0;
+    double coarse_hierarchy_build_ms = 0.0;
     double stage1_ms = 0.0;
+    double stage1_envelope_ms = 0.0;
     double stage2_ms = 0.0;
     double stage2_decode_ms = 0.0;
     double submit_ms = 0.0;
+    double submit_address_sort_ms = 0.0;
+    uint64_t submit_address_sorted_requests = 0;
     double rerank_compute_ms = 0.0;
     double fetch_missing_ms = 0.0;
+    double final_drain_ms = 0.0;
+    double execute_buffered_ms = 0.0;
+    double collector_finalize_ms = 0.0;
+    double assemble_results_ms = 0.0;
+    double search_unaccounted_ms = 0.0;
 };
 
 static void Accumulate(QueryMetrics& m, const SearchResults& results,
@@ -499,20 +542,43 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.s2_safe_out += st.s2_safe_out;
     m.s2_uncertain += st.s2_uncertain;
     m.candidates_reranked += st.reranked_candidates;
+    m.budgeted_early_submitted_candidates +=
+        st.budgeted_early_submitted_candidates;
     m.vec_only_reads += st.vec_only_read_requests;
     m.all_reads += st.all_read_requests;
     m.payload_reads += st.payload_read_requests;
+    m.stage1_envelope_tested_blocks += st.stage1_envelope_tested_blocks;
+    m.stage1_envelope_skipped_blocks += st.stage1_envelope_skipped_blocks;
+    m.stage1_envelope_safeout_lanes += st.stage1_envelope_safeout_lanes;
     m.stage2_decode_blocks += st.stage2_decode_blocks;
     m.stage2_decode_input_bytes += st.stage2_decode_input_bytes;
     m.stage2_decode_output_bytes += st.stage2_decode_output_bytes;
     m.probe_ms += st.probe_time_ms;
     m.coarse_select_ms += st.coarse_select_ms;
+    m.coarse_score_ms += st.coarse_score_ms;
+    m.coarse_topn_ms += st.coarse_topn_ms;
+    m.coarse_routing_mode += st.coarse_routing_mode;
+    m.coarse_super_count += st.coarse_super_count;
+    m.coarse_super_probes += st.coarse_super_probes;
+    m.coarse_child_candidates_scored += st.coarse_child_candidates_scored;
+    m.coarse_candidate_budget += st.coarse_candidate_budget;
+    m.coarse_exact_fallback += st.coarse_exact_fallback;
+    m.coarse_exact_overlap += st.coarse_exact_overlap;
+    m.coarse_hierarchy_build_ms += st.coarse_hierarchy_build_ms;
     m.stage1_ms += st.probe_stage1_ms;
+    m.stage1_envelope_ms += st.probe_stage1_envelope_ms;
     m.stage2_ms += st.probe_stage2_ms;
     m.stage2_decode_ms += st.probe_stage2_decode_ms;
     m.submit_ms += st.probe_submit_ms;
+    m.submit_address_sort_ms += st.probe_submit_address_sort_ms;
+    m.submit_address_sorted_requests += st.probe_submit_address_sorted_requests;
     m.rerank_compute_ms += st.rerank_compute_ms;
     m.fetch_missing_ms += st.fetch_missing_ms;
+    m.final_drain_ms += st.final_drain_ms;
+    m.execute_buffered_ms += st.execute_buffered_ms;
+    m.collector_finalize_ms += st.collector_finalize_ms;
+    m.assemble_results_ms += st.assemble_results_ms;
+    m.search_unaccounted_ms += st.search_unaccounted_ms;
 
     if (gt != nullptr) {
         std::vector<int64_t> predicted;
@@ -556,6 +622,11 @@ static int Usage() {
         "  --rabitq-validation-mode auto|official_1_plus_n|legacy_signed_magnitude\n"
         "  --non-safeout-candidate-budget N (default: 0)\n"
         "  --fixed-vec-buffer-count N  Fixed vector buffers (default: 0)\n"
+        "  --two-level-coarse-routing 0|1 Enable two-level coarse routing (default: 0)\n"
+        "  --two-level-coarse-budget-factor N Candidate budget = nprobe*N (default: 8)\n"
+        "  --vec-read-address-sort 0|1 Sort vec-only submit windows by data.dat offset (default: 0)\n"
+        "  --vec-read-address-sort-window N Sort chunk size, 0=whole window (default: 64)\n"
+        "  --budgeted-early-submit 0|1 Submit top budgeted candidates before final drain (default: 0)\n"
         "  --fine-grained-timing 0|1   Enable detailed stage timing (default: 0)\n"
         "  --hotpath-detailed-timing 0|1 (default: 0)\n"
         "  --direct-io                 Open index files with direct I/O\n");
@@ -683,6 +754,7 @@ int main(int argc, char** argv) {
     const double preload_wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_preload_start).count();
     const ProcRss rss_after_preload = ReadProcRss();
+    const SmapsRollupStats smaps_after_preload = ReadSmapsRollupStats();
 
     IoUringReader cluster_reader;
     auto init_status = cluster_reader.Init(
@@ -741,6 +813,18 @@ int main(int argc, char** argv) {
         std::max(0, GetIntArg(argc, argv, "--non-safeout-candidate-budget", 0)));
     cfg.fixed_vec_buffer_count = static_cast<uint32_t>(
         std::max(0, GetIntArg(argc, argv, "--fixed-vec-buffer-count", 0)));
+    cfg.enable_vec_read_address_sort =
+        GetIntArg(argc, argv, "--vec-read-address-sort", 0) != 0;
+    cfg.vec_read_address_sort_window = static_cast<uint32_t>(
+        std::max(0, GetIntArg(argc, argv, "--vec-read-address-sort-window", 64)));
+    cfg.enable_budgeted_early_submit =
+        GetIntArg(argc, argv, "--budgeted-early-submit", 0) != 0;
+    cfg.budgeted_early_submit_interval_clusters = static_cast<uint32_t>(
+        std::max(1, GetIntArg(argc, argv, "--budgeted-early-submit-interval-clusters", 32)));
+    cfg.budgeted_early_submit_count = static_cast<uint32_t>(
+        std::max(1, GetIntArg(argc, argv, "--budgeted-early-submit-count", 64)));
+    cfg.budgeted_early_submit_max = static_cast<uint32_t>(
+        std::max(1, GetIntArg(argc, argv, "--budgeted-early-submit-max", 128)));
     cfg.cluster_submit_reserve = static_cast<uint32_t>(
         std::max(1, GetIntArg(argc, argv, "--cluster-submit-reserve", 8)));
     cfg.submit_batch_size = static_cast<uint32_t>(
@@ -755,8 +839,22 @@ int main(int argc, char** argv) {
         GetIntArg(argc, argv, "--rerank-batched-distance-simd", 1) != 0;
     cfg.enable_coarse_select_simd =
         GetIntArg(argc, argv, "--coarse-select-simd", 1) != 0;
+    cfg.enable_two_level_coarse_routing =
+        GetIntArg(argc, argv, "--two-level-coarse-routing", 0) != 0;
+    cfg.two_level_coarse_threshold = static_cast<uint32_t>(
+        std::max(1, GetIntArg(argc, argv, "--two-level-coarse-threshold", 4096)));
+    cfg.two_level_coarse_super_count = static_cast<uint32_t>(
+        std::max(0, GetIntArg(argc, argv, "--two-level-coarse-super-count", 0)));
+    cfg.two_level_coarse_super_factor = static_cast<uint32_t>(
+        std::max(0, GetIntArg(argc, argv, "--two-level-coarse-super-factor", 0)));
+    cfg.two_level_coarse_budget_factor = static_cast<uint32_t>(
+        std::max(1, GetIntArg(argc, argv, "--two-level-coarse-budget-factor", 8)));
+    cfg.enable_two_level_coarse_exact_overlap =
+        GetIntArg(argc, argv, "--two-level-coarse-exact-overlap", 0) != 0;
     cfg.enable_stage1_safein =
         GetIntArg(argc, argv, "--enable-stage1-safein", 1) != 0;
+    cfg.enable_stage1_block_skip_envelope =
+        GetIntArg(argc, argv, "--stage1-block-skip-envelope", 0) != 0;
     cfg.enable_stage2_collect_block_first =
         GetIntArg(argc, argv, "--stage2-block-first", 1) != 0;
     cfg.enable_stage2_scatter_batch_classify =
@@ -767,6 +865,22 @@ int main(int argc, char** argv) {
         GetDoubleArg(argc, argv, "--safeout-epsilon-override", -1.0);
     cfg.safein_epsilon_override = static_cast<float>(safein_eps_override);
     cfg.safeout_epsilon_override = static_cast<float>(safeout_eps_override);
+
+    double two_level_coarse_warmup_ms = 0.0;
+    if (cfg.enable_two_level_coarse_routing) {
+        index.SetTwoLevelCoarseRouting(cfg.enable_two_level_coarse_routing,
+                                       cfg.two_level_coarse_threshold,
+                                       cfg.two_level_coarse_super_count,
+                                       cfg.two_level_coarse_super_factor,
+                                       cfg.two_level_coarse_budget_factor,
+                                       cfg.enable_two_level_coarse_exact_overlap);
+        const auto warmup_start = std::chrono::steady_clock::now();
+        const bool prepared = index.PrepareTwoLevelCoarseRouting(cfg.nprobe);
+        two_level_coarse_warmup_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - warmup_start).count();
+        Log("  two-level coarse warmup: %s (%.3f ms)\n",
+            prepared ? "prepared" : "skipped", two_level_coarse_warmup_ms);
+    }
 
     std::unique_ptr<OverlapScheduler> scheduler;
     if (data_reader) {
@@ -797,6 +911,7 @@ int main(int argc, char** argv) {
         }
     }
     const ProcRss rss_after_queries = ReadProcRss();
+    const SmapsRollupStats smaps_after_queries = ReadSmapsRollupStats();
     const double process_wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_process_start).count();
 
@@ -847,6 +962,32 @@ int main(int argc, char** argv) {
     f << "    " << JInt("query_dim", queries.cols) << ",\n";
     f << "    " << JInt("topk", topk) << ",\n";
     f << "    " << JInt("nprobe", nprobe) << ",\n";
+    f << "    " << JBool("enable_two_level_coarse_routing",
+                         cfg.enable_two_level_coarse_routing) << ",\n";
+    f << "    " << JInt("two_level_coarse_threshold",
+                        cfg.two_level_coarse_threshold) << ",\n";
+    f << "    " << JInt("two_level_coarse_super_count",
+                        cfg.two_level_coarse_super_count) << ",\n";
+    f << "    " << JInt("two_level_coarse_super_factor",
+                        cfg.two_level_coarse_super_factor) << ",\n";
+    f << "    " << JInt("two_level_coarse_budget_factor",
+                        cfg.two_level_coarse_budget_factor) << ",\n";
+    f << "    " << JBool("enable_two_level_coarse_exact_overlap",
+                         cfg.enable_two_level_coarse_exact_overlap) << ",\n";
+    f << "    " << JBool("enable_vec_read_address_sort",
+                         cfg.enable_vec_read_address_sort) << ",\n";
+    f << "    " << JInt("vec_read_address_sort_window",
+                        cfg.vec_read_address_sort_window) << ",\n";
+    f << "    " << JBool("enable_budgeted_early_submit",
+                         cfg.enable_budgeted_early_submit) << ",\n";
+    f << "    " << JInt("budgeted_early_submit_interval_clusters",
+                        cfg.budgeted_early_submit_interval_clusters) << ",\n";
+    f << "    " << JInt("budgeted_early_submit_count",
+                        cfg.budgeted_early_submit_count) << ",\n";
+    f << "    " << JInt("budgeted_early_submit_max",
+                        cfg.budgeted_early_submit_max) << ",\n";
+    f << "    " << JBool("enable_stage1_block_skip_envelope",
+                         cfg.enable_stage1_block_skip_envelope) << ",\n";
     f << "    " << JBool("recall_available", metrics.recall_available) << ",\n";
     f << "    " << JNum("recall_at_1", recall1) << ",\n";
     f << "    " << JNum("recall_at_5", recall5) << ",\n";
@@ -858,6 +999,7 @@ int main(int argc, char** argv) {
     f << "    " << JNum("p99_ms", p99) << ",\n";
     f << "    " << JNum("process_wall_ms", process_wall_ms) << ",\n";
     f << "    " << JNum("preload_wall_ms", preload_wall_ms) << ",\n";
+    f << "    " << JNum("two_level_coarse_warmup_ms", two_level_coarse_warmup_ms) << ",\n";
     f << "    " << JStr("resident_preload_mode", index.segment().resident_preload_mode()) << ",\n";
     f << "    " << JInt("resident_preload_batch_size", static_cast<int64_t>(index.segment().resident_preload_batch_size())) << ",\n";
     f << "    " << JInt("preload_bytes", static_cast<int64_t>(index.segment().resident_preload_bytes())) << ",\n";
@@ -869,6 +1011,11 @@ int main(int argc, char** argv) {
     f << "    " << JInt("resident_parsed_address_duplicate_bytes", static_cast<int64_t>(index.segment().resident_parsed_address_duplicate_bytes())) << ",\n";
     f << "    " << JInt("resident_cluster_mem_bytes", static_cast<int64_t>(index.segment().resident_cluster_mem_bytes())) << ",\n";
     f << "    " << JInt("resident_parallel_view_bytes", static_cast<int64_t>(index.segment().resident_parallel_view_bytes())) << ",\n";
+    f << "    " << JInt("resident_stage1_envelope_bytes", static_cast<int64_t>(index.segment().resident_stage1_envelope_bytes())) << ",\n";
+    f << "    " << JInt("smaps_after_preload_anon_huge_pages_kib", smaps_after_preload.anon_huge_pages_kib) << ",\n";
+    f << "    " << JInt("smaps_after_preload_file_pmd_mapped_kib", smaps_after_preload.file_pmd_mapped_kib) << ",\n";
+    f << "    " << JInt("smaps_anon_huge_pages_kib", smaps_after_queries.anon_huge_pages_kib) << ",\n";
+    f << "    " << JInt("smaps_file_pmd_mapped_kib", smaps_after_queries.file_pmd_mapped_kib) << ",\n";
     f << "    " << JInt("exrabitq_storage_version", clu_version) << ",\n";
     f << "    " << JStr("exrabitq_storage_format", ExRaBitQStorageFormatName(clu_version)) << ",\n";
     f << "    " << JBool("exrabitq_stage2_magnitude_packed", packed_stage2) << ",\n";
@@ -899,17 +1046,39 @@ int main(int argc, char** argv) {
     f << "    " << JNum("avg_s2_safe_out", metrics.s2_safe_out * inv_q) << ",\n";
     f << "    " << JNum("avg_s2_uncertain", metrics.s2_uncertain * inv_q) << ",\n";
     f << "    " << JNum("avg_candidates_reranked", metrics.candidates_reranked * inv_q) << ",\n";
+    f << "    " << JNum("avg_budgeted_early_submitted_candidates", metrics.budgeted_early_submitted_candidates * inv_q) << ",\n";
     f << "    " << JNum("avg_vec_only_read_requests", metrics.vec_only_reads * inv_q) << ",\n";
     f << "    " << JNum("avg_all_read_requests", metrics.all_reads * inv_q) << ",\n";
     f << "    " << JNum("avg_payload_read_requests", metrics.payload_reads * inv_q) << ",\n";
     f << "    " << JNum("avg_probe_ms", metrics.probe_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_coarse_select_ms", metrics.coarse_select_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_coarse_score_ms", metrics.coarse_score_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_coarse_topn_ms", metrics.coarse_topn_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_coarse_routing_mode", metrics.coarse_routing_mode * inv_q) << ",\n";
+    f << "    " << JNum("avg_coarse_super_count", metrics.coarse_super_count * inv_q) << ",\n";
+    f << "    " << JNum("avg_coarse_super_probes", metrics.coarse_super_probes * inv_q) << ",\n";
+    f << "    " << JNum("avg_coarse_child_candidates_scored", metrics.coarse_child_candidates_scored * inv_q) << ",\n";
+    f << "    " << JNum("avg_coarse_candidate_budget", metrics.coarse_candidate_budget * inv_q) << ",\n";
+    f << "    " << JNum("avg_coarse_exact_fallback", metrics.coarse_exact_fallback * inv_q) << ",\n";
+    f << "    " << JNum("avg_coarse_exact_overlap", metrics.coarse_exact_overlap * inv_q) << ",\n";
+    f << "    " << JNum("avg_coarse_hierarchy_build_ms", metrics.coarse_hierarchy_build_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_probe_stage1_ms", metrics.stage1_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_stage1_envelope_ms", metrics.stage1_envelope_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_probe_stage2_ms", metrics.stage2_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_probe_stage2_decode_ms", metrics.stage2_decode_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_probe_submit_ms", metrics.submit_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_submit_address_sort_ms", metrics.submit_address_sort_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_submit_address_sorted_requests", metrics.submit_address_sorted_requests * inv_q) << ",\n";
     f << "    " << JNum("avg_rerank_compute_ms", metrics.rerank_compute_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_fetch_missing_ms", metrics.fetch_missing_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_final_drain_ms", metrics.final_drain_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_execute_buffered_ms", metrics.execute_buffered_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_collector_finalize_ms", metrics.collector_finalize_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_assemble_results_ms", metrics.assemble_results_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_search_unaccounted_ms", metrics.search_unaccounted_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_stage1_envelope_tested_blocks", metrics.stage1_envelope_tested_blocks * inv_q) << ",\n";
+    f << "    " << JNum("avg_stage1_envelope_skipped_blocks", metrics.stage1_envelope_skipped_blocks * inv_q) << ",\n";
+    f << "    " << JNum("avg_stage1_envelope_safeout_lanes", metrics.stage1_envelope_safeout_lanes * inv_q) << ",\n";
     f << "    " << JNum("avg_stage2_decode_blocks", metrics.stage2_decode_blocks * inv_q) << ",\n";
     f << "    " << JNum("avg_stage2_decode_input_bytes", metrics.stage2_decode_input_bytes * inv_q) << ",\n";
     f << "    " << JNum("avg_stage2_decode_output_bytes", metrics.stage2_decode_output_bytes * inv_q) << "\n";

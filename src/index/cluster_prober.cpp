@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 #include "vdb/simd/fastscan.h"
 #include "vdb/simd/ip_exrabitq.h"
@@ -22,6 +23,27 @@ namespace index {
 namespace {
 
 constexpr uint32_t kStage2BatchSize = 8;
+
+#if defined(VDB_USE_AVX512)
+constexpr uint32_t kFastScanLutPerIter = 4;
+constexpr uint32_t kFastScanCodePerIter = 128;
+constexpr uint32_t kFastScanCodePerLane = 16;
+constexpr uint32_t kFastScanHiOffset = 64;
+#elif defined(VDB_USE_AVX2)
+constexpr uint32_t kFastScanLutPerIter = 2;
+constexpr uint32_t kFastScanCodePerIter = 64;
+constexpr uint32_t kFastScanCodePerLane = 16;
+constexpr uint32_t kFastScanHiOffset = 32;
+#else
+constexpr uint32_t kFastScanLutPerIter = 1;
+constexpr uint32_t kFastScanCodePerIter = 32;
+constexpr uint32_t kFastScanCodePerLane = 16;
+constexpr uint32_t kFastScanHiOffset = 16;
+#endif
+
+constexpr uint8_t kFastScanInvPerm[16] = {
+    0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15
+};
 
 bool DebugCompareCompactStage2Enabled() {
     static const bool enabled = [] {
@@ -45,6 +67,164 @@ VDB_FORCE_INLINE uint32_t CompactMaskToIndices(uint32_t mask, uint32_t* VDB_REST
     return n;
 }
 
+VDB_FORCE_INLINE const uint8_t* FastScanLutGroupBase(const uint8_t* lut,
+                                                     uint32_t group_idx) {
+    return lut + (group_idx / kFastScanLutPerIter) * kFastScanCodePerIter +
+           (group_idx % kFastScanLutPerIter) * kFastScanCodePerLane;
+}
+
+VDB_FORCE_INLINE uint16_t FastScanPresenceMaskFull(const uint8_t* group_bytes) {
+    uint16_t mask = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+        const uint8_t byte = group_bytes[i];
+        mask |= static_cast<uint16_t>(1u << (byte & 0x0Fu));
+        mask |= static_cast<uint16_t>(1u << ((byte >> 4) & 0x0Fu));
+    }
+    return mask;
+}
+
+VDB_FORCE_INLINE uint16_t FastScanPresenceMaskTail(const uint8_t* group_bytes,
+                                                   uint32_t count) {
+    uint16_t mask = 0;
+    for (uint32_t lane = 0; lane < count; ++lane) {
+        const bool high_half = lane >= 16u;
+        const uint32_t lane_in_half = high_half ? (lane - 16u) : lane;
+        const uint32_t perm_pos = kFastScanInvPerm[lane_in_half];
+        const uint8_t byte = group_bytes[perm_pos];
+        const uint8_t nibble =
+            high_half ? static_cast<uint8_t>((byte >> 4) & 0x0Fu)
+                      : static_cast<uint8_t>(byte & 0x0Fu);
+        mask |= static_cast<uint16_t>(1u << nibble);
+    }
+    return mask;
+}
+
+VDB_FORCE_INLINE uint16_t FastScanPresenceMaskForGroup(const uint8_t* packed_codes,
+                                                       uint32_t group_idx,
+                                                       uint32_t count) {
+    const uint8_t* pair = packed_codes + (group_idx / 2u) * 32u;
+    const uint8_t* group_bytes = pair + ((group_idx & 1u) ? 16u : 0u);
+    return count >= 32u ? FastScanPresenceMaskFull(group_bytes)
+                        : FastScanPresenceMaskTail(group_bytes, count);
+}
+
+VDB_FORCE_INLINE uint32_t FastScanLutValue(const uint8_t* lut, uint32_t group_idx,
+                                           uint32_t nibble) {
+    const uint8_t* base = FastScanLutGroupBase(lut, group_idx);
+    return static_cast<uint32_t>(base[nibble]) |
+           (static_cast<uint32_t>(base[kFastScanHiOffset + nibble]) << 8);
+}
+
+uint32_t FastScanRawAccumulatorUpperBound(const uint8_t* packed_codes,
+                                          const uint8_t* lut,
+                                          Dim dim,
+                                          uint32_t count) {
+    const uint32_t groups = dim >> 2;
+    uint32_t raw_upper = 0;
+    for (uint32_t group = 0; group < groups; ++group) {
+        const uint16_t present =
+            FastScanPresenceMaskForGroup(packed_codes, group, count);
+        uint32_t group_max = 0;
+        uint16_t mask = present;
+        while (mask) {
+            const uint32_t nibble = static_cast<uint32_t>(__builtin_ctz(mask));
+            group_max = std::max(group_max, FastScanLutValue(lut, group, nibble));
+            mask &= static_cast<uint16_t>(mask - 1u);
+        }
+        raw_upper += group_max;
+    }
+    return raw_upper;
+}
+
+uint32_t FastScanRawAccumulatorUpperBoundFromPresence(const uint16_t* presence_masks,
+                                                      const uint8_t* lut,
+                                                      Dim dim) {
+    const uint32_t groups = dim >> 2;
+    uint32_t raw_upper = 0;
+    for (uint32_t group = 0; group < groups; ++group) {
+        uint32_t group_max = 0;
+        uint16_t mask = presence_masks[group];
+        while (mask) {
+            const uint32_t nibble = static_cast<uint32_t>(__builtin_ctz(mask));
+            group_max = std::max(group_max, FastScanLutValue(lut, group, nibble));
+            mask &= static_cast<uint16_t>(mask - 1u);
+        }
+        raw_upper += group_max;
+    }
+    return raw_upper;
+}
+
+bool Stage1BlockEnvelopeSafeOutFromSummary(
+    const rabitq::PreparedClusterQueryView& view,
+    uint32_t raw_upper,
+    float norm_min,
+    float norm_max,
+    float safeout_frontier_upper,
+    Dim dim,
+    double* lower_bound_out = nullptr) {
+    if (view.prepared == nullptr || view.prepared->lut_aligned == nullptr ||
+        !std::isfinite(safeout_frontier_upper)) {
+        return false;
+    }
+    if (!std::isfinite(norm_min) || !std::isfinite(norm_max)) {
+        return false;
+    }
+
+    const rabitq::PreparedQuery& pq = *view.prepared;
+    const double ip_raw_upper =
+        (static_cast<double>(raw_upper) + static_cast<double>(pq.fs_shift)) *
+        static_cast<double>(pq.fs_width);
+    const double ip_upper =
+        (2.0 * ip_raw_upper - static_cast<double>(pq.sum_q)) /
+        std::sqrt(static_cast<double>(dim));
+
+    const double q_norm = static_cast<double>(pq.norm_qc);
+    const double q_norm_sq = static_cast<double>(pq.norm_qc_sq);
+    const double margin = static_cast<double>(view.safeout_margin_factor);
+    const double r_min = static_cast<double>(norm_min);
+    const double r_max = static_cast<double>(norm_max);
+    const double unconstrained_min = q_norm * ip_upper + 0.5 * margin;
+    const double r_star = std::min(std::max(unconstrained_min, r_min), r_max);
+    const double lower_bound =
+        r_star * r_star + q_norm_sq - 2.0 * r_star * q_norm * ip_upper -
+        margin * r_star;
+    if (lower_bound_out != nullptr) {
+        *lower_bound_out = lower_bound;
+    }
+    if (!std::isfinite(lower_bound)) {
+        return false;
+    }
+
+    const double guarded_lower =
+        std::nextafter(lower_bound, -std::numeric_limits<double>::infinity());
+    return guarded_lower > static_cast<double>(safeout_frontier_upper);
+}
+
+bool Stage1BlockEnvelopeSafeOut(const rabitq::PreparedClusterQueryView& view,
+                                const uint8_t* packed_codes,
+                                const float* block_norms,
+                                uint32_t count,
+                                float safeout_frontier_upper,
+                                Dim dim,
+                                double* lower_bound_out = nullptr) {
+    if (count == 0 || view.prepared == nullptr ||
+        view.prepared->lut_aligned == nullptr) {
+        return false;
+    }
+    float norm_min = block_norms[0];
+    float norm_max = block_norms[0];
+    for (uint32_t i = 1; i < count; ++i) {
+        norm_min = std::min(norm_min, block_norms[i]);
+        norm_max = std::max(norm_max, block_norms[i]);
+    }
+    const rabitq::PreparedQuery& pq = *view.prepared;
+    const uint32_t raw_upper = FastScanRawAccumulatorUpperBound(
+        packed_codes, pq.lut_aligned, dim, count);
+    return Stage1BlockEnvelopeSafeOutFromSummary(
+        view, raw_upper, norm_min, norm_max, safeout_frontier_upper, dim,
+        lower_bound_out);
+}
+
 } // namespace
 
 ClusterProber::ClusterProber(const ConANN& conann, Dim dim, uint8_t bits)
@@ -62,7 +242,8 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
                           const rabitq::PreparedClusterQueryView& view,
                           float safeout_frontier_upper, float safein_threshold_base,
                           bool enable_address_decode_simd, bool enable_fine_grained_timing,
-                          bool enable_stage1_safein, bool enable_stage2_collect_block_first,
+                          bool enable_stage1_safein, bool enable_stage1_block_skip_envelope,
+                          bool enable_stage2_collect_block_first,
                           bool enable_stage2_scatter_batch_classify,
                           const std::vector<std::vector<uint32_t>>* false_stats_cluster_members,
                           const std::unordered_set<uint32_t>* false_stats_true_topk_rows,
@@ -90,6 +271,66 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
         const uint8_t* block_ptr =
             pc.fastscan_blocks + static_cast<size_t>(b) * pc.fastscan_block_size;
         const float* block_norms = reinterpret_cast<const float*>(block_ptr + packed_sz);
+
+        if (enable_stage1_block_skip_envelope) {
+            ++stats.stage1_envelope_tested_blocks;
+            bool block_safeout = false;
+            const bool has_precomputed_envelope =
+                pc.has_stage1_envelope_summary() &&
+                pc.stage1_envelope_groups_per_block == (dim_ >> 2) &&
+                b < pc.stage1_envelope_block_count;
+            if (enable_fine_grained_timing) {
+                auto envelope_start = std::chrono::steady_clock::now();
+                if (has_precomputed_envelope) {
+                    const uint16_t* masks =
+                        pc.stage1_envelope_presence_masks +
+                        static_cast<size_t>(b) * pc.stage1_envelope_groups_per_block;
+                    const rabitq::PreparedQuery& pq = *view.prepared;
+                    const uint32_t raw_upper =
+                        FastScanRawAccumulatorUpperBoundFromPresence(
+                            masks, pq.lut_aligned, dim_);
+                    block_safeout = Stage1BlockEnvelopeSafeOutFromSummary(
+                        view, raw_upper, pc.stage1_envelope_norm_min[b],
+                        pc.stage1_envelope_norm_max[b], safeout_frontier_upper, dim_);
+                } else {
+                    block_safeout = Stage1BlockEnvelopeSafeOut(
+                        view, block_ptr, block_norms, count, safeout_frontier_upper, dim_);
+                }
+                stats.stage1_envelope_ms += std::chrono::duration<double, std::milli>(
+                                                 std::chrono::steady_clock::now() -
+                                                 envelope_start)
+                                                 .count();
+            } else {
+                if (has_precomputed_envelope) {
+                    const uint16_t* masks =
+                        pc.stage1_envelope_presence_masks +
+                        static_cast<size_t>(b) * pc.stage1_envelope_groups_per_block;
+                    const rabitq::PreparedQuery& pq = *view.prepared;
+                    const uint32_t raw_upper =
+                        FastScanRawAccumulatorUpperBoundFromPresence(
+                            masks, pq.lut_aligned, dim_);
+                    block_safeout = Stage1BlockEnvelopeSafeOutFromSummary(
+                        view, raw_upper, pc.stage1_envelope_norm_min[b],
+                        pc.stage1_envelope_norm_max[b], safeout_frontier_upper, dim_);
+                } else {
+                    block_safeout = Stage1BlockEnvelopeSafeOut(
+                        view, block_ptr, block_norms, count, safeout_frontier_upper, dim_);
+                }
+            }
+            if (block_safeout) {
+                ++stats.stage1_envelope_skipped_blocks;
+                stats.stage1_envelope_safeout_lanes += count;
+                stats.s1_safeout += count;
+                if (collect_false_stats) {
+                    for (uint32_t lane = 0; lane < count; ++lane) {
+                        if (is_true_topk(base_idx + lane)) {
+                            ++stats.s1_false_safeout;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
 
         // Stage 1a/1b: fused batch-32 FastScan distance estimation and masks.
         alignas(64) float dists[32];
@@ -794,7 +1035,8 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
 
     if (enable_fine_grained_timing) {
         stats.stage1_ms = stats.stage1_estimate_ms + stats.stage1_mask_ms +
-                          stats.stage1_iterate_ms + stats.stage1_classify_ms;
+                          stats.stage1_iterate_ms + stats.stage1_classify_ms +
+                          stats.stage1_envelope_ms;
     }
 }
 

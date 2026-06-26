@@ -124,6 +124,9 @@ OverlapScheduler::OverlapScheduler(index::IvfIndex& index,
     }
     if (config_.non_safeout_candidate_budget > 0) {
         budgeted_read_plan_heap_.reserve(config_.non_safeout_candidate_budget);
+        pending_vec_only_plans_.reserve(config_.non_safeout_candidate_budget);
+        pending_slots_.reserve(config_.non_safeout_candidate_budget);
+        emitted_budgeted_offsets_.reserve(config_.budgeted_early_submit_max);
     }
     // Stage 2: precompute margin divisor from effective total bits.
     uint8_t bits = index.segment().rabitq_config().active_code_bits();
@@ -420,10 +423,6 @@ void OverlapScheduler::MaterializeBudgetedReadPlans(SearchContext& ctx) {
     }
     std::sort_heap(budgeted_read_plan_heap_.begin(),
                    budgeted_read_plan_heap_.end());
-    std::sort(budgeted_read_plan_heap_.begin(), budgeted_read_plan_heap_.end(),
-              [](const BudgetedReadPlan& a, const BudgetedReadPlan& b) {
-                  return a.rank_key < b.rank_key;
-              });
 
     auto& stats = ctx.stats();
     stats.candidate_budget_selected =
@@ -435,6 +434,9 @@ void OverlapScheduler::MaterializeBudgetedReadPlans(SearchContext& ctx) {
 
     for (const auto& entry : budgeted_read_plan_heap_) {
         const ReadPlanEntry& plan = entry.plan;
+        if (BudgetedPlanAlreadyEmitted(plan.addr.offset)) {
+            continue;
+        }
         if (plan.type == PendingIO::Type::VEC_ALL) {
             pending_all_plans_.push_back(plan);
             RecordSafeInPrefetchDecision(ctx, plan.has_truth,
@@ -446,6 +448,68 @@ void OverlapScheduler::MaterializeBudgetedReadPlans(SearchContext& ctx) {
         stats.unique_fetch_candidates++;
     }
     budgeted_read_plan_heap_.clear();
+}
+
+bool OverlapScheduler::BudgetedPlanAlreadyEmitted(uint64_t offset) const {
+    return std::find(emitted_budgeted_offsets_.begin(),
+                     emitted_budgeted_offsets_.end(),
+                     offset) != emitted_budgeted_offsets_.end();
+}
+
+void OverlapScheduler::MarkBudgetedPlanEmitted(uint64_t offset) {
+    if (!BudgetedPlanAlreadyEmitted(offset)) {
+        emitted_budgeted_offsets_.push_back(offset);
+    }
+}
+
+void OverlapScheduler::EmitTopBudgetedReadPlans(SearchContext& ctx,
+                                                uint32_t max_count) {
+    if (!config_.enable_budgeted_early_submit ||
+        !UseNonSafeOutCandidateBudget() ||
+        budgeted_read_plan_heap_.empty() ||
+        max_count == 0 ||
+        budgeted_early_submitted_count_ >= config_.budgeted_early_submit_max) {
+        return;
+    }
+    const uint32_t remaining_cap =
+        config_.budgeted_early_submit_max - budgeted_early_submitted_count_;
+    max_count = std::min(max_count, remaining_cap);
+    if (max_count == 0) return;
+
+    std::vector<const BudgetedReadPlan*> ranked;
+    ranked.reserve(budgeted_read_plan_heap_.size());
+    for (const auto& entry : budgeted_read_plan_heap_) {
+        if (!BudgetedPlanAlreadyEmitted(entry.plan.addr.offset)) {
+            ranked.push_back(&entry);
+        }
+    }
+    if (ranked.empty()) return;
+    std::sort(ranked.begin(), ranked.end(),
+              [](const BudgetedReadPlan* a, const BudgetedReadPlan* b) {
+                  return a->rank_key < b->rank_key;
+              });
+
+    uint32_t emitted = 0;
+    for (const BudgetedReadPlan* entry : ranked) {
+        if (emitted >= max_count) break;
+        const ReadPlanEntry& plan = entry->plan;
+        if (BudgetedPlanAlreadyEmitted(plan.addr.offset)) {
+            continue;
+        }
+        if (plan.type == PendingIO::Type::VEC_ALL) {
+            pending_all_plans_.push_back(plan);
+            RecordSafeInPrefetchDecision(ctx, plan.has_truth,
+                                         plan.is_true_topk);
+        } else {
+            pending_vec_only_plans_.push_back(VecOnlyReadPlan{plan.addr});
+        }
+        MarkBudgetedPlanEmitted(plan.addr.offset);
+        ctx.stats().total_submit_window_requests++;
+        ctx.stats().unique_fetch_candidates++;
+        ctx.stats().budgeted_early_submitted_candidates++;
+        ++budgeted_early_submitted_count_;
+        ++emitted;
+    }
 }
 
 void OverlapScheduler::FlushDeferredSafeInPlans(SearchContext& ctx,
@@ -503,6 +567,8 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     pending_vec_only_plans_.clear();
     deferred_safein_plans_.clear();
     budgeted_read_plan_heap_.clear();
+    emitted_budgeted_offsets_.clear();
+    budgeted_early_submitted_count_ = 0;
     pending_vec_only_head_ = 0;
     safeout_frontier_heap_.clear();
     safein_frontier_heap_.clear();
@@ -567,28 +633,54 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     ctx.stats().coarse_exact_overlap = index_.last_coarse_exact_overlap();
     ctx.stats().coarse_hierarchy_build_ms =
         index_.last_coarse_hierarchy_build_ms();
-    ctx.stats().coarse_select_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - coarse_start).count();
+	    ctx.stats().coarse_select_ms = std::chrono::duration<double, std::milli>(
+	        std::chrono::steady_clock::now() - coarse_start).count();
 
-    ProbeResidentClusters(ctx, reranker, sorted_clusters);
-    FinalDrain(ctx, reranker);
-    reranker.ExecuteBuffered();
+	    ProbeResidentClusters(ctx, reranker, sorted_clusters);
+	    {
+	        auto t0 = std::chrono::steady_clock::now();
+	        FinalDrain(ctx, reranker);
+	        ctx.stats().final_drain_ms = std::chrono::duration<double, std::milli>(
+	            std::chrono::steady_clock::now() - t0).count();
+	    }
+	    {
+	        auto t0 = std::chrono::steady_clock::now();
+	        reranker.ExecuteBuffered();
+	        ctx.stats().execute_buffered_ms = std::chrono::duration<double, std::milli>(
+	            std::chrono::steady_clock::now() - t0).count();
+	    }
 
-    auto results = ctx.collector().Finalize();
+	    std::vector<CollectorEntry> results;
+	    {
+	        auto t0 = std::chrono::steady_clock::now();
+	        results = ctx.collector().Finalize();
+	        ctx.stats().collector_finalize_ms =
+	            std::chrono::duration<double, std::milli>(
+	                std::chrono::steady_clock::now() - t0).count();
+	    }
 
-    {
-        auto tf0 = std::chrono::steady_clock::now();
+	    {
+	        auto tf0 = std::chrono::steady_clock::now();
         FetchMissingPayloads(ctx, reranker, results);
         ctx.stats().fetch_missing_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - tf0).count();
-        ctx.stats().remaining_payload_fetch_ms = ctx.stats().fetch_missing_ms;
-    }
-    auto sr = AssembleResults(reranker, results);
-    sr.stats() = ctx.stats();
-    sr.stats().total_time_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - t_search_start).count();
-    return sr;
-}
+	        ctx.stats().remaining_payload_fetch_ms = ctx.stats().fetch_missing_ms;
+	    }
+	    auto ta0 = std::chrono::steady_clock::now();
+	    auto sr = AssembleResults(reranker, results);
+	    ctx.stats().assemble_results_ms = std::chrono::duration<double, std::milli>(
+	        std::chrono::steady_clock::now() - ta0).count();
+	    sr.stats() = ctx.stats();
+	    const double total_ms = std::chrono::duration<double, std::milli>(
+	        std::chrono::steady_clock::now() - t_search_start).count();
+	    sr.stats().total_time_ms = total_ms;
+	    sr.stats().search_unaccounted_ms = total_ms -
+	        (sr.stats().coarse_select_ms + sr.stats().probe_time_ms +
+	         sr.stats().final_drain_ms + sr.stats().execute_buffered_ms +
+	         sr.stats().collector_finalize_ms + sr.stats().fetch_missing_ms +
+	         sr.stats().assemble_results_ms);
+	    return sr;
+	}
 
 uint32_t OverlapScheduler::PendingDataRequestCount() const {
     return static_cast<uint32_t>(
@@ -725,11 +817,46 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
                 std::chrono::steady_clock::now() - emit_start).count();
     };
 
+    auto sort_vec_only_window = [&](uint32_t count) {
+        if (!config_.enable_vec_read_address_sort || count <= 1) return;
+        const size_t begin = pending_vec_only_head_;
+        const size_t end = std::min(
+            pending_vec_only_plans_.size(), begin + static_cast<size_t>(count));
+        if (end <= begin + 1) return;
+        auto sort_start = std::chrono::steady_clock::now();
+        const uint32_t window = config_.vec_read_address_sort_window;
+        auto by_offset = [](const VecOnlyReadPlan& a, const VecOnlyReadPlan& b) {
+            return a.addr.offset < b.addr.offset;
+        };
+        if (window == 0 || static_cast<size_t>(window) >= end - begin) {
+            std::sort(pending_vec_only_plans_.begin() + static_cast<std::ptrdiff_t>(begin),
+                      pending_vec_only_plans_.begin() + static_cast<std::ptrdiff_t>(end),
+                      by_offset);
+        } else {
+            for (size_t chunk_begin = begin; chunk_begin < end; chunk_begin += window) {
+                const size_t chunk_end =
+                    std::min(end, chunk_begin + static_cast<size_t>(window));
+                std::sort(
+                    pending_vec_only_plans_.begin() +
+                        static_cast<std::ptrdiff_t>(chunk_begin),
+                    pending_vec_only_plans_.begin() +
+                        static_cast<std::ptrdiff_t>(chunk_end),
+                    by_offset);
+            }
+        }
+        ctx.stats().probe_submit_address_sort_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - sort_start).count();
+        ctx.stats().probe_submit_address_sorted_requests +=
+            static_cast<uint32_t>(end - begin);
+    };
+
     const uint32_t all_take =
         std::min<uint32_t>(remaining, static_cast<uint32_t>(pending_all_plans_.size()));
     auto emit_start = std::chrono::steady_clock::now();
     emit_all(all_take);
     remaining -= all_take;
+    sort_vec_only_window(remaining);
     emit_vec_only(remaining);
     const double emit_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - emit_start).count();
@@ -751,6 +878,7 @@ void OverlapScheduler::ProbeResidentClusters(
             ? std::numeric_limits<uint32_t>::max()
             : config_.submit_batch_size;
     uint32_t clusters_since_submit = 0;
+    uint32_t clusters_since_budgeted_early_submit = 0;
 
     auto record_submit = [&](AsyncReader& reader) {
         auto ts0 = std::chrono::steady_clock::now();
@@ -794,6 +922,16 @@ void OverlapScheduler::ProbeResidentClusters(
         ProbeCluster(*cluster, cid, ctx, reranker);
         (void)tp0;
         ++clusters_since_submit;
+        ++clusters_since_budgeted_early_submit;
+
+        if (config_.enable_budgeted_early_submit &&
+            UseNonSafeOutCandidateBudget() &&
+            budgeted_read_plan_heap_.size() >= config_.non_safeout_candidate_budget &&
+            clusters_since_budgeted_early_submit >=
+                config_.budgeted_early_submit_interval_clusters) {
+            EmitTopBudgetedReadPlans(ctx, config_.budgeted_early_submit_count);
+            clusters_since_budgeted_early_submit = 0;
+        }
 
         if (isolated_submission_mode_) {
             const bool vec_batch_ready =
@@ -1429,6 +1567,7 @@ void OverlapScheduler::ProbeCluster(
                   config_.enable_address_decode_simd,
                   config_.enable_fine_grained_timing,
                   config_.enable_stage1_safein,
+                  config_.enable_stage1_block_skip_envelope,
                   config_.enable_stage2_collect_block_first,
                   config_.enable_stage2_scatter_batch_classify,
                   config_.false_stats_cluster_members,
@@ -1442,6 +1581,7 @@ void OverlapScheduler::ProbeCluster(
         ctx.stats().probe_stage1_mask_ms += local_stats.stage1_mask_ms;
         ctx.stats().probe_stage1_iterate_ms += local_stats.stage1_iterate_ms;
         ctx.stats().probe_stage1_classify_only_ms += local_stats.stage1_classify_ms;
+        ctx.stats().probe_stage1_envelope_ms += local_stats.stage1_envelope_ms;
         ctx.stats().probe_stage2_ms += local_stats.stage2_ms;
         ctx.stats().probe_stage2_collect_ms += local_stats.stage2_collect_ms;
         ctx.stats().probe_stage2_kernel_ms += local_stats.stage2_kernel_ms;
@@ -1467,6 +1607,12 @@ void OverlapScheduler::ProbeCluster(
     ctx.stats().stage1_fused_blocks += local_stats.stage1_fused_blocks;
     ctx.stats().stage1_fused_safeout_lanes += local_stats.stage1_fused_safeout_lanes;
     ctx.stats().stage1_fused_safein_lanes += local_stats.stage1_fused_safein_lanes;
+    ctx.stats().stage1_envelope_tested_blocks +=
+        local_stats.stage1_envelope_tested_blocks;
+    ctx.stats().stage1_envelope_skipped_blocks +=
+        local_stats.stage1_envelope_skipped_blocks;
+    ctx.stats().stage1_envelope_safeout_lanes +=
+        local_stats.stage1_envelope_safeout_lanes;
     ctx.stats().stage2_masked_kernel_calls += local_stats.stage2_masked_kernel_calls;
     ctx.stats().stage2_lanes_requested += local_stats.stage2_lanes_requested;
     ctx.stats().stage2_lanes_skipped += local_stats.stage2_lanes_skipped;

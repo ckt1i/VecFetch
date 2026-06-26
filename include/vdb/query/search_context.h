@@ -60,6 +60,12 @@ struct SearchConfig {
     uint32_t submit_batch_min = 16;
     uint32_t submit_batch_max = 48;
     uint32_t fixed_vec_buffer_count = 0;
+    bool enable_vec_read_address_sort = false;
+    uint32_t vec_read_address_sort_window = 64;
+    bool enable_budgeted_early_submit = false;
+    uint32_t budgeted_early_submit_interval_clusters = 32;
+    uint32_t budgeted_early_submit_count = 64;
+    uint32_t budgeted_early_submit_max = 128;
 
     bool enable_address_decode_simd = true;
     bool enable_rerank_batched_distance_simd = true;
@@ -72,6 +78,7 @@ struct SearchConfig {
     uint32_t two_level_coarse_budget_factor = 8;
     bool enable_two_level_coarse_exact_overlap = false;
     bool enable_stage1_safein = true;
+    bool enable_stage1_block_skip_envelope = false;
     bool enable_stage2_collect_block_first = true;
     bool enable_stage2_scatter_batch_classify = true;
     float safein_epsilon_override = -1.0f;
@@ -140,6 +147,7 @@ struct SearchStats {
     uint32_t candidate_budget_seen = 0;
     uint32_t candidate_budget_selected = 0;
     uint32_t candidate_budget_dropped = 0;
+    uint32_t budgeted_early_submitted_candidates = 0;
     double coarse_select_ms = 0;
     double coarse_score_ms = 0;
     double coarse_topn_ms = 0;
@@ -164,6 +172,7 @@ struct SearchStats {
     double probe_stage1_mask_ms = 0;
     double probe_stage1_iterate_ms = 0;
     double probe_stage1_classify_only_ms = 0;
+    double probe_stage1_envelope_ms = 0;
     double probe_stage2_ms = 0;
     double probe_stage2_collect_ms = 0;
     double probe_stage2_kernel_ms = 0;
@@ -176,6 +185,9 @@ struct SearchStats {
     uint32_t stage1_fused_blocks = 0;
     uint32_t stage1_fused_safeout_lanes = 0;
     uint32_t stage1_fused_safein_lanes = 0;
+    uint32_t stage1_envelope_tested_blocks = 0;
+    uint32_t stage1_envelope_skipped_blocks = 0;
+    uint32_t stage1_envelope_safeout_lanes = 0;
     uint64_t stage2_masked_kernel_calls = 0;
     uint64_t stage2_lanes_requested = 0;
     uint64_t stage2_lanes_skipped = 0;
@@ -191,6 +203,8 @@ struct SearchStats {
     double probe_submit_vec_only_emit_ms = 0;
     double probe_submit_pending_slot_alloc_ms = 0;
     double probe_submit_prep_read_ms = 0;
+    double probe_submit_address_sort_ms = 0;
+    uint32_t probe_submit_address_sorted_requests = 0;
     double rerank_time_ms = 0;
     double rerank_cpu_ms = 0;
     double total_time_ms = 0;
@@ -210,10 +224,15 @@ struct SearchStats {
     double safein_payload_prefetch_ms = 0;  // Reserved field: disabled in low-overhead benchmark path
     double candidate_collect_ms = 0;        // Organize buffered candidates before batch rerank
     double pool_vector_read_ms = 0;         // Batch read/visit of prefetched vectors from memory pool
-    double rerank_compute_ms = 0;           // Batch L2/top-k compute
-    double rerank_vec_alloc_ms = 0;         // Vector slab growth / allocation
-    double rerank_vec_copy_ms = 0;          // Copy vector bytes into rerank storage
-    double remaining_payload_fetch_ms = 0;  // Final missing payload fetch
+	    double rerank_compute_ms = 0;           // Batch L2/top-k compute
+	    double rerank_vec_alloc_ms = 0;         // Vector slab growth / allocation
+	    double rerank_vec_copy_ms = 0;          // Copy vector bytes into rerank storage
+	    double final_drain_ms = 0;              // Final submit/drain after probing clusters
+	    double execute_buffered_ms = 0;         // Buffered rerank execution wall time
+	    double collector_finalize_ms = 0;       // Top-k collector final sort/extract
+	    double assemble_results_ms = 0;         // Materialize SearchResults rows
+	    double search_unaccounted_ms = 0;       // Search total minus coarse/probe/tail fields
+	    double remaining_payload_fetch_ms = 0;  // Final missing payload fetch
     double safeout_frontier_buffer_ms = 0;  // Time spent buffering dynamic SafeOut estimates
     double safeout_frontier_merge_ms = 0;   // Time spent updating kth upper-bound frontier
 };

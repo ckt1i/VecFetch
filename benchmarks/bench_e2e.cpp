@@ -589,6 +589,27 @@ static const char* ExRaBitQStorageFormatName(uint32_t clu_file_version) {
     return "legacy_byte_sign";
 }
 
+struct SmapsRollupStats {
+    int64_t anon_huge_pages_kib = 0;
+    int64_t file_pmd_mapped_kib = 0;
+};
+
+static SmapsRollupStats ReadSmapsRollupStats() {
+    SmapsRollupStats stats;
+    std::ifstream f("/proc/self/smaps_rollup");
+    std::string key;
+    int64_t value = 0;
+    std::string unit;
+    while (f >> key >> value >> unit) {
+        if (key == "AnonHugePages:") {
+            stats.anon_huge_pages_kib = value;
+        } else if (key == "FilePmdMapped:") {
+            stats.file_pmd_mapped_kib = value;
+        }
+    }
+    return stats;
+}
+
 // ============================================================================
 // JSONL field parsing (no JSON library)
 // ============================================================================
@@ -752,6 +773,7 @@ struct QueryResult {
     double probe_stage1_mask_ms = 0;
     double probe_stage1_iterate_ms = 0;
     double probe_stage1_classify_only_ms = 0;
+    double probe_stage1_envelope_ms = 0;
     double probe_stage2_ms = 0;
     double probe_stage2_collect_ms = 0;
     double probe_stage2_kernel_ms = 0;
@@ -764,6 +786,9 @@ struct QueryResult {
     uint32_t stage1_fused_blocks = 0;
     uint32_t stage1_fused_safeout_lanes = 0;
     uint32_t stage1_fused_safein_lanes = 0;
+    uint32_t stage1_envelope_tested_blocks = 0;
+    uint32_t stage1_envelope_skipped_blocks = 0;
+    uint32_t stage1_envelope_safeout_lanes = 0;
     uint64_t stage2_masked_kernel_calls = 0;
     uint64_t stage2_lanes_requested = 0;
     uint64_t stage2_lanes_skipped = 0;
@@ -779,6 +804,8 @@ struct QueryResult {
     double probe_submit_vec_only_emit_ms = 0;
     double probe_submit_pending_slot_alloc_ms = 0;
     double probe_submit_prep_read_ms = 0;
+    double probe_submit_address_sort_ms = 0;
+    uint32_t probe_submit_address_sorted_requests = 0;
     double rerank_cpu_ms = 0;
     double safein_payload_prefetch_ms = 0;
     double candidate_collect_ms = 0;
@@ -790,6 +817,11 @@ struct QueryResult {
     double uring_prep_ms = 0;
     double uring_submit_ms = 0;
     double fetch_missing_ms = 0;
+    double final_drain_ms = 0;
+    double execute_buffered_ms = 0;
+    double collector_finalize_ms = 0;
+    double assemble_results_ms = 0;
+    double search_unaccounted_ms = 0;
     uint32_t submit_calls = 0;
     uint32_t submit_window_flushes = 0;
     uint32_t submit_window_tail_flushes = 0;
@@ -879,6 +911,7 @@ struct RoundMetrics {
     double avg_probe_stage1_mask = 0;
     double avg_probe_stage1_iterate = 0;
     double avg_probe_stage1_classify_only = 0;
+    double avg_probe_stage1_envelope = 0;
     double avg_probe_stage2 = 0;
     double avg_probe_stage2_collect = 0;
     double avg_probe_stage2_kernel = 0;
@@ -891,6 +924,9 @@ struct RoundMetrics {
     double avg_stage1_fused_blocks = 0;
     double avg_stage1_fused_safeout_lanes = 0;
     double avg_stage1_fused_safein_lanes = 0;
+    double avg_stage1_envelope_tested_blocks = 0;
+    double avg_stage1_envelope_skipped_blocks = 0;
+    double avg_stage1_envelope_safeout_lanes = 0;
     double avg_stage2_masked_kernel_calls = 0;
     double avg_stage2_lanes_requested = 0;
     double avg_stage2_lanes_skipped = 0;
@@ -907,6 +943,8 @@ struct RoundMetrics {
     double avg_probe_submit_vec_only_emit = 0;
     double avg_probe_submit_pending_slot_alloc = 0;
     double avg_probe_submit_prep_read = 0;
+    double avg_probe_submit_address_sort = 0;
+    double avg_probe_submit_address_sorted_requests = 0;
     double avg_rerank_cpu = 0;
     double avg_safein_payload_prefetch = 0;
     double avg_candidate_collect = 0;
@@ -918,6 +956,11 @@ struct RoundMetrics {
     double avg_uring_prep = 0;
     double avg_uring_submit = 0;
     double avg_fetch_missing = 0;
+    double avg_final_drain = 0;
+    double avg_execute_buffered = 0;
+    double avg_collector_finalize = 0;
+    double avg_assemble_results = 0;
+    double avg_search_unaccounted = 0;
     double avg_submit_calls = 0;
     double avg_submit_window_flushes = 0;
     double avg_submit_window_tail_flushes = 0;
@@ -983,6 +1026,9 @@ struct RoundMetrics {
     double resident_cluster_mem_bytes = 0;
     double resident_parallel_view_build_ms = 0;
     double resident_parallel_view_bytes = 0;
+    double resident_stage1_envelope_bytes = 0;
+    double smaps_anon_huge_pages_kib = 0;
+    double smaps_file_pmd_mapped_kib = 0;
     double index_total_bytes = 0;
     double index_cluster_clu_bytes = 0;
     double index_data_dat_bytes = 0;
@@ -1069,6 +1115,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.probe_stage1_mask_ms = results.stats().probe_stage1_mask_ms;
         qr.probe_stage1_iterate_ms = results.stats().probe_stage1_iterate_ms;
         qr.probe_stage1_classify_only_ms = results.stats().probe_stage1_classify_only_ms;
+        qr.probe_stage1_envelope_ms = results.stats().probe_stage1_envelope_ms;
         qr.probe_stage2_ms = results.stats().probe_stage2_ms;
         qr.probe_stage2_collect_ms = results.stats().probe_stage2_collect_ms;
         qr.probe_stage2_kernel_ms = results.stats().probe_stage2_kernel_ms;
@@ -1081,6 +1128,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.stage1_fused_blocks = results.stats().stage1_fused_blocks;
         qr.stage1_fused_safeout_lanes = results.stats().stage1_fused_safeout_lanes;
         qr.stage1_fused_safein_lanes = results.stats().stage1_fused_safein_lanes;
+        qr.stage1_envelope_tested_blocks = results.stats().stage1_envelope_tested_blocks;
+        qr.stage1_envelope_skipped_blocks = results.stats().stage1_envelope_skipped_blocks;
+        qr.stage1_envelope_safeout_lanes = results.stats().stage1_envelope_safeout_lanes;
         qr.stage2_masked_kernel_calls = results.stats().stage2_masked_kernel_calls;
         qr.stage2_lanes_requested = results.stats().stage2_lanes_requested;
         qr.stage2_lanes_skipped = results.stats().stage2_lanes_skipped;
@@ -1101,6 +1151,10 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
             results.stats().probe_submit_pending_slot_alloc_ms;
         qr.probe_submit_prep_read_ms =
             results.stats().probe_submit_prep_read_ms;
+        qr.probe_submit_address_sort_ms =
+            results.stats().probe_submit_address_sort_ms;
+        qr.probe_submit_address_sorted_requests =
+            results.stats().probe_submit_address_sorted_requests;
         qr.rerank_cpu_ms = results.stats().rerank_cpu_ms;
         qr.safein_payload_prefetch_ms = results.stats().safein_payload_prefetch_ms;
         qr.candidate_collect_ms = results.stats().candidate_collect_ms;
@@ -1112,6 +1166,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.uring_prep_ms = results.stats().uring_prep_ms;
         qr.uring_submit_ms = results.stats().uring_submit_ms;
         qr.fetch_missing_ms = results.stats().fetch_missing_ms;
+        qr.final_drain_ms = results.stats().final_drain_ms;
+        qr.execute_buffered_ms = results.stats().execute_buffered_ms;
+        qr.collector_finalize_ms = results.stats().collector_finalize_ms;
+        qr.assemble_results_ms = results.stats().assemble_results_ms;
+        qr.search_unaccounted_ms = results.stats().search_unaccounted_ms;
         qr.submit_calls = results.stats().total_submit_calls;
         qr.submit_window_flushes = results.stats().total_submit_window_flushes;
         qr.submit_window_tail_flushes =
@@ -1280,7 +1339,8 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_probe_prepare_quant_lut = 0;
     double sum_probe_stage1 = 0, sum_probe_stage1_estimate = 0;
     double sum_probe_stage1_mask = 0, sum_probe_stage1_iterate = 0;
-    double sum_probe_stage1_classify_only = 0, sum_probe_stage2 = 0;
+    double sum_probe_stage1_classify_only = 0, sum_probe_stage1_envelope = 0;
+    double sum_probe_stage2 = 0;
     double sum_probe_stage2_collect = 0;
     double sum_probe_stage2_kernel = 0;
     double sum_probe_stage2_scatter = 0;
@@ -1292,6 +1352,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_stage1_fused_blocks = 0;
     double sum_stage1_fused_safeout_lanes = 0;
     double sum_stage1_fused_safein_lanes = 0;
+    double sum_stage1_envelope_tested_blocks = 0;
+    double sum_stage1_envelope_skipped_blocks = 0;
+    double sum_stage1_envelope_safeout_lanes = 0;
     double sum_stage2_masked_kernel_calls = 0;
     double sum_stage2_lanes_requested = 0;
     double sum_stage2_lanes_skipped = 0;
@@ -1306,6 +1369,8 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_probe_submit_vec_only_emit = 0;
     double sum_probe_submit_pending_slot_alloc = 0;
     double sum_probe_submit_prep_read = 0;
+    double sum_probe_submit_address_sort = 0;
+    double sum_probe_submit_address_sorted_requests = 0;
     double sum_rerank_cpu = 0;
     double sum_safein_payload_prefetch = 0, sum_candidate_collect = 0;
     double sum_pool_vector_read = 0, sum_rerank_compute = 0;
@@ -1313,6 +1378,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_remaining_payload_fetch = 0;
     double sum_uring_prep = 0, sum_uring_submit = 0;
     double sum_fetch_missing = 0;
+    double sum_final_drain = 0;
+    double sum_execute_buffered = 0;
+    double sum_collector_finalize = 0;
+    double sum_assemble_results = 0;
+    double sum_search_unaccounted = 0;
     double sum_submit_calls = 0;
     double sum_submit_window_flushes = 0;
     double sum_submit_window_tail_flushes = 0;
@@ -1387,6 +1457,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_probe_stage1_mask += qresults[qi].probe_stage1_mask_ms;
         sum_probe_stage1_iterate += qresults[qi].probe_stage1_iterate_ms;
         sum_probe_stage1_classify_only += qresults[qi].probe_stage1_classify_only_ms;
+        sum_probe_stage1_envelope += qresults[qi].probe_stage1_envelope_ms;
         sum_probe_stage2 += qresults[qi].probe_stage2_ms;
         sum_probe_stage2_collect += qresults[qi].probe_stage2_collect_ms;
         sum_probe_stage2_kernel += qresults[qi].probe_stage2_kernel_ms;
@@ -1399,6 +1470,12 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_stage1_fused_blocks += qresults[qi].stage1_fused_blocks;
         sum_stage1_fused_safeout_lanes += qresults[qi].stage1_fused_safeout_lanes;
         sum_stage1_fused_safein_lanes += qresults[qi].stage1_fused_safein_lanes;
+        sum_stage1_envelope_tested_blocks +=
+            qresults[qi].stage1_envelope_tested_blocks;
+        sum_stage1_envelope_skipped_blocks +=
+            qresults[qi].stage1_envelope_skipped_blocks;
+        sum_stage1_envelope_safeout_lanes +=
+            qresults[qi].stage1_envelope_safeout_lanes;
         sum_stage2_masked_kernel_calls += qresults[qi].stage2_masked_kernel_calls;
         sum_stage2_lanes_requested += qresults[qi].stage2_lanes_requested;
         sum_stage2_lanes_skipped += qresults[qi].stage2_lanes_skipped;
@@ -1419,6 +1496,10 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
             qresults[qi].probe_submit_pending_slot_alloc_ms;
         sum_probe_submit_prep_read +=
             qresults[qi].probe_submit_prep_read_ms;
+        sum_probe_submit_address_sort +=
+            qresults[qi].probe_submit_address_sort_ms;
+        sum_probe_submit_address_sorted_requests +=
+            qresults[qi].probe_submit_address_sorted_requests;
         sum_rerank_cpu += qresults[qi].rerank_cpu_ms;
         sum_safein_payload_prefetch += qresults[qi].safein_payload_prefetch_ms;
         sum_candidate_collect += qresults[qi].candidate_collect_ms;
@@ -1430,6 +1511,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_uring_prep += qresults[qi].uring_prep_ms;
         sum_uring_submit += qresults[qi].uring_submit_ms;
         sum_fetch_missing += qresults[qi].fetch_missing_ms;
+        sum_final_drain += qresults[qi].final_drain_ms;
+        sum_execute_buffered += qresults[qi].execute_buffered_ms;
+        sum_collector_finalize += qresults[qi].collector_finalize_ms;
+        sum_assemble_results += qresults[qi].assemble_results_ms;
+        sum_search_unaccounted += qresults[qi].search_unaccounted_ms;
         sum_submit_calls += qresults[qi].submit_calls;
         sum_submit_window_flushes += qresults[qi].submit_window_flushes;
         sum_submit_window_tail_flushes +=
@@ -1505,6 +1591,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_probe_stage1_mask = sum_probe_stage1_mask / Q;
     m.avg_probe_stage1_iterate = sum_probe_stage1_iterate / Q;
     m.avg_probe_stage1_classify_only = sum_probe_stage1_classify_only / Q;
+    m.avg_probe_stage1_envelope = sum_probe_stage1_envelope / Q;
     m.avg_probe_stage2 = sum_probe_stage2 / Q;
     m.avg_probe_stage2_collect = sum_probe_stage2_collect / Q;
     m.avg_probe_stage2_kernel = sum_probe_stage2_kernel / Q;
@@ -1517,6 +1604,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_stage1_fused_blocks = sum_stage1_fused_blocks / Q;
     m.avg_stage1_fused_safeout_lanes = sum_stage1_fused_safeout_lanes / Q;
     m.avg_stage1_fused_safein_lanes = sum_stage1_fused_safein_lanes / Q;
+    m.avg_stage1_envelope_tested_blocks = sum_stage1_envelope_tested_blocks / Q;
+    m.avg_stage1_envelope_skipped_blocks = sum_stage1_envelope_skipped_blocks / Q;
+    m.avg_stage1_envelope_safeout_lanes = sum_stage1_envelope_safeout_lanes / Q;
     m.avg_stage2_masked_kernel_calls = sum_stage2_masked_kernel_calls / Q;
     m.avg_stage2_lanes_requested = sum_stage2_lanes_requested / Q;
     m.avg_stage2_lanes_skipped = sum_stage2_lanes_skipped / Q;
@@ -1536,6 +1626,9 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_probe_submit_pending_slot_alloc =
         sum_probe_submit_pending_slot_alloc / Q;
     m.avg_probe_submit_prep_read = sum_probe_submit_prep_read / Q;
+    m.avg_probe_submit_address_sort = sum_probe_submit_address_sort / Q;
+    m.avg_probe_submit_address_sorted_requests =
+        sum_probe_submit_address_sorted_requests / Q;
     m.avg_rerank_cpu = sum_rerank_cpu / Q;
     m.avg_safein_payload_prefetch = sum_safein_payload_prefetch / Q;
     m.avg_candidate_collect = sum_candidate_collect / Q;
@@ -1547,6 +1640,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_uring_prep = sum_uring_prep / Q;
     m.avg_uring_submit = sum_uring_submit / Q;
     m.avg_fetch_missing = sum_fetch_missing / Q;
+    m.avg_final_drain = sum_final_drain / Q;
+    m.avg_execute_buffered = sum_execute_buffered / Q;
+    m.avg_collector_finalize = sum_collector_finalize / Q;
+    m.avg_assemble_results = sum_assemble_results / Q;
+    m.avg_search_unaccounted = sum_search_unaccounted / Q;
     m.avg_submit_calls = sum_submit_calls / Q;
     m.avg_submit_window_flushes = sum_submit_window_flushes / Q;
     m.avg_submit_window_tail_flushes = sum_submit_window_tail_flushes / Q;
@@ -1636,6 +1734,13 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         index.segment().resident_parallel_view_build_ms();
     m.resident_parallel_view_bytes =
         static_cast<double>(index.segment().resident_parallel_view_bytes());
+    m.resident_stage1_envelope_bytes =
+        static_cast<double>(index.segment().resident_stage1_envelope_bytes());
+    const SmapsRollupStats smaps = ReadSmapsRollupStats();
+    m.smaps_anon_huge_pages_kib =
+        static_cast<double>(smaps.anon_huge_pages_kib);
+    m.smaps_file_pmd_mapped_kib =
+        static_cast<double>(smaps.file_pmd_mapped_kib);
     m.index_cluster_clu_bytes = FileSizeBytesOrZero(index.dir() + "/cluster.clu");
     m.index_data_dat_bytes = FileSizeBytesOrZero(index.dir() + "/data.dat");
     m.index_rotation_bytes = FileSizeBytesOrZero(index.dir() + "/rotation.bin");
@@ -1683,6 +1788,10 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         m.avg_rerank_compute, m.avg_remaining_payload_fetch);
     Log("  %s: uring_prep=%.3f ms  uring_submit=%.3f ms  fetch_missing=%.3f ms\n",
         label, m.avg_uring_prep, m.avg_uring_submit, m.avg_fetch_missing);
+    Log("  %s: final_drain=%.3f ms  execute_buffered=%.3f ms  collector_finalize=%.3f ms  assemble=%.3f ms  unaccounted=%.3f ms\n",
+        label, m.avg_final_drain, m.avg_execute_buffered,
+        m.avg_collector_finalize, m.avg_assemble_results,
+        m.avg_search_unaccounted);
     Log("  %s: submit_calls=%.1f\n", label, m.avg_submit_calls);
     Log("  %s: submit_window_flushes=%.1f  submit_window_tail_flushes=%.1f  submit_window_requests=%.1f\n",
         label, m.avg_submit_window_flushes,
@@ -1862,6 +1971,10 @@ int main(int argc, char* argv[]) {
     int arg_io_queue_depth = GetIntArg(argc, argv, "--io-queue-depth", 64);
     int arg_fixed_vec_buffer_count =
         GetIntArg(argc, argv, "--fixed-vec-buffer-count", 0);
+    int arg_vec_read_address_sort =
+        GetIntArg(argc, argv, "--vec-read-address-sort", 0);
+    int arg_vec_read_address_sort_window =
+        GetIntArg(argc, argv, "--vec-read-address-sort-window", 64);
     int arg_cluster_submit_reserve =
         GetIntArg(argc, argv, "--cluster-submit-reserve", 8);
     std::string arg_submission_mode =
@@ -1911,6 +2024,8 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--stage2-block-first", 1);
     int arg_stage2_batch_classify =
         GetIntArg(argc, argv, "--stage2-batch-classify", 1);
+    int arg_stage1_block_skip_envelope =
+        GetIntArg(argc, argv, "--stage1-block-skip-envelope", 0);
     bool arg_cold = HasFlag(argc, argv, "--cold");
     bool arg_direct_io = HasFlag(argc, argv, "--direct-io");
     bool arg_iopoll = HasFlag(argc, argv, "--iopoll");
@@ -2074,6 +2189,13 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
                      "Invalid --enable-stage1-safein: %d (expected 0 or 1)\n",
                      arg_enable_stage1_safein);
+        return 1;
+    }
+    if (arg_stage1_block_skip_envelope != 0 &&
+        arg_stage1_block_skip_envelope != 1) {
+        std::fprintf(stderr,
+                     "Invalid --stage1-block-skip-envelope: %d (expected 0 or 1)\n",
+                     arg_stage1_block_skip_envelope);
         return 1;
     }
     if (arg_safein_dk_samples_only != 0 && arg_safein_dk_samples_only != 1) {
@@ -2770,6 +2892,10 @@ int main(int argc, char* argv[]) {
         (arg_hotpath_detailed_timing != 0);
     search_cfg.submit_batch_size = static_cast<uint32_t>(
         GetIntArg(argc, argv, "--submit-batch", 32));
+    search_cfg.enable_vec_read_address_sort =
+        (arg_vec_read_address_sort != 0);
+    search_cfg.vec_read_address_sort_window =
+        static_cast<uint32_t>(std::max(arg_vec_read_address_sort_window, 0));
     search_cfg.enable_online_submit_tuning = (arg_submit_online != 0);
     search_cfg.submit_ema_alpha = arg_submit_ema_alpha;
     search_cfg.enable_address_decode_simd = (arg_address_decode_simd != 0);
@@ -2790,6 +2916,8 @@ int main(int argc, char* argv[]) {
     search_cfg.enable_two_level_coarse_exact_overlap =
         (arg_two_level_coarse_exact_overlap != 0);
     search_cfg.enable_stage1_safein = (arg_enable_stage1_safein != 0);
+    search_cfg.enable_stage1_block_skip_envelope =
+        (arg_stage1_block_skip_envelope != 0);
     search_cfg.enable_stage2_collect_block_first = (arg_stage2_block_first != 0);
     search_cfg.enable_stage2_scatter_batch_classify = (arg_stage2_batch_classify != 0);
     if (has_safein_epsilon_override) {
@@ -2841,6 +2969,7 @@ int main(int argc, char* argv[]) {
                          "resident_file_buffer_bytes,resident_code_storage_bytes,"
                          "resident_decoded_address_bytes,resident_raw_address_bytes,"
                          "resident_parsed_address_duplicate_bytes,resident_cluster_mem_bytes,"
+                         "resident_stage1_envelope_bytes,"
                          "logical_dim,effective_dim,padding_mode,rotation_mode,"
                          "avg_prepare_rotation_ms,avg_prepare_quant_lut_ms,index_total_bytes\n";
         }
@@ -2911,6 +3040,7 @@ int main(int argc, char* argv[]) {
                       << sm.resident_raw_address_bytes << ","
                       << sm.resident_parsed_address_duplicate_bytes << ","
                       << sm.resident_cluster_mem_bytes << ","
+                      << sm.resident_stage1_envelope_bytes << ","
                       << index.logical_dim() << ","
                       << index.effective_dim() << ","
                       << "\"" << index.padding_mode() << "\"" << ","
@@ -3054,6 +3184,11 @@ int main(int argc, char* argv[]) {
     Log("  stage1_estimate=%.3f ms  stage1_mask=%.3f ms  stage1_iterate=%.3f ms  stage1_classify=%.3f ms\n",
         metrics.avg_probe_stage1_estimate, metrics.avg_probe_stage1_mask,
         metrics.avg_probe_stage1_iterate, metrics.avg_probe_stage1_classify_only);
+    Log("  stage1_envelope=%.3f ms  envelope_tested_blocks=%.1f  skipped_blocks=%.1f  skipped_lanes=%.1f\n",
+        metrics.avg_probe_stage1_envelope,
+        metrics.avg_stage1_envelope_tested_blocks,
+        metrics.avg_stage1_envelope_skipped_blocks,
+        metrics.avg_stage1_envelope_safeout_lanes);
     Log("  stage1_fused_blocks=%.1f  fused_safeout_lanes=%.1f  fused_safein_lanes=%.1f\n",
         metrics.avg_stage1_fused_blocks,
         metrics.avg_stage1_fused_safeout_lanes,
@@ -3223,6 +3358,8 @@ int main(int argc, char* argv[]) {
                             search_cfg.safein_all_threshold) << ",\n";
         f << "    " << JInt("io_queue_depth", search_cfg.io_queue_depth) << ",\n";
         f << "    " << JInt("fixed_vec_buffer_count", search_cfg.fixed_vec_buffer_count) << ",\n";
+        f << "    " << JBool("enable_vec_read_address_sort", search_cfg.enable_vec_read_address_sort) << ",\n";
+        f << "    " << JInt("vec_read_address_sort_window", search_cfg.vec_read_address_sort_window) << ",\n";
         f << "    " << JInt("cluster_submit_reserve", search_cfg.cluster_submit_reserve) << ",\n";
         f << "    " << JBool("iopoll_requested", arg_iopoll) << ",\n";
         f << "    " << JBool("sqpoll_requested", arg_sqpoll) << ",\n";
@@ -3242,6 +3379,8 @@ int main(int argc, char* argv[]) {
         f << "    " << JInt("two_level_coarse_budget_factor", search_cfg.two_level_coarse_budget_factor) << ",\n";
         f << "    " << JBool("enable_two_level_coarse_exact_overlap", search_cfg.enable_two_level_coarse_exact_overlap) << ",\n";
         f << "    " << JBool("enable_stage1_safein", search_cfg.enable_stage1_safein) << ",\n";
+        f << "    " << JBool("enable_stage1_block_skip_envelope",
+                             search_cfg.enable_stage1_block_skip_envelope) << ",\n";
         f << "    " << JBool("enable_stage2_scatter_batch_classify",
                              search_cfg.enable_stage2_scatter_batch_classify) << ",\n";
         f << "    " << JBool("enable_online_submit_tuning", search_cfg.enable_online_submit_tuning) << ",\n";
@@ -3408,6 +3547,9 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("resident_cluster_mem_bytes", metrics.resident_cluster_mem_bytes) << ",\n";
         f << "    " << JNum("resident_parallel_view_build_ms", metrics.resident_parallel_view_build_ms) << ",\n";
         f << "    " << JNum("resident_parallel_view_bytes", metrics.resident_parallel_view_bytes) << ",\n";
+        f << "    " << JNum("resident_stage1_envelope_bytes", metrics.resident_stage1_envelope_bytes) << ",\n";
+        f << "    " << JNum("smaps_anon_huge_pages_kib", metrics.smaps_anon_huge_pages_kib) << ",\n";
+        f << "    " << JNum("smaps_file_pmd_mapped_kib", metrics.smaps_file_pmd_mapped_kib) << ",\n";
         f << "    " << JNum("index_total_bytes", metrics.index_total_bytes) << ",\n";
         f << "    " << JNum("index_cluster_clu_bytes", metrics.index_cluster_clu_bytes) << ",\n";
         f << "    " << JNum("index_data_dat_bytes", metrics.index_data_dat_bytes) << ",\n";
@@ -3460,6 +3602,7 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_probe_stage1_mask_ms", metrics.avg_probe_stage1_mask) << ",\n";
         f << "    " << JNum("avg_probe_stage1_iterate_ms", metrics.avg_probe_stage1_iterate) << ",\n";
         f << "    " << JNum("avg_probe_stage1_classify_only_ms", metrics.avg_probe_stage1_classify_only) << ",\n";
+        f << "    " << JNum("avg_probe_stage1_envelope_ms", metrics.avg_probe_stage1_envelope) << ",\n";
         f << "    " << JNum("avg_probe_stage2_ms", metrics.avg_probe_stage2) << ",\n";
         f << "    " << JNum("avg_probe_stage2_collect_ms", metrics.avg_probe_stage2_collect) << ",\n";
         f << "    " << JNum("avg_probe_stage2_kernel_ms", metrics.avg_probe_stage2_kernel) << ",\n";
@@ -3472,6 +3615,9 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_stage1_fused_blocks", metrics.avg_stage1_fused_blocks) << ",\n";
         f << "    " << JNum("avg_stage1_fused_safeout_lanes", metrics.avg_stage1_fused_safeout_lanes) << ",\n";
         f << "    " << JNum("avg_stage1_fused_safein_lanes", metrics.avg_stage1_fused_safein_lanes) << ",\n";
+        f << "    " << JNum("avg_stage1_envelope_tested_blocks", metrics.avg_stage1_envelope_tested_blocks) << ",\n";
+        f << "    " << JNum("avg_stage1_envelope_skipped_blocks", metrics.avg_stage1_envelope_skipped_blocks) << ",\n";
+        f << "    " << JNum("avg_stage1_envelope_safeout_lanes", metrics.avg_stage1_envelope_safeout_lanes) << ",\n";
         f << "    " << JNum("avg_stage2_masked_kernel_calls", metrics.avg_stage2_masked_kernel_calls) << ",\n";
         f << "    " << JNum("avg_stage2_lanes_requested", metrics.avg_stage2_lanes_requested) << ",\n";
         f << "    " << JNum("avg_stage2_lanes_skipped", metrics.avg_stage2_lanes_skipped) << ",\n";
@@ -3488,6 +3634,8 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_probe_submit_vec_only_emit_ms", metrics.avg_probe_submit_vec_only_emit) << ",\n";
         f << "    " << JNum("avg_probe_submit_pending_slot_alloc_ms", metrics.avg_probe_submit_pending_slot_alloc) << ",\n";
         f << "    " << JNum("avg_probe_submit_prep_read_ms", metrics.avg_probe_submit_prep_read) << ",\n";
+        f << "    " << JNum("avg_probe_submit_address_sort_ms", metrics.avg_probe_submit_address_sort) << ",\n";
+        f << "    " << JNum("avg_probe_submit_address_sorted_requests", metrics.avg_probe_submit_address_sorted_requests) << ",\n";
         f << "    " << JNum("avg_rerank_cpu_ms", metrics.avg_rerank_cpu) << ",\n";
         f << "    " << JNum("avg_safein_payload_prefetch_ms", metrics.avg_safein_payload_prefetch) << ",\n";
         f << "    " << JNum("avg_candidate_collect_ms", metrics.avg_candidate_collect) << ",\n";
@@ -3499,6 +3647,11 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_uring_prep_ms", metrics.avg_uring_prep) << ",\n";
         f << "    " << JNum("avg_uring_submit_ms", metrics.avg_uring_submit) << ",\n";
         f << "    " << JNum("avg_fetch_missing_ms", metrics.avg_fetch_missing) << ",\n";
+        f << "    " << JNum("avg_final_drain_ms", metrics.avg_final_drain) << ",\n";
+        f << "    " << JNum("avg_execute_buffered_ms", metrics.avg_execute_buffered) << ",\n";
+        f << "    " << JNum("avg_collector_finalize_ms", metrics.avg_collector_finalize) << ",\n";
+        f << "    " << JNum("avg_assemble_results_ms", metrics.avg_assemble_results) << ",\n";
+        f << "    " << JNum("avg_search_unaccounted_ms", metrics.avg_search_unaccounted) << ",\n";
         f << "    " << JNum("avg_submit_calls", metrics.avg_submit_calls) << ",\n";
         f << "    " << JNum("avg_submit_window_flushes", metrics.avg_submit_window_flushes) << ",\n";
         f << "    " << JNum("avg_submit_window_tail_flushes", metrics.avg_submit_window_tail_flushes) << ",\n";
@@ -3589,6 +3742,7 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("probe_stage1_mask_ms", qr.probe_stage1_mask_ms) << ",\n";
             f << "      " << JNum("probe_stage1_iterate_ms", qr.probe_stage1_iterate_ms) << ",\n";
             f << "      " << JNum("probe_stage1_classify_only_ms", qr.probe_stage1_classify_only_ms) << ",\n";
+            f << "      " << JNum("probe_stage1_envelope_ms", qr.probe_stage1_envelope_ms) << ",\n";
             f << "      " << JNum("probe_stage2_ms", qr.probe_stage2_ms) << ",\n";
             f << "      " << JNum("probe_stage2_collect_ms", qr.probe_stage2_collect_ms) << ",\n";
             f << "      " << JNum("probe_stage2_kernel_ms", qr.probe_stage2_kernel_ms) << ",\n";
@@ -3601,6 +3755,9 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("stage1_fused_blocks", qr.stage1_fused_blocks) << ",\n";
             f << "      " << JNum("stage1_fused_safeout_lanes", qr.stage1_fused_safeout_lanes) << ",\n";
             f << "      " << JNum("stage1_fused_safein_lanes", qr.stage1_fused_safein_lanes) << ",\n";
+            f << "      " << JNum("stage1_envelope_tested_blocks", qr.stage1_envelope_tested_blocks) << ",\n";
+            f << "      " << JNum("stage1_envelope_skipped_blocks", qr.stage1_envelope_skipped_blocks) << ",\n";
+            f << "      " << JNum("stage1_envelope_safeout_lanes", qr.stage1_envelope_safeout_lanes) << ",\n";
             f << "      " << JNum("stage2_masked_kernel_calls", qr.stage2_masked_kernel_calls) << ",\n";
             f << "      " << JNum("stage2_lanes_requested", qr.stage2_lanes_requested) << ",\n";
             f << "      " << JNum("stage2_lanes_skipped", qr.stage2_lanes_skipped) << ",\n";
@@ -3616,6 +3773,8 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("probe_submit_vec_only_emit_ms", qr.probe_submit_vec_only_emit_ms) << ",\n";
             f << "      " << JNum("probe_submit_pending_slot_alloc_ms", qr.probe_submit_pending_slot_alloc_ms) << ",\n";
             f << "      " << JNum("probe_submit_prep_read_ms", qr.probe_submit_prep_read_ms) << ",\n";
+            f << "      " << JNum("probe_submit_address_sort_ms", qr.probe_submit_address_sort_ms) << ",\n";
+            f << "      " << JNum("probe_submit_address_sorted_requests", qr.probe_submit_address_sorted_requests) << ",\n";
             f << "      " << JNum("safein_payload_prefetch_ms", qr.safein_payload_prefetch_ms) << ",\n";
             f << "      " << JNum("candidate_collect_ms", qr.candidate_collect_ms) << ",\n";
             f << "      " << JNum("pool_vector_read_ms", qr.pool_vector_read_ms) << ",\n";

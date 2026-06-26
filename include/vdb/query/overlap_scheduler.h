@@ -204,6 +204,8 @@ class OverlapScheduler {
     std::vector<VecOnlyReadPlan> pending_vec_only_plans_;
     std::vector<DeferredSafeInPlan> deferred_safein_plans_;
     std::vector<BudgetedReadPlan> budgeted_read_plan_heap_;
+    std::vector<uint64_t> emitted_budgeted_offsets_;
+    uint32_t budgeted_early_submitted_count_ = 0;
     size_t pending_vec_only_head_ = 0;
 
     uint32_t vec_bytes_;
@@ -275,6 +277,9 @@ class OverlapScheduler {
     void AddBudgetedReadPlan(SearchContext& ctx, const ReadPlanEntry& plan,
                              float rank_key);
     void MaterializeBudgetedReadPlans(SearchContext& ctx);
+    void EmitTopBudgetedReadPlans(SearchContext& ctx, uint32_t max_count);
+    bool BudgetedPlanAlreadyEmitted(uint64_t offset) const;
+    void MarkBudgetedPlanEmitted(uint64_t offset);
 
     // Stage 2 ExRaBitQ re-classification
     float margin_s2_divisor_ = 1.0f;  // 2^(total_bits-1), precomputed
