@@ -38,133 +38,6 @@ std::filesystem::path TestDir() {
 
 } // namespace
 
-TEST(ClusterProberTest, Stage1BlockSkipEnvelopeSkipsSafeOutTailBlock) {
-    constexpr vdb::Dim dim = 64;
-    constexpr uint32_t kRecords = 31;
-
-    const std::filesystem::path test_dir = TestDir();
-    std::filesystem::remove_all(test_dir);
-    std::filesystem::create_directories(test_dir);
-    const std::string path = (test_dir / "stage1_envelope_tail.clu").string();
-
-    vdb::RaBitQConfig config;
-    config.bits = 1;
-    config.total_bits = 1;
-    config.ex_bits = 0;
-
-    vdb::rabitq::RotationMatrix rotation(dim);
-    rotation.GenerateRandom(31);
-    vdb::rabitq::RaBitQEncoder encoder(dim, rotation, config, 37);
-
-    std::vector<float> centroid(dim);
-    for (uint32_t d = 0; d < dim; ++d) {
-        centroid[d] = 0.01f * static_cast<float>((static_cast<int>(d) % 7) - 3);
-    }
-
-    std::vector<vdb::rabitq::RaBitQCode> codes;
-    codes.reserve(kRecords);
-    for (uint32_t i = 0; i < kRecords; ++i) {
-        std::vector<float> vec(dim);
-        for (uint32_t d = 0; d < dim; ++d) {
-            vec[d] = 0.015f * static_cast<float>(static_cast<int>(i) - 5) +
-                     0.02f * static_cast<float>((static_cast<int>(d) % 17) - 8);
-        }
-        codes.push_back(encoder.Encode(vec.data(), centroid.data()));
-    }
-
-    std::vector<vdb::AddressEntry> addrs;
-    uint64_t offset = 0;
-    for (uint32_t i = 0; i < kRecords; ++i) {
-        addrs.push_back({offset, dim * sizeof(float)});
-        offset += dim * sizeof(float);
-    }
-    const auto addr_blocks = vdb::storage::AddressColumn::Encode(addrs, 64, 1);
-
-    vdb::storage::ClusterStoreWriter writer;
-    ASSERT_TRUE(writer.Open(path, 1, dim, config).ok());
-    ASSERT_TRUE(writer.BeginCluster(0, kRecords, centroid.data(), 1.0f).ok());
-    ASSERT_TRUE(writer.WriteVectors(codes).ok());
-    ASSERT_TRUE(writer.WriteAddressBlocks(addr_blocks).ok());
-    ASSERT_TRUE(writer.EndCluster().ok());
-    ASSERT_TRUE(writer.Finalize("data.dat").ok());
-
-    vdb::storage::ClusterStoreReader reader;
-    ASSERT_TRUE(reader.Open(path).ok());
-    ASSERT_TRUE(reader.EnsureClusterLoaded(0).ok());
-    const auto loc = reader.GetBlockLocation(0);
-    ASSERT_TRUE(loc.has_value());
-
-    constexpr size_t kAlignment = 4096;
-    const size_t alloc_size = static_cast<size_t>(loc->size);
-    const size_t padded_size = ((alloc_size + kAlignment - 1) / kAlignment) * kAlignment;
-    auto* raw_block = static_cast<uint8_t*>(std::aligned_alloc(kAlignment, padded_size));
-    ASSERT_NE(raw_block, nullptr);
-    vdb::query::AlignedBufPtr block_buf(raw_block);
-    const ssize_t bytes =
-        ::pread(reader.clu_fd(), block_buf.get(), alloc_size, static_cast<off_t>(loc->offset));
-    ASSERT_EQ(bytes, static_cast<ssize_t>(alloc_size));
-
-    vdb::query::ParsedCluster parsed;
-    ASSERT_TRUE(reader.ParseClusterBlock(0, std::move(block_buf), loc->size, parsed).ok());
-    ASSERT_EQ(parsed.num_records, kRecords);
-    ASSERT_EQ(parsed.num_fastscan_blocks, 1u);
-
-    std::vector<float> query(dim);
-    for (uint32_t d = 0; d < dim; ++d) {
-        query[d] = 0.025f * static_cast<float>((static_cast<int>(d) % 19) - 9);
-    }
-
-    vdb::rabitq::RaBitQEstimator estimator(dim, config.active_code_bits());
-    vdb::rabitq::PreparedQuery pq;
-    vdb::rabitq::ClusterPreparedScratch scratch;
-    estimator.PrepareQueryInto(query.data(), centroid.data(), rotation, &pq, &scratch);
-
-    vdb::rabitq::PreparedClusterQueryView view;
-    view.prepared = &pq;
-    view.scratch = &scratch;
-    view.safein_margin_factor = 0.0f;
-    view.safeout_margin_factor = 0.0f;
-
-    vdb::index::ConANN conann(0.0f, 0.0f);
-    vdb::index::ClusterProber prober(conann, dim, config.active_code_bits(),
-                                     config.effective_total_bits());
-    constexpr float kAlwaysSafeOutFrontier = -1.0e6f;
-    constexpr float kDisableSafeIn = -std::numeric_limits<float>::infinity();
-
-    CollectingSink full_sink;
-    vdb::index::ProbeStats full_stats;
-    prober.Probe(parsed, 0, view, kAlwaysSafeOutFrontier, kDisableSafeIn,
-                 /*enable_address_decode_simd=*/true,
-                 /*enable_fine_grained_timing=*/true,
-                 /*enable_stage1_safein=*/false,
-                 /*enable_stage1_block_skip_envelope=*/false,
-                 /*enable_stage2_collect_block_first=*/true,
-                 /*enable_stage2_scatter_batch_classify=*/true, nullptr, nullptr,
-                 full_sink, full_stats);
-    EXPECT_EQ(full_stats.s1_safeout, kRecords);
-    EXPECT_EQ(full_stats.stage1_fused_blocks, 1u);
-    EXPECT_TRUE(full_sink.batches.empty());
-
-    CollectingSink envelope_sink;
-    vdb::index::ProbeStats envelope_stats;
-    prober.Probe(parsed, 0, view, kAlwaysSafeOutFrontier, kDisableSafeIn,
-                 /*enable_address_decode_simd=*/true,
-                 /*enable_fine_grained_timing=*/true,
-                 /*enable_stage1_safein=*/false,
-                 /*enable_stage1_block_skip_envelope=*/true,
-                 /*enable_stage2_collect_block_first=*/true,
-                 /*enable_stage2_scatter_batch_classify=*/true, nullptr, nullptr,
-                 envelope_sink, envelope_stats);
-    EXPECT_EQ(envelope_stats.s1_safeout, kRecords);
-    EXPECT_EQ(envelope_stats.stage1_envelope_tested_blocks, 1u);
-    EXPECT_EQ(envelope_stats.stage1_envelope_skipped_blocks, 1u);
-    EXPECT_EQ(envelope_stats.stage1_envelope_safeout_lanes, kRecords);
-    EXPECT_EQ(envelope_stats.stage1_fused_blocks, 0u);
-    EXPECT_TRUE(envelope_sink.batches.empty());
-
-    std::filesystem::remove_all(test_dir);
-}
-
 TEST(ClusterProberTest, OfficialV13Stage2ScoresUseOfficialFactors) {
     constexpr vdb::Dim dim = 64;
     constexpr uint32_t kRecords = 8;
@@ -287,7 +160,6 @@ TEST(ClusterProberTest, OfficialV13Stage2ScoresUseOfficialFactors) {
                  /*enable_address_decode_simd=*/true,
                  /*enable_fine_grained_timing=*/true,
                  /*enable_stage1_safein=*/false,
-                 /*enable_stage1_block_skip_envelope=*/false,
                  /*enable_stage2_collect_block_first=*/true,
                  /*enable_stage2_scatter_batch_classify=*/true, nullptr, nullptr, sink, stats);
 
@@ -341,6 +213,9 @@ TEST(ClusterProberTest, OfficialV14DirectStage2ScoresBypassDecode) {
                           Case{vdb::RaBitQExDataLayout::kVectorBitMajorTiles, 1, 15},
                           Case{vdb::RaBitQExDataLayout::kVectorBitMajorTiles, 2, 15},
                           Case{vdb::RaBitQExDataLayout::kVectorBitMajorTiles, 3, 15},
+                          Case{vdb::RaBitQExDataLayout::kTileLaneBitMajor, 1, 15},
+                          Case{vdb::RaBitQExDataLayout::kTileLaneBitMajor, 2, 15},
+                          Case{vdb::RaBitQExDataLayout::kTileLaneBitMajor, 3, 15},
                           Case{vdb::RaBitQExDataLayout::kSmallLane4Bitplanes, 1, 15},
                           Case{vdb::RaBitQExDataLayout::kSmallLane4Bitplanes, 2, 15},
                           Case{vdb::RaBitQExDataLayout::kSmallLane4Bitplanes, 3, 15},
@@ -483,6 +358,10 @@ TEST(ClusterProberTest, OfficialV14DirectStage2ScoresBypassDecode) {
             vdb::simd::IPOfficialRaBitQBatchCompactVectorBitMajorTilesMasked(
                 pq.rotated.data(), block_view.abs_blocks, ex_bits, 0xFFu, kRecords, dim,
                 parsed.exrabitq_dim_block, ip_ex);
+        } else if (layout == vdb::RaBitQExDataLayout::kTileLaneBitMajor) {
+            vdb::simd::IPOfficialRaBitQBatchCompactTileLaneBitMajorMasked(
+                pq.rotated.data(), block_view.abs_blocks, ex_bits, 0xFFu, kRecords, dim,
+                parsed.exrabitq_dim_block, ip_ex);
         } else if (layout == vdb::RaBitQExDataLayout::kSmallLane4Bitplanes) {
             vdb::simd::IPOfficialRaBitQBatchCompactSmallLane4BitplanesMasked(
                 pq.rotated.data(), block_view.abs_blocks, ex_bits, 0xFFu, kRecords, dim,
@@ -519,7 +398,6 @@ TEST(ClusterProberTest, OfficialV14DirectStage2ScoresBypassDecode) {
                      /*enable_address_decode_simd=*/true,
                      /*enable_fine_grained_timing=*/true,
                      /*enable_stage1_safein=*/false,
-                     /*enable_stage1_block_skip_envelope=*/false,
                      /*enable_stage2_collect_block_first=*/true,
                      /*enable_stage2_scatter_batch_classify=*/true, nullptr, nullptr, sink, stats);
 

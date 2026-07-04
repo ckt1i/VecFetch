@@ -16,9 +16,14 @@ target_link_libraries(bench_build_index PRIVATE vdb_query vdb_io)
 vdb_enable_target_avx512(bench_build_index)
 
 # ----- Online E2E query benchmark -----
-add_executable(bench_e2e bench_online_query.cpp)
+add_executable(bench_e2e bench_online_query.cpp rabitq_bench_calibration.cpp)
 target_link_libraries(bench_e2e PRIVATE vdb_query vdb_io)
 vdb_enable_target_avx512(bench_e2e)
+
+# ----- No Combine Store Materializer -----
+add_executable(bench_materialize_no_combine_store bench_materialize_no_combine_store.cpp)
+target_link_libraries(bench_materialize_no_combine_store PRIVATE vdb_index vdb_io)
+vdb_enable_target_avx512(bench_materialize_no_combine_store)
 
 # ----- Offline SafeIn d_k samples generator -----
 add_executable(bench_safein_dk_samples bench_safein_dk_samples.cpp rabitq_bench_calibration.cpp)

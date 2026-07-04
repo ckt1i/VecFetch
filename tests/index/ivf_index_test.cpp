@@ -241,6 +241,9 @@ TEST(IvfIndexTwoLevelCoarseTest, DefaultParameterDerivation) {
     EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(16384, 256, 8), 2048u);
     EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(1024, 256, 8), 1024u);
     EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(16384, 256, 0), 256u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(16384, 1024, 16, 8192), 8192u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(8192, 512, 16, 6144), 6144u);
+    EXPECT_EQ(IvfIndex::DefaultTwoLevelCandidateBudget(8192, 512, 16, 128), 512u);
 }
 
 TEST_F(IvfIndexTest, TwoLevelRoutingDisabledMatchesExact) {

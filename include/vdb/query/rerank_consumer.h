@@ -39,6 +39,9 @@ class RerankConsumer {
     /// Ownership of buf transfers to the consumer.
     void ConsumeVec(uint8_t* buf, AddressEntry addr);
 
+    /// Consume an already owned raw-vector buffer without copying it again.
+    void ConsumeOwnedVec(AlignedBufPtr buf, AddressEntry addr);
+
     /// Consume an ALL buffer: buffer vector for later batch rerank and cache payload.
     /// Ownership of buf remains with caller; payload bytes may be copied into cache.
     void ConsumeAll(uint8_t* buf, AddressEntry addr);
@@ -83,6 +86,7 @@ class RerankConsumer {
     uint32_t aligned_vec_bytes_;
     std::vector<BufferedCandidate> buffered_candidates_;
     std::vector<VectorChunk> vector_chunks_;
+    std::vector<AlignedBufPtr> owned_vector_buffers_;
 
     // Payload cache: addr.offset → owned payload buffer (freed via free())
     std::unordered_map<uint64_t, AlignedBufPtr> payload_cache_;

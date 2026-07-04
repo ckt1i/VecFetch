@@ -67,6 +67,7 @@ inline bool UsesVariableOfficialExDataLayout(RaBitQExDataLayout layout) {
            resolved == RaBitQExDataLayout::kVectorBitplanesPrefetch ||
            resolved == RaBitQExDataLayout::kVectorBitplanesMicroBatch ||
            resolved == RaBitQExDataLayout::kVectorBitMajorTiles ||
+           resolved == RaBitQExDataLayout::kTileLaneBitMajor ||
            resolved == RaBitQExDataLayout::kVectorNibble4 ||
            resolved == RaBitQExDataLayout::kVector2Bit ||
            resolved == RaBitQExDataLayout::kSmallLane4Bitplanes ||
@@ -83,6 +84,11 @@ inline bool IsVectorBitplanesLayout(RaBitQExDataLayout layout) {
 inline bool IsVectorBitMajorTileLayout(RaBitQExDataLayout layout) {
     const RaBitQExDataLayout resolved = RaBitQResolveSelectedExDataLayout(layout);
     return resolved == RaBitQExDataLayout::kVectorBitMajorTiles;
+}
+
+inline bool IsTileLaneBitMajorLayout(RaBitQExDataLayout layout) {
+    const RaBitQExDataLayout resolved = RaBitQResolveSelectedExDataLayout(layout);
+    return resolved == RaBitQExDataLayout::kTileLaneBitMajor;
 }
 
 inline bool IsVectorContiguousOfficialLayout(RaBitQExDataLayout layout) {
@@ -333,12 +339,6 @@ bool UseCompactCodeSlabResidentPreload() {
            std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
 }
 
-bool UseStage1EnvelopePrecompute() {
-    const char* env = std::getenv("VDB_STAGE1_PRECOMPUTE_ENVELOPE");
-    return env != nullptr && env[0] != '\0' && env[0] != '0' &&
-           std::strcmp(env, "false") != 0 && std::strcmp(env, "off") != 0;
-}
-
 uintptr_t AlignUp(uintptr_t value, uintptr_t alignment) {
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
@@ -378,100 +378,6 @@ void MAdviseHugePageVector(std::vector<T>& vec) {
     }
 }
 
-constexpr uint8_t kFastScanInvPerm[16] = {
-    0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15
-};
-
-VDB_FORCE_INLINE uint16_t FastScanPresenceMaskFull(const uint8_t* group_bytes) {
-    uint16_t mask = 0;
-    for (uint32_t i = 0; i < 16; ++i) {
-        const uint8_t byte = group_bytes[i];
-        mask |= static_cast<uint16_t>(1u << (byte & 0x0Fu));
-        mask |= static_cast<uint16_t>(1u << ((byte >> 4) & 0x0Fu));
-    }
-    return mask;
-}
-
-VDB_FORCE_INLINE uint16_t FastScanPresenceMaskTail(const uint8_t* group_bytes,
-                                                   uint32_t count) {
-    uint16_t mask = 0;
-    for (uint32_t lane = 0; lane < count; ++lane) {
-        const bool high_half = lane >= 16u;
-        const uint32_t lane_in_half = high_half ? (lane - 16u) : lane;
-        const uint32_t perm_pos = kFastScanInvPerm[lane_in_half];
-        const uint8_t byte = group_bytes[perm_pos];
-        const uint8_t nibble =
-            high_half ? static_cast<uint8_t>((byte >> 4) & 0x0Fu)
-                      : static_cast<uint8_t>(byte & 0x0Fu);
-        mask |= static_cast<uint16_t>(1u << nibble);
-    }
-    return mask;
-}
-
-VDB_FORCE_INLINE uint16_t FastScanPresenceMaskForGroup(const uint8_t* packed_codes,
-                                                       uint32_t group_idx,
-                                                       uint32_t count) {
-    const uint8_t* pair = packed_codes + (group_idx / 2u) * 32u;
-    const uint8_t* group_bytes = pair + ((group_idx & 1u) ? 16u : 0u);
-    return count >= 32u ? FastScanPresenceMaskFull(group_bytes)
-                        : FastScanPresenceMaskTail(group_bytes, count);
-}
-
-uint64_t ResidentStage1EnvelopeBytes(
-    const ClusterStoreReader::ResidentClusterView& view) {
-    return static_cast<uint64_t>(view.stage1_envelope_presence_masks.size()) *
-               sizeof(uint16_t) +
-           static_cast<uint64_t>(view.stage1_envelope_norm_min.size()) *
-               sizeof(float) +
-           static_cast<uint64_t>(view.stage1_envelope_norm_max.size()) *
-               sizeof(float);
-}
-
-void BuildResidentStage1EnvelopeSummary(
-    const query::ParsedCluster& parsed,
-    Dim dim,
-    ClusterStoreReader::ResidentClusterView* view) {
-    if (view == nullptr || parsed.fastscan_blocks == nullptr ||
-        parsed.num_fastscan_blocks == 0 || parsed.fastscan_block_size == 0 ||
-        dim < 4) {
-        return;
-    }
-    const uint32_t groups = dim >> 2;
-    const uint32_t packed_sz = FastScanPackedSize(dim);
-    if (groups == 0 ||
-        parsed.fastscan_block_size < packed_sz + 32u * sizeof(float)) {
-        return;
-    }
-
-    view->stage1_envelope_groups_per_block = groups;
-    view->stage1_envelope_presence_masks.assign(
-        static_cast<size_t>(parsed.num_fastscan_blocks) * groups, 0);
-    view->stage1_envelope_norm_min.assign(parsed.num_fastscan_blocks, 0.0f);
-    view->stage1_envelope_norm_max.assign(parsed.num_fastscan_blocks, 0.0f);
-
-    for (uint32_t b = 0; b < parsed.num_fastscan_blocks; ++b) {
-        const uint32_t base_idx = b * 32u;
-        const uint32_t count = std::min(32u, parsed.num_records - base_idx);
-        const uint8_t* block_ptr =
-            parsed.fastscan_blocks +
-            static_cast<size_t>(b) * parsed.fastscan_block_size;
-        for (uint32_t group = 0; group < groups; ++group) {
-            view->stage1_envelope_presence_masks[
-                static_cast<size_t>(b) * groups + group] =
-                FastScanPresenceMaskForGroup(block_ptr, group, count);
-        }
-        const float* norms = reinterpret_cast<const float*>(block_ptr + packed_sz);
-        float norm_min = std::numeric_limits<float>::infinity();
-        float norm_max = -std::numeric_limits<float>::infinity();
-        for (uint32_t i = 0; i < count; ++i) {
-            norm_min = std::min(norm_min, norms[i]);
-            norm_max = std::max(norm_max, norms[i]);
-        }
-        view->stage1_envelope_norm_min[b] = norm_min;
-        view->stage1_envelope_norm_max[b] = norm_max;
-    }
-}
-
 void CopyParsedMetadataToResident(const query::ParsedCluster& parsed,
                                   ClusterStoreReader::ResidentClusterView* view) {
     view->fastscan_block_size = parsed.fastscan_block_size;
@@ -491,12 +397,15 @@ void CopyParsedMetadataToResident(const query::ParsedCluster& parsed,
     view->exrabitq_abs_bytes_per_lane_dim_block =
         parsed.exrabitq_abs_bytes_per_lane_dim_block;
     view->exrabitq_magnitude_bits = parsed.exrabitq_magnitude_bits;
+    view->exrabitq_loaded_magnitude_bits =
+        parsed.exrabitq_loaded_magnitude_bits;
     view->exrabitq_magnitude_packed = parsed.exrabitq_magnitude_packed;
     view->rabitq_total_bits = parsed.rabitq_total_bits;
     view->rabitq_ex_bits = parsed.rabitq_ex_bits;
     view->rabitq_estimator_mode = parsed.rabitq_estimator_mode;
     view->rabitq_exdata_layout = parsed.rabitq_exdata_layout;
     view->num_records = parsed.num_records;
+    view->dim = parsed.dim;
     view->epsilon = parsed.epsilon;
     view->address_page_size = parsed.address_page_size;
 }
@@ -526,6 +435,189 @@ void RelocateResidentCodePointers(const query::ParsedCluster& parsed,
     const uint8_t* base = view->code_storage.empty() ? nullptr
                                                      : view->code_storage.data();
     RelocateResidentCodePointersToBase(parsed, base, view);
+}
+
+bool CanBuildSelectiveResidentExData(const query::ParsedCluster& parsed,
+                                     uint8_t resident_ex_bits) {
+    if (resident_ex_bits == 0 ||
+        resident_ex_bits >= parsed.exrabitq_magnitude_bits ||
+        !parsed.uses_official_1_plus_n() ||
+        parsed.exrabitq_storage_version < kFileVersionV15 ||
+        !parsed.exrabitq_variable_batch_blocks ||
+        parsed.exrabitq_batch_blocks == nullptr ||
+        parsed.exrabitq_batch_block_offsets == nullptr ||
+        !RaBitQExDataLayoutSupportsActiveExBits(parsed.rabitq_exdata_layout)) {
+        return false;
+    }
+    const RaBitQExDataLayout resolved =
+        RaBitQResolveSelectedExDataLayout(parsed.rabitq_exdata_layout);
+    return resolved == RaBitQExDataLayout::kTileLaneBitMajor ||
+           resolved == RaBitQExDataLayout::kVectorBitMajorTiles;
+}
+
+Status AppendTileLaneBitMajorPrefix(const uint8_t* src,
+                                    uint32_t dim,
+                                    uint32_t valid_count,
+                                    uint8_t stored_bits,
+                                    uint8_t resident_bits,
+                                    std::vector<uint8_t>* out) {
+    if (src == nullptr || out == nullptr || resident_bits == 0 ||
+        resident_bits > stored_bits || stored_bits > 3 || valid_count == 0) {
+        return Status::InvalidArgument("Invalid tile-lane bit-major trim request");
+    }
+    uint32_t done = 0;
+    const uint8_t* tile = src;
+    while (done < dim) {
+        const uint32_t tile_dims = simd::ExRaBitQBitMajorTileDims(dim - done);
+        if (tile_dims == 0) {
+            return Status::Corruption("Invalid tile-lane bit-major tile size");
+        }
+        const uint32_t plane_bytes = tile_dims / 8u;
+        const size_t keep_bytes =
+            static_cast<size_t>(resident_bits) * valid_count * plane_bytes;
+        AppendRaw(*out, tile, keep_bytes);
+        tile += static_cast<size_t>(stored_bits) * valid_count * plane_bytes;
+        done += std::min<uint32_t>(tile_dims, dim - done);
+    }
+    return Status::OK();
+}
+
+Status AppendVectorBitMajorTilePrefix(const uint8_t* src,
+                                      uint32_t dim,
+                                      uint32_t valid_count,
+                                      uint8_t stored_bits,
+                                      uint8_t resident_bits,
+                                      std::vector<uint8_t>* out) {
+    if (src == nullptr || out == nullptr || resident_bits == 0 ||
+        resident_bits > stored_bits || stored_bits > 3 || valid_count == 0) {
+        return Status::InvalidArgument("Invalid vector bit-major trim request");
+    }
+    const uint32_t stored_vector_bytes =
+        simd::ExRaBitQBitMajorTileVectorBytes(dim, stored_bits);
+    if (stored_vector_bytes == 0) {
+        return Status::Corruption("Invalid vector bit-major stored width");
+    }
+    for (uint32_t lane = 0; lane < valid_count; ++lane) {
+        uint32_t done = 0;
+        const uint8_t* tile =
+            src + static_cast<size_t>(lane) * stored_vector_bytes;
+        while (done < dim) {
+            const uint32_t tile_dims = simd::ExRaBitQBitMajorTileDims(dim - done);
+            if (tile_dims == 0) {
+                return Status::Corruption("Invalid vector bit-major tile size");
+            }
+            const uint32_t plane_bytes = tile_dims / 8u;
+            const size_t keep_bytes =
+                static_cast<size_t>(resident_bits) * plane_bytes;
+            AppendRaw(*out, tile, keep_bytes);
+            tile += static_cast<size_t>(stored_bits) * plane_bytes;
+            done += std::min<uint32_t>(tile_dims, dim - done);
+        }
+    }
+    return Status::OK();
+}
+
+Status BuildSelectiveResidentCodeStorage(const query::ParsedCluster& parsed,
+                                         uint8_t resident_ex_bits,
+                                         std::vector<uint8_t>* out) {
+    if (out == nullptr) {
+        return Status::InvalidArgument("Output buffer is null");
+    }
+    if (!CanBuildSelectiveResidentExData(parsed, resident_ex_bits)) {
+        return Status::InvalidArgument(
+            "Selective resident preload is unsupported for this RaBitQ layout");
+    }
+
+    const uint64_t fastscan_bytes = parsed.exrabitq_region_offset;
+    if (parsed.fastscan_blocks == nullptr ||
+        fastscan_bytes > parsed.code_region_bytes) {
+        return Status::Corruption("Invalid parsed code-region offsets");
+    }
+
+    out->clear();
+    out->reserve(static_cast<size_t>(fastscan_bytes) +
+                 static_cast<size_t>(parsed.exrabitq_batch_region_bytes));
+    AppendRaw(*out, parsed.fastscan_blocks, static_cast<size_t>(fastscan_bytes));
+
+    const size_t region_start = out->size();
+    const uint32_t batch_blocks = parsed.exrabitq_num_batch_blocks;
+    const uint32_t offset_count = batch_blocks + 1u;
+    const uint32_t header_bytes = 8u + offset_count * sizeof(uint32_t);
+    out->resize(region_start + header_bytes, 0);
+    std::memcpy(out->data() + region_start, &kVariableExRegionMagic,
+                sizeof(uint32_t));
+    std::memcpy(out->data() + region_start + 4, &batch_blocks, sizeof(uint32_t));
+
+    const RaBitQExDataLayout resolved =
+        RaBitQResolveSelectedExDataLayout(parsed.rabitq_exdata_layout);
+    for (uint32_t bb = 0; bb < batch_blocks; ++bb) {
+        const uint32_t batch_offset =
+            static_cast<uint32_t>(out->size() - region_start);
+        std::memcpy(out->data() + region_start + 8 + bb * sizeof(uint32_t),
+                    &batch_offset, sizeof(uint32_t));
+
+        const auto block_view = parsed.exrabitq_batch_block_view(bb);
+        if (block_view.valid_count == 0 ||
+            block_view.valid_count > parsed.exrabitq_batch_size ||
+            block_view.abs_blocks == nullptr ||
+            block_view.official_factor_adds == nullptr ||
+            block_view.official_factor_rescales == nullptr) {
+            return Status::Corruption("Invalid ExRaBitQ batch block during trim");
+        }
+
+        AppendVal<uint32_t>(*out, block_view.valid_count);
+        if (resolved == RaBitQExDataLayout::kTileLaneBitMajor) {
+            VDB_RETURN_IF_ERROR(AppendTileLaneBitMajorPrefix(
+                block_view.abs_blocks, parsed.dim, block_view.valid_count,
+                parsed.exrabitq_magnitude_bits, resident_ex_bits, out));
+        } else if (resolved == RaBitQExDataLayout::kVectorBitMajorTiles) {
+            VDB_RETURN_IF_ERROR(AppendVectorBitMajorTilePrefix(
+                block_view.abs_blocks, parsed.dim, block_view.valid_count,
+                parsed.exrabitq_magnitude_bits, resident_ex_bits, out));
+        } else {
+            return Status::InvalidArgument(
+                "Selective resident preload supports only bit-major layouts");
+        }
+        AppendRaw(*out, block_view.official_factor_adds,
+                  static_cast<size_t>(block_view.valid_count) * sizeof(float));
+        AppendRaw(*out, block_view.official_factor_rescales,
+                  static_cast<size_t>(block_view.valid_count) * sizeof(float));
+    }
+
+    const uint32_t final_offset =
+        static_cast<uint32_t>(out->size() - region_start);
+    std::memcpy(out->data() + region_start + 8 +
+                    batch_blocks * sizeof(uint32_t),
+                &final_offset, sizeof(uint32_t));
+    return Status::OK();
+}
+
+Status MakeSelectiveResidentView(query::ParsedCluster& parsed,
+                                 uint8_t resident_ex_bits,
+                                 ClusterStoreReader::ResidentClusterView* view) {
+    if (view == nullptr) {
+        return Status::InvalidArgument("Resident view is null");
+    }
+    CopyParsedMetadataToResident(parsed, view);
+    VDB_RETURN_IF_ERROR(BuildSelectiveResidentCodeStorage(
+        parsed, resident_ex_bits, &view->code_storage));
+    MAdviseHugePageVector(view->code_storage);
+    view->code_storage_bytes = static_cast<uint64_t>(view->code_storage.size());
+    view->exrabitq_loaded_magnitude_bits = resident_ex_bits;
+    view->exrabitq_batch_region_bytes =
+        view->code_storage_bytes >= parsed.exrabitq_region_offset
+            ? static_cast<uint32_t>(
+                  view->code_storage_bytes - parsed.exrabitq_region_offset)
+            : 0;
+    RelocateResidentCodePointers(parsed, view);
+    view->raw_addresses = nullptr;
+    view->addresses_are_raw_v2 = false;
+    view->raw_address_bytes = 0;
+    view->decoded_addresses = std::move(parsed.decoded_addresses);
+    view->decoded_address_bytes =
+        static_cast<uint64_t>(view->decoded_addresses.size()) *
+        sizeof(AddressEntry);
+    return Status::OK();
 }
 
 ClusterStoreReader::ResidentClusterView MakeCompactResidentView(
@@ -781,9 +873,15 @@ Status ClusterStoreWriter::WriteVectors(
                     return Status::InvalidArgument(
                         "vector_bitmajor_tiles official ExData layout requires ex_bits=1,2,3");
                 }
+                if (exdata_layout == RaBitQExDataLayout::kTileLaneBitMajor &&
+                    (stage2_bits < 1 || stage2_bits > 3)) {
+                    return Status::InvalidArgument(
+                        "tile_lane_bitmajor official ExData layout requires ex_bits=1,2,3");
+                }
                 if (exdata_layout != RaBitQExDataLayout::kVectorNibble4 &&
                     exdata_layout != RaBitQExDataLayout::kVector2Bit &&
                     exdata_layout != RaBitQExDataLayout::kVectorBitMajorTiles &&
+                    exdata_layout != RaBitQExDataLayout::kTileLaneBitMajor &&
                     !IsSmallLaneBitplanesLayout(exdata_layout) &&
                     !IsVectorBitplanesLayout(exdata_layout) && stage2_bits != 3) {
                     return Status::InvalidArgument(
@@ -856,6 +954,35 @@ Status ClusterStoreWriter::WriteVectors(
 	                            }
 	                            AppendRaw(region, packed_abs_buf.data(), vector_bytes);
 	                        }
+	                    } else if (IsTileLaneBitMajorLayout(exdata_layout)) {
+	                        const uint32_t batch_bytes =
+	                            simd::ExRaBitQTileLaneBitMajorBatchBytes(
+	                                dim, stage2_bits, valid_count);
+	                        if (batch_bytes == 0) {
+	                            return Status::InvalidArgument(
+	                                "unsupported tile_lane_bitmajor Stage2 payload width");
+	                        }
+	                        std::vector<const uint8_t*> decoded_lanes(valid_count, nullptr);
+	                        for (uint32_t lane = 0; lane < valid_count; ++lane) {
+	                            const auto& code = codes[start + lane];
+	                            if (code.ex_code.size() != dim) {
+	                                return Status::InvalidArgument(
+	                                    "ExRaBitQ code size mismatch with dim");
+	                            }
+	                            if (!code.ex_code_sign_folded) {
+	                                return Status::InvalidArgument(
+	                                    "official ExRaBitQ tile-lane bit-major layout requires sign-folded ExData");
+	                            }
+	                            decoded_lanes[lane] = code.ex_code.data();
+	                        }
+	                        std::vector<uint8_t> packed_abs_buf(batch_bytes);
+	                        if (!simd::ExRaBitQPackOfficialTileLaneBitMajor(
+	                                decoded_lanes.data(), valid_count, dim, stage2_bits,
+	                                packed_abs_buf.data(), batch_bytes)) {
+	                            return Status::InvalidArgument(
+	                                "ExRaBitQ code contains value outside bit-width range");
+	                        }
+	                        AppendRaw(region, packed_abs_buf.data(), batch_bytes);
 	                    } else if (IsSmallLaneBitplanesLayout(exdata_layout)) {
 	                        const uint32_t subgroup_lanes =
 	                            SmallLaneBitplanesGroupSize(exdata_layout);
@@ -1435,6 +1562,7 @@ ClusterStoreReader::ClusterStoreReader(ClusterStoreReader&& other) noexcept
       resident_clusters_(std::move(other.resident_clusters_)),
       resident_parsed_clusters_(std::move(other.resident_parsed_clusters_)),
       resident_preload_ready_(other.resident_preload_ready_),
+      resident_loaded_ex_bits_(other.resident_loaded_ex_bits_),
       resident_preload_bytes_(other.resident_preload_bytes_),
       resident_cluster_mem_bytes_(other.resident_cluster_mem_bytes_),
       resident_file_size_bytes_(other.resident_file_size_bytes_),
@@ -1448,8 +1576,7 @@ ClusterStoreReader::ClusterStoreReader(ClusterStoreReader&& other) noexcept
       resident_preload_mode_(std::move(other.resident_preload_mode_)),
       resident_preload_time_ms_(other.resident_preload_time_ms_),
       resident_parallel_view_bytes_(other.resident_parallel_view_bytes_),
-      resident_parallel_view_build_ms_(other.resident_parallel_view_build_ms_),
-      resident_stage1_envelope_bytes_(other.resident_stage1_envelope_bytes_) {
+      resident_parallel_view_build_ms_(other.resident_parallel_view_build_ms_) {
     other.fd_ = -1;
     other.resident_mmap_base_ = nullptr;
     other.resident_mmap_data_ = nullptr;
@@ -1460,6 +1587,7 @@ ClusterStoreReader::ClusterStoreReader(ClusterStoreReader&& other) noexcept
     other.resident_code_slab_mapping_bytes_ = 0;
     other.resident_code_slab_data_bytes_ = 0;
     other.resident_preload_ready_ = false;
+    other.resident_loaded_ex_bits_ = 0;
     other.resident_preload_bytes_ = 0;
     other.resident_cluster_mem_bytes_ = 0;
     other.resident_file_size_bytes_ = 0;
@@ -1473,7 +1601,6 @@ ClusterStoreReader::ClusterStoreReader(ClusterStoreReader&& other) noexcept
     other.resident_preload_time_ms_ = 0.0;
     other.resident_parallel_view_bytes_ = 0;
     other.resident_parallel_view_build_ms_ = 0.0;
-    other.resident_stage1_envelope_bytes_ = 0;
 }
 
 ClusterStoreReader& ClusterStoreReader::operator=(
@@ -1496,6 +1623,7 @@ ClusterStoreReader& ClusterStoreReader::operator=(
         resident_clusters_ = std::move(other.resident_clusters_);
         resident_parsed_clusters_ = std::move(other.resident_parsed_clusters_);
         resident_preload_ready_ = other.resident_preload_ready_;
+        resident_loaded_ex_bits_ = other.resident_loaded_ex_bits_;
         resident_preload_bytes_ = other.resident_preload_bytes_;
         resident_cluster_mem_bytes_ = other.resident_cluster_mem_bytes_;
         resident_file_size_bytes_ = other.resident_file_size_bytes_;
@@ -1510,7 +1638,6 @@ ClusterStoreReader& ClusterStoreReader::operator=(
         resident_preload_time_ms_ = other.resident_preload_time_ms_;
         resident_parallel_view_bytes_ = other.resident_parallel_view_bytes_;
         resident_parallel_view_build_ms_ = other.resident_parallel_view_build_ms_;
-        resident_stage1_envelope_bytes_ = other.resident_stage1_envelope_bytes_;
         other.fd_ = -1;
         other.resident_mmap_base_ = nullptr;
         other.resident_mmap_data_ = nullptr;
@@ -1521,6 +1648,7 @@ ClusterStoreReader& ClusterStoreReader::operator=(
         other.resident_code_slab_mapping_bytes_ = 0;
         other.resident_code_slab_data_bytes_ = 0;
         other.resident_preload_ready_ = false;
+        other.resident_loaded_ex_bits_ = 0;
         other.resident_preload_bytes_ = 0;
         other.resident_cluster_mem_bytes_ = 0;
         other.resident_file_size_bytes_ = 0;
@@ -1534,7 +1662,6 @@ ClusterStoreReader& ClusterStoreReader::operator=(
         other.resident_preload_time_ms_ = 0.0;
         other.resident_parallel_view_bytes_ = 0;
         other.resident_parallel_view_build_ms_ = 0.0;
-        other.resident_stage1_envelope_bytes_ = 0;
     }
     return *this;
 }
@@ -1551,6 +1678,7 @@ void ClusterStoreReader::Close() {
     ReleaseResidentMmapFileBuffer();
     ReleaseResidentCodeSlabBuffer();
     resident_preload_ready_ = false;
+    resident_loaded_ex_bits_ = 0;
     resident_preload_bytes_ = 0;
     resident_cluster_mem_bytes_ = 0;
     resident_file_size_bytes_ = 0;
@@ -1564,7 +1692,6 @@ void ClusterStoreReader::Close() {
     resident_preload_time_ms_ = 0.0;
     resident_parallel_view_bytes_ = 0;
     resident_parallel_view_build_ms_ = 0.0;
-    resident_stage1_envelope_bytes_ = 0;
     cluster_index_.clear();
     file_version_ = 0;
 }
@@ -2260,12 +2387,14 @@ Status ClusterStoreReader::ParseClusterBlockView(
     out.exrabitq_abs_bytes_per_lane_dim_block =
         exrabitq_abs_bytes_per_lane_dim_block();
     out.exrabitq_magnitude_bits = info_.rabitq_config.stage2_payload_bits();
+    out.exrabitq_loaded_magnitude_bits = out.exrabitq_magnitude_bits;
     out.exrabitq_magnitude_packed = exrabitq_magnitude_packed();
     out.rabitq_total_bits = info_.rabitq_config.effective_total_bits();
     out.rabitq_ex_bits = info_.rabitq_config.stage2_payload_bits();
     out.rabitq_estimator_mode = info_.rabitq_config.estimator_mode;
     out.rabitq_exdata_layout = info_.rabitq_config.effective_exdata_layout();
     out.num_records = entry.num_records;
+    out.dim = info_.dim;
     out.epsilon = entry.epsilon;
     out.raw_addresses = raw_addresses;
     out.address_page_size = address_page_size;
@@ -2299,11 +2428,19 @@ Status ClusterStoreReader::ParseClusterBlock(
     return Status::OK();
 }
 
-Status ClusterStoreReader::PreloadAllClusters() {
+Status ClusterStoreReader::PreloadAllClusters(uint8_t resident_ex_bits) {
     if (fd_ < 0) {
         return Status::InvalidArgument("ClusterStoreReader not open");
     }
+    const uint8_t stored_ex_bits = info_.rabitq_config.stage2_payload_bits();
+    const uint8_t effective_resident_ex_bits =
+        resident_ex_bits == 0 ? stored_ex_bits
+                              : std::min<uint8_t>(resident_ex_bits, stored_ex_bits);
     if (resident_preload_ready_) {
+        if (resident_loaded_ex_bits_ != effective_resident_ex_bits) {
+            return Status::InvalidArgument(
+                "Resident clusters are already preloaded with a different bits setting");
+        }
         return Status::OK();
     }
 
@@ -2314,14 +2451,16 @@ Status ClusterStoreReader::PreloadAllClusters() {
     }
 
 	    if (UseCompactResidentPreload()) {
-	        const bool use_code_slab = UseCompactCodeSlabResidentPreload();
-	        const bool precompute_stage1_envelope = UseStage1EnvelopePrecompute();
-	        std::map<uint32_t, ResidentClusterView> resident_clusters;
-	        std::map<uint32_t, query::ParsedCluster> resident_parsed_clusters;
-	        uint64_t resident_cluster_mem_bytes = 0;
-        uint64_t resident_parallel_view_bytes = 0;
-        uint64_t resident_stage1_envelope_bytes = 0;
-        uint64_t resident_code_storage_bytes = 0;
+	        const bool selective_resident_ex =
+	            effective_resident_ex_bits > 0 &&
+	            effective_resident_ex_bits < stored_ex_bits;
+		        const bool use_code_slab =
+		            UseCompactCodeSlabResidentPreload() && !selective_resident_ex;
+		        std::map<uint32_t, ResidentClusterView> resident_clusters;
+		        std::map<uint32_t, query::ParsedCluster> resident_parsed_clusters;
+		        uint64_t resident_cluster_mem_bytes = 0;
+	        uint64_t resident_parallel_view_bytes = 0;
+	        uint64_t resident_code_storage_bytes = 0;
         uint64_t resident_decoded_address_bytes = 0;
         uint64_t resident_preload_bytes = 0;
         double parallel_build_ms = 0.0;
@@ -2583,16 +2722,19 @@ Status ClusterStoreReader::PreloadAllClusters() {
 	                    view.decoded_address_bytes =
 	                        static_cast<uint64_t>(view.decoded_addresses.size()) *
 	                        sizeof(AddressEntry);
+	                } else if (selective_resident_ex) {
+	                    if (!CanBuildSelectiveResidentExData(
+	                            parsed, effective_resident_ex_bits)) {
+	                        return Status::InvalidArgument(
+	                            "Selective resident preload requires a bit-major "
+	                            "official RaBitQ layout that supports active bits");
+	                    }
+	                    VDB_RETURN_IF_ERROR(MakeSelectiveResidentView(
+	                        parsed, effective_resident_ex_bits, &view));
 	                } else {
 	                    view = MakeCompactResidentView(parsed);
 	                }
-	                uint64_t stage1_envelope_bytes = 0;
-	                if (precompute_stage1_envelope) {
-	                    BuildResidentStage1EnvelopeSummary(parsed, info_.dim, &view);
-	                    stage1_envelope_bytes = ResidentStage1EnvelopeBytes(view);
-	                    resident_stage1_envelope_bytes += stage1_envelope_bytes;
-	                }
-	                auto pb0 = std::chrono::steady_clock::now();
+		                auto pb0 = std::chrono::steady_clock::now();
 	                BuildResidentParallelStage2View(parsed, &view);
                 MAdviseHugePageVector(view.exrabitq_parallel_abs_blocks_storage);
                 MAdviseHugePageVector(view.exrabitq_parallel_sign_words_storage);
@@ -2617,8 +2759,7 @@ Status ClusterStoreReader::PreloadAllClusters() {
 	                }
 	                resident_cluster_mem_bytes +=
 	                    inserted.first->second.decoded_address_bytes;
-                resident_cluster_mem_bytes += parallel_bytes;
-                resident_cluster_mem_bytes += stage1_envelope_bytes;
+	                resident_cluster_mem_bytes += parallel_bytes;
                 resident_parsed_clusters.emplace(
                     entry->cluster_id, inserted.first->second.ToParsedCluster());
             }
@@ -2633,9 +2774,10 @@ Status ClusterStoreReader::PreloadAllClusters() {
         resident_file_buffer_.clear();
 	        resident_file_buffer_.shrink_to_fit();
 	        ReleaseResidentMmapFileBuffer();
-	        resident_clusters_ = std::move(resident_clusters);
+        resident_clusters_ = std::move(resident_clusters);
         resident_parsed_clusters_ = std::move(resident_parsed_clusters);
         resident_preload_ready_ = true;
+        resident_loaded_ex_bits_ = effective_resident_ex_bits;
         resident_preload_bytes_ = resident_preload_bytes;
         resident_cluster_mem_bytes_ = resident_cluster_mem_bytes;
         resident_file_size_bytes_ = static_cast<uint64_t>(file_size);
@@ -2645,7 +2787,11 @@ Status ClusterStoreReader::PreloadAllClusters() {
         resident_raw_address_bytes_ = 0;
         resident_parsed_address_duplicate_bytes_ = 0;
         resident_preload_batch_size_ = 16;
-	        if (use_code_slab) {
+	        if (selective_resident_ex) {
+	            resident_preload_mode_ = "compact_selective_bits" +
+	                std::to_string(static_cast<uint32_t>(
+	                    effective_resident_ex_bits + 1u));
+	        } else if (use_code_slab) {
 	            resident_cluster_mem_bytes_ += code_slab_bytes;
 	            resident_preload_mode_ = "compact_code_mmap_2mb";
 	        } else {
@@ -2653,13 +2799,17 @@ Status ClusterStoreReader::PreloadAllClusters() {
 	        }
         resident_preload_time_ms_ = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count();
-        resident_parallel_view_bytes_ = resident_parallel_view_bytes;
-        resident_parallel_view_build_ms_ = parallel_build_ms;
-        resident_stage1_envelope_bytes_ = resident_stage1_envelope_bytes;
+	        resident_parallel_view_bytes_ = resident_parallel_view_bytes;
+	        resident_parallel_view_build_ms_ = parallel_build_ms;
         return Status::OK();
     }
 
     const bool use_aligned_mmap = UseAlignedMmapResidentFile();
+    if (effective_resident_ex_bits > 0 &&
+        effective_resident_ex_bits < stored_ex_bits) {
+        return Status::InvalidArgument(
+            "Selective resident preload requires compact resident preload mode");
+    }
     ReleaseResidentCodeSlabBuffer();
     if (use_aligned_mmap) {
 	        resident_file_buffer_.clear();
@@ -2685,10 +2835,8 @@ Status ClusterStoreReader::PreloadAllClusters() {
     std::map<uint32_t, query::ParsedCluster> resident_parsed_clusters;
     uint64_t resident_cluster_mem_bytes = 0;
     uint64_t resident_parallel_view_bytes = 0;
-    uint64_t resident_stage1_envelope_bytes = 0;
     uint64_t resident_decoded_address_bytes = 0;
     uint64_t resident_raw_address_bytes = 0;
-    const bool precompute_stage1_envelope = UseStage1EnvelopePrecompute();
     auto parallel_build_start = std::chrono::steady_clock::now();
     for (const auto& entry : info_.lookup_table) {
 	        if (entry.block_offset + entry.block_size > resident_file_size) {
@@ -2730,6 +2878,7 @@ Status ClusterStoreReader::PreloadAllClusters() {
         view.rabitq_estimator_mode = parsed.rabitq_estimator_mode;
         view.rabitq_exdata_layout = parsed.rabitq_exdata_layout;
         view.num_records = parsed.num_records;
+        view.dim = parsed.dim;
         view.epsilon = parsed.epsilon;
         view.raw_addresses = parsed.raw_addresses;
         view.address_page_size = parsed.address_page_size;
@@ -2738,12 +2887,6 @@ Status ClusterStoreReader::PreloadAllClusters() {
         view.decoded_address_bytes =
             static_cast<uint64_t>(view.decoded_addresses.size()) * sizeof(AddressEntry);
         view.raw_address_bytes = parsed.address_payload_bytes;
-        uint64_t stage1_envelope_bytes = 0;
-        if (precompute_stage1_envelope) {
-            BuildResidentStage1EnvelopeSummary(parsed, info_.dim, &view);
-            stage1_envelope_bytes = ResidentStage1EnvelopeBytes(view);
-            resident_stage1_envelope_bytes += stage1_envelope_bytes;
-        }
         BuildResidentParallelStage2View(parsed, &view);
         MAdviseHugePageVector(view.exrabitq_parallel_abs_blocks_storage);
         MAdviseHugePageVector(view.exrabitq_parallel_sign_words_storage);
@@ -2764,7 +2907,6 @@ Status ClusterStoreReader::PreloadAllClusters() {
         resident_cluster_mem_bytes +=
             static_cast<uint64_t>(inserted.first->second.exrabitq_parallel_sign_words_storage.size()) *
             sizeof(uint16_t);
-        resident_cluster_mem_bytes += stage1_envelope_bytes;
         resident_parsed_clusters.emplace(
             entry.cluster_id, inserted.first->second.ToParsedCluster());
     }
@@ -2772,6 +2914,7 @@ Status ClusterStoreReader::PreloadAllClusters() {
     resident_clusters_ = std::move(resident_clusters);
     resident_parsed_clusters_ = std::move(resident_parsed_clusters);
     resident_preload_ready_ = true;
+	    resident_loaded_ex_bits_ = effective_resident_ex_bits;
 	    resident_preload_bytes_ = resident_file_size;
 	    resident_cluster_mem_bytes_ =
 	        resident_cluster_mem_bytes + resident_file_size;
@@ -2788,7 +2931,6 @@ Status ClusterStoreReader::PreloadAllClusters() {
     resident_parallel_view_bytes_ = resident_parallel_view_bytes;
     resident_parallel_view_build_ms_ = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - parallel_build_start).count();
-    resident_stage1_envelope_bytes_ = resident_stage1_envelope_bytes;
     return Status::OK();
 }
 
@@ -2985,6 +3127,14 @@ Status ClusterStoreReader::LoadCodes(
                             out_codes[i].ex_code.data())) {
                         return Status::Corruption(
                             "Failed to unpack vector_bitmajor_tiles payload");
+                    }
+                } else if (variable_ex_blocks && IsTileLaneBitMajorLayout(exdata_layout)) {
+                    if (!simd::ExRaBitQUnpackOfficialTileLaneBitMajor(
+                            abs_base, valid_count, lane_id, dim,
+                            info_.rabitq_config.stage2_payload_bits(),
+                            out_codes[i].ex_code.data())) {
+                        return Status::Corruption(
+                            "Failed to unpack tile_lane_bitmajor payload");
                     }
                 } else {
                 const uint8_t* sparse_cursor = abs_base;

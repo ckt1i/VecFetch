@@ -471,6 +471,7 @@ enum class RaBitQExDataLayout : uint8_t {
   kSmallLane2Bitplanes = 13,
   kVectorBitplanesMicroBatch = 14,
   kVectorBitMajorTiles = 15,
+  kTileLaneBitMajor = 16,
 };
 
 constexpr std::string_view RaBitQExDataLayoutName(RaBitQExDataLayout layout) {
@@ -495,6 +496,8 @@ constexpr std::string_view RaBitQExDataLayoutName(RaBitQExDataLayout layout) {
       return "vector_bitplanes_microbatch";
     case RaBitQExDataLayout::kVectorBitMajorTiles:
       return "vector_bitmajor_tiles";
+    case RaBitQExDataLayout::kTileLaneBitMajor:
+      return "tile_lane_bitmajor";
     case RaBitQExDataLayout::kVectorNibble4:
       return "vector_nibble4";
     case RaBitQExDataLayout::kVector2Bit:
@@ -593,6 +596,13 @@ inline bool ParseRaBitQExDataLayout(std::string_view value,
     }
     return true;
   }
+  if (value == "tile_lane_bitmajor" || value == "batch_tile_bitmajor" ||
+      value == "tile_lane_bitplanes" || value == "batch_bitmajor_tiles") {
+    if (layout != nullptr) {
+      *layout = RaBitQExDataLayout::kTileLaneBitMajor;
+    }
+    return true;
+  }
   if (value == "vector_nibble4" || value == "per_vector_nibble4" ||
       value == "vector_4bit_nibble" || value == "official_4bit_nibble") {
     if (layout != nullptr) {
@@ -654,6 +664,8 @@ constexpr RaBitQExDataLayout RaBitQExDataLayoutFromByte(uint8_t layout) {
       return RaBitQExDataLayout::kVectorBitplanesMicroBatch;
     case static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitMajorTiles):
       return RaBitQExDataLayout::kVectorBitMajorTiles;
+    case static_cast<uint8_t>(RaBitQExDataLayout::kTileLaneBitMajor):
+      return RaBitQExDataLayout::kTileLaneBitMajor;
     case static_cast<uint8_t>(RaBitQExDataLayout::kVectorNibble4):
       return RaBitQExDataLayout::kVectorNibble4;
     case static_cast<uint8_t>(RaBitQExDataLayout::kVector2Bit):
@@ -681,6 +693,7 @@ constexpr bool RaBitQExDataLayoutByteValid(uint8_t layout) {
          layout == static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitplanesPrefetch) ||
          layout == static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitplanesMicroBatch) ||
          layout == static_cast<uint8_t>(RaBitQExDataLayout::kVectorBitMajorTiles) ||
+         layout == static_cast<uint8_t>(RaBitQExDataLayout::kTileLaneBitMajor) ||
          layout == static_cast<uint8_t>(RaBitQExDataLayout::kVectorNibble4) ||
          layout == static_cast<uint8_t>(RaBitQExDataLayout::kVector2Bit) ||
          layout == static_cast<uint8_t>(RaBitQExDataLayout::kSmallLane4Bitplanes) ||
@@ -725,6 +738,7 @@ constexpr uint8_t RaBitQExDataLayoutDirectBits(RaBitQExDataLayout layout) {
     case RaBitQExDataLayout::kVectorBitplanesPrefetch:
     case RaBitQExDataLayout::kVectorBitplanesMicroBatch:
     case RaBitQExDataLayout::kVectorBitMajorTiles:
+    case RaBitQExDataLayout::kTileLaneBitMajor:
     case RaBitQExDataLayout::kSmallLane4Bitplanes:
     case RaBitQExDataLayout::kSmallLane2Bitplanes:
       return 0;
@@ -751,10 +765,24 @@ constexpr bool RaBitQExDataLayoutIsDirect(RaBitQExDataLayout layout) {
          resolved == RaBitQExDataLayout::kVectorBitplanesPrefetch ||
          resolved == RaBitQExDataLayout::kVectorBitplanesMicroBatch ||
          resolved == RaBitQExDataLayout::kVectorBitMajorTiles ||
+         resolved == RaBitQExDataLayout::kTileLaneBitMajor ||
          resolved == RaBitQExDataLayout::kVectorNibble4 ||
          resolved == RaBitQExDataLayout::kVector2Bit ||
          resolved == RaBitQExDataLayout::kSmallLane4Bitplanes ||
          resolved == RaBitQExDataLayout::kSmallLane2Bitplanes;
+}
+
+constexpr bool RaBitQExDataLayoutSupportsActiveExBits(RaBitQExDataLayout layout) {
+  const RaBitQExDataLayout resolved = RaBitQResolveSelectedExDataLayout(layout);
+  return resolved == RaBitQExDataLayout::kSplit1Bitplane ||
+         resolved == RaBitQExDataLayout::kSplit2Bitplanes ||
+         resolved == RaBitQExDataLayout::kSplit3Bitplanes ||
+         resolved == RaBitQExDataLayout::kSplit3TrimmedBitplanes ||
+         resolved == RaBitQExDataLayout::kVectorBitplanes ||
+         resolved == RaBitQExDataLayout::kVectorBitplanesPrefetch ||
+         resolved == RaBitQExDataLayout::kVectorBitplanesMicroBatch ||
+         resolved == RaBitQExDataLayout::kVectorBitMajorTiles ||
+         resolved == RaBitQExDataLayout::kTileLaneBitMajor;
 }
 
 /// RaBitQ (Reduced-Bit Quantization) configuration
@@ -816,7 +844,8 @@ struct RaBitQConfig {
         effective == RaBitQExDataLayout::kSmallLane2Bitplanes) {
       return ex_bits >= 1 && ex_bits <= 4;
     }
-    if (effective == RaBitQExDataLayout::kVectorBitMajorTiles) {
+    if (effective == RaBitQExDataLayout::kVectorBitMajorTiles ||
+        effective == RaBitQExDataLayout::kTileLaneBitMajor) {
       return ex_bits >= 1 && ex_bits <= 3;
     }
     const uint8_t direct_bits = RaBitQExDataLayoutDirectBits(effective);

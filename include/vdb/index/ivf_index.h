@@ -92,7 +92,8 @@ class IvfIndex {
                                   uint32_t super_count,
                                   uint32_t super_factor,
                                   uint32_t budget_factor,
-                                  bool exact_overlap = false);
+                                  bool exact_overlap = false,
+                                  uint32_t budget_cap = 0);
     bool PrepareTwoLevelCoarseRouting(uint32_t nprobe) const;
     uint32_t last_coarse_routing_mode() const { return last_coarse_routing_mode_; }
     uint32_t last_coarse_super_count() const { return last_coarse_super_count_; }
@@ -110,7 +111,8 @@ class IvfIndex {
                                               uint32_t factor = 0);
     static uint32_t DefaultTwoLevelCandidateBudget(uint32_t nlist,
                                                    uint32_t nprobe,
-                                                   uint32_t budget_factor = 8);
+                                                   uint32_t budget_factor = 8,
+                                                   uint32_t budget_cap = 0);
 
     /// Get the ConANN classifier.
     const ConANN& conann() const { return conann_; }
@@ -258,6 +260,7 @@ class IvfIndex {
     mutable uint32_t two_level_coarse_super_count_ = 0;
     mutable uint32_t two_level_coarse_super_factor_ = 0;
     mutable uint32_t two_level_coarse_budget_factor_ = 8;
+    mutable uint32_t two_level_coarse_budget_cap_ = 0;
     mutable bool two_level_coarse_exact_overlap_ = false;
     mutable HierarchicalCoarseIndex coarse_hierarchy_;
     mutable double last_coarse_hierarchy_build_ms_ = 0;

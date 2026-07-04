@@ -127,6 +127,14 @@ struct IvfBuilderConfig {
     /// Non-power-of-two dimensions are automatically served by the fixed-round
     /// FHT+Kac rotator. For non-64-multiple dimensions, the builder pads only
     /// to the next multiple of 64.
+    ///
+    /// Rotation mode used by the RaBitQ encoder. Supported values:
+    ///   - "auto": current behavior; power-of-two dimensions use Hadamard,
+    ///     other dimensions use FHT-Kac and fall back to random_matrix.
+    ///   - "fht_kac_rotator" / "fht_kac": force FHT-Kac.
+    ///   - "random_matrix" / "random": force dense random orthogonal rotation.
+    ///   - "hadamard": force Hadamard, valid only for power-of-two dimensions.
+    std::string rotation_mode = "auto";
 };
 
 // ============================================================================

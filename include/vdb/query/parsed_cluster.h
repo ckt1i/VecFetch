@@ -9,6 +9,7 @@
 #include "vdb/common/macros.h"
 #include "vdb/common/types.h"
 #include "vdb/simd/address_decode.h"
+#include "vdb/simd/ip_exrabitq.h"
 #include "vdb/storage/address_column.h"
 
 namespace vdb {
@@ -56,6 +57,7 @@ struct ParsedCluster {
         uint32_t batch_block_id = 0;
         uint32_t abs_bytes_per_lane_dim_block = 0;
         uint8_t magnitude_bits = 0;
+        uint8_t loaded_magnitude_bits = 0;
         bool abs_packed = false;
         RaBitQExDataLayout exdata_layout = RaBitQExDataLayout::kGenericPacked;
         uint32_t batch_block_bytes = 0;
@@ -76,14 +78,6 @@ struct ParsedCluster {
     const uint8_t* fastscan_blocks = nullptr;  // Pointer to first block
     uint32_t fastscan_block_size = 0;          // Bytes per block (packed_codes + norms)
     uint32_t num_fastscan_blocks = 0;          // ceil(num_records / 32)
-    const uint16_t* stage1_envelope_presence_masks = nullptr;
-    const float* stage1_envelope_norm_min = nullptr;
-    const float* stage1_envelope_norm_max = nullptr;
-    uint32_t stage1_envelope_groups_per_block = 0;
-    uint32_t stage1_envelope_block_count = 0;
-    std::vector<uint16_t> stage1_envelope_presence_masks_storage;
-    std::vector<float> stage1_envelope_norm_min_storage;
-    std::vector<float> stage1_envelope_norm_max_storage;
 
     // --- Region 2: ExRaBitQ ---
     const uint8_t* exrabitq_entries = nullptr;  // Pointer to first entry (nullptr if bits=1)
@@ -102,6 +96,7 @@ struct ParsedCluster {
     uint32_t exrabitq_num_batch_blocks = 0;
     uint32_t exrabitq_abs_bytes_per_lane_dim_block = 0;
     uint8_t exrabitq_magnitude_bits = 0;
+    uint8_t exrabitq_loaded_magnitude_bits = 0;
     bool exrabitq_magnitude_packed = false;
     uint8_t rabitq_total_bits = 1;
     uint8_t rabitq_ex_bits = 0;
@@ -116,6 +111,7 @@ struct ParsedCluster {
 
     // --- Existing ---
     uint32_t num_records = 0;
+    Dim dim = 0;
     float epsilon = 0.0f;  // r_max = max(||o-c||) within cluster
     const storage::RawAddressEntryV2* raw_addresses = nullptr;
     uint32_t address_page_size = 0;
@@ -149,14 +145,6 @@ struct ParsedCluster {
         const uint32_t packed_codes_size = fastscan_block_size - 32 * sizeof(float);
         const float* norms = reinterpret_cast<const float*>(block + packed_codes_size);
         return norms[vec_in_block];
-    }
-
-    bool has_stage1_envelope_summary() const {
-        return stage1_envelope_presence_masks != nullptr &&
-               stage1_envelope_norm_min != nullptr &&
-               stage1_envelope_norm_max != nullptr &&
-               stage1_envelope_groups_per_block > 0 &&
-               stage1_envelope_block_count >= num_fastscan_blocks;
     }
 
     ExRaBitQView exrabitq_view(uint32_t vec_idx, Dim dim) const {
@@ -219,13 +207,47 @@ struct ParsedCluster {
         const uint8_t* payload = block + sizeof(uint32_t);
         const uint32_t stored_lanes =
             exrabitq_variable_batch_blocks ? view.valid_count : exrabitq_batch_size;
-        const uint32_t abs_total_bytes =
-            exrabitq_num_dim_blocks * stored_lanes * abs_lane_bytes;
+        uint64_t abs_total_bytes =
+            static_cast<uint64_t>(exrabitq_num_dim_blocks) * stored_lanes * abs_lane_bytes;
+        const uint8_t layout_bits = exrabitq_loaded_magnitude_bits != 0
+            ? exrabitq_loaded_magnitude_bits
+            : exrabitq_magnitude_bits;
+        if (exrabitq_variable_batch_blocks && uses_official_1_plus_n()) {
+            const RaBitQExDataLayout resolved =
+                RaBitQResolveSelectedExDataLayout(rabitq_exdata_layout);
+            if (resolved == RaBitQExDataLayout::kVectorBitMajorTiles && dim != 0) {
+                const uint32_t vector_bytes =
+                    simd::ExRaBitQBitMajorTileVectorBytes(dim, layout_bits);
+                if (vector_bytes == 0) {
+                    return ExRaBitQBatchBlockView{};
+                }
+                abs_total_bytes = static_cast<uint64_t>(stored_lanes) * vector_bytes;
+            } else if (resolved == RaBitQExDataLayout::kTileLaneBitMajor && dim != 0) {
+                const uint32_t batch_bytes =
+                    simd::ExRaBitQTileLaneBitMajorBatchBytes(
+                        dim, layout_bits, stored_lanes);
+                if (batch_bytes == 0) {
+                    return ExRaBitQBatchBlockView{};
+                }
+                abs_total_bytes = batch_bytes;
+            }
+        }
         view.abs_blocks = payload;
-        view.sign_blocks = uses_official_1_plus_n() ? nullptr : payload + abs_total_bytes;
+        const uint64_t sign_total_bytes =
+            uses_official_1_plus_n()
+                ? 0
+                : static_cast<uint64_t>(exrabitq_num_dim_blocks) * stored_lanes *
+                      (exrabitq_dim_block / 8u);
+        view.sign_blocks = uses_official_1_plus_n()
+                               ? nullptr
+                               : payload + static_cast<size_t>(abs_total_bytes);
         const uint32_t factor_count =
             uses_official_1_plus_n() ? stored_lanes * 2u : stored_lanes;
-        if (block_bytes < factor_count * sizeof(float)) {
+        const uint64_t factor_bytes = static_cast<uint64_t>(factor_count) * sizeof(float);
+        if (block_bytes < factor_bytes ||
+            static_cast<uint64_t>(sizeof(uint32_t)) + abs_total_bytes +
+                    sign_total_bytes + factor_bytes >
+                block_bytes) {
             return ExRaBitQBatchBlockView{};
         }
         const float* factors = reinterpret_cast<const float*>(
@@ -238,6 +260,7 @@ struct ParsedCluster {
         }
         view.abs_bytes_per_lane_dim_block = abs_lane_bytes;
         view.magnitude_bits = exrabitq_magnitude_bits;
+        view.loaded_magnitude_bits = layout_bits;
         view.abs_packed = exrabitq_magnitude_packed;
         view.exdata_layout = rabitq_exdata_layout;
         view.batch_block_bytes = block_bytes;

@@ -70,9 +70,6 @@ struct ProbeStats {
     uint32_t stage1_fused_blocks = 0;
     uint32_t stage1_fused_safeout_lanes = 0;
     uint32_t stage1_fused_safein_lanes = 0;
-    uint32_t stage1_envelope_tested_blocks = 0;
-    uint32_t stage1_envelope_skipped_blocks = 0;
-    uint32_t stage1_envelope_safeout_lanes = 0;
     uint64_t stage2_masked_kernel_calls = 0;
     uint64_t stage2_lanes_requested = 0;
     uint64_t stage2_lanes_skipped = 0;
@@ -80,12 +77,13 @@ struct ProbeStats {
     uint64_t stage2_decode_blocks = 0;
     uint64_t stage2_decode_input_bytes = 0;
     uint64_t stage2_decode_output_bytes = 0;
+    uint64_t stage2_active_ex_bits_sum = 0;
+    uint64_t stage2_stored_ex_bits_sum = 0;
     double stage1_ms = 0;
     double stage1_estimate_ms = 0;
     double stage1_mask_ms = 0;
     double stage1_iterate_ms = 0;
     double stage1_classify_ms = 0;
-    double stage1_envelope_ms = 0;
     double stage2_ms = 0;
     double stage2_collect_ms = 0;
     double stage2_kernel_ms = 0;
@@ -116,6 +114,8 @@ class ClusterProber {
     ClusterProber(const ConANN& conann, Dim dim, uint8_t bits);
     ClusterProber(const ConANN& conann, Dim dim, uint8_t code_bits,
                   uint8_t total_bits);
+    ClusterProber(const ConANN& conann, Dim dim, uint8_t code_bits,
+                  uint8_t total_bits, uint8_t active_ex_bits);
     ~ClusterProber();
 
     VDB_DISALLOW_COPY_AND_MOVE(ClusterProber);
@@ -145,7 +145,6 @@ class ClusterProber {
                bool enable_address_decode_simd,
                bool enable_fine_grained_timing,
                bool enable_stage1_safein,
-               bool enable_stage1_block_skip_envelope,
                bool enable_stage2_collect_block_first,
                bool enable_stage2_scatter_batch_classify,
                const std::vector<std::vector<uint32_t>>* false_stats_cluster_members,
@@ -158,6 +157,7 @@ class ClusterProber {
     Dim dim_;
     uint8_t bits_;
     uint8_t total_bits_;
+    uint8_t active_ex_bits_;
     bool has_s2_;
     float margin_s2_divisor_;   // 2^(total_bits-1), precomputed; 1.0 when no S2
     rabitq::RaBitQEstimator estimator_;

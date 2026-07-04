@@ -314,7 +314,8 @@ static bool ResolveRaBitQBuildConfig(int argc, char* argv[],
                      "Invalid --rabitq-exdata-layout: %s "
                      "(expected generic_packed, split1_bitplane, split2_bitplanes, "
                      "split3_2plus1, split3_bitplanes, split3_trimmed_bitplanes, "
-                     "split3_zero_plane_elide, vector_bitmajor_tiles, or selected_direct)\n",
+                     "split3_zero_plane_elide, vector_bitmajor_tiles, "
+                     "tile_lane_bitmajor, or selected_direct)\n",
                      layout_arg.c_str());
         return false;
     }
@@ -773,7 +774,6 @@ struct QueryResult {
     double probe_stage1_mask_ms = 0;
     double probe_stage1_iterate_ms = 0;
     double probe_stage1_classify_only_ms = 0;
-    double probe_stage1_envelope_ms = 0;
     double probe_stage2_ms = 0;
     double probe_stage2_collect_ms = 0;
     double probe_stage2_kernel_ms = 0;
@@ -786,9 +786,6 @@ struct QueryResult {
     uint32_t stage1_fused_blocks = 0;
     uint32_t stage1_fused_safeout_lanes = 0;
     uint32_t stage1_fused_safein_lanes = 0;
-    uint32_t stage1_envelope_tested_blocks = 0;
-    uint32_t stage1_envelope_skipped_blocks = 0;
-    uint32_t stage1_envelope_safeout_lanes = 0;
     uint64_t stage2_masked_kernel_calls = 0;
     uint64_t stage2_lanes_requested = 0;
     uint64_t stage2_lanes_skipped = 0;
@@ -796,6 +793,7 @@ struct QueryResult {
     uint64_t stage2_decode_blocks = 0;
     uint64_t stage2_decode_input_bytes = 0;
     uint64_t stage2_decode_output_bytes = 0;
+    uint64_t stage2_active_ex_bits_sum = 0;
     double probe_classify_ms = 0;
     double probe_submit_ms = 0;
     double probe_submit_prepare_vec_only_ms = 0;
@@ -804,8 +802,6 @@ struct QueryResult {
     double probe_submit_vec_only_emit_ms = 0;
     double probe_submit_pending_slot_alloc_ms = 0;
     double probe_submit_prep_read_ms = 0;
-    double probe_submit_address_sort_ms = 0;
-    uint32_t probe_submit_address_sorted_requests = 0;
     double rerank_cpu_ms = 0;
     double safein_payload_prefetch_ms = 0;
     double candidate_collect_ms = 0;
@@ -911,7 +907,6 @@ struct RoundMetrics {
     double avg_probe_stage1_mask = 0;
     double avg_probe_stage1_iterate = 0;
     double avg_probe_stage1_classify_only = 0;
-    double avg_probe_stage1_envelope = 0;
     double avg_probe_stage2 = 0;
     double avg_probe_stage2_collect = 0;
     double avg_probe_stage2_kernel = 0;
@@ -924,9 +919,6 @@ struct RoundMetrics {
     double avg_stage1_fused_blocks = 0;
     double avg_stage1_fused_safeout_lanes = 0;
     double avg_stage1_fused_safein_lanes = 0;
-    double avg_stage1_envelope_tested_blocks = 0;
-    double avg_stage1_envelope_skipped_blocks = 0;
-    double avg_stage1_envelope_safeout_lanes = 0;
     double avg_stage2_masked_kernel_calls = 0;
     double avg_stage2_lanes_requested = 0;
     double avg_stage2_lanes_skipped = 0;
@@ -935,6 +927,8 @@ struct RoundMetrics {
     double avg_stage2_decode_blocks = 0;
     double avg_stage2_decode_input_bytes = 0;
     double avg_stage2_decode_output_bytes = 0;
+    double avg_stage2_bitplane_lane_work = 0;
+    double avg_stage2_active_ex_bits = 0;
     double avg_probe_classify = 0;
     double avg_probe_submit = 0;
     double avg_probe_submit_prepare_vec_only = 0;
@@ -943,8 +937,6 @@ struct RoundMetrics {
     double avg_probe_submit_vec_only_emit = 0;
     double avg_probe_submit_pending_slot_alloc = 0;
     double avg_probe_submit_prep_read = 0;
-    double avg_probe_submit_address_sort = 0;
-    double avg_probe_submit_address_sorted_requests = 0;
     double avg_rerank_cpu = 0;
     double avg_safein_payload_prefetch = 0;
     double avg_candidate_collect = 0;
@@ -1026,7 +1018,6 @@ struct RoundMetrics {
     double resident_cluster_mem_bytes = 0;
     double resident_parallel_view_build_ms = 0;
     double resident_parallel_view_bytes = 0;
-    double resident_stage1_envelope_bytes = 0;
     double smaps_anon_huge_pages_kib = 0;
     double smaps_file_pmd_mapped_kib = 0;
     double index_total_bytes = 0;
@@ -1048,7 +1039,8 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     const std::vector<int64_t>& qry_ids_data,
     const std::vector<std::vector<int64_t>>& gt_topk,
     const std::vector<std::vector<float>>& gt_dists,
-    bool recall_available) {
+    bool recall_available,
+    const std::unordered_map<int64_t, uint32_t>* image_id_to_row = nullptr) {
     (void)gt_dists;
 
     Log("\n[%s] Querying %u vectors...\n", label, Q);
@@ -1069,9 +1061,32 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
                                        search_cfg.two_level_coarse_super_count,
                                        search_cfg.two_level_coarse_super_factor,
                                        search_cfg.two_level_coarse_budget_factor,
-                                       search_cfg.enable_two_level_coarse_exact_overlap);
+                                       search_cfg.enable_two_level_coarse_exact_overlap,
+                                       search_cfg.two_level_coarse_budget_cap);
         (void)index.PrepareTwoLevelCoarseRouting(search_cfg.nprobe);
     }
+
+    std::vector<std::unordered_set<uint32_t>> truth_row_sets;
+    if (recall_available && image_id_to_row != nullptr &&
+        search_cfg.false_stats_cluster_members != nullptr && !gt_topk.empty()) {
+        truth_row_sets.resize(Q);
+        const uint32_t gt_limit =
+            search_cfg.top_k > 0 ? search_cfg.top_k : std::numeric_limits<uint32_t>::max();
+        const uint32_t gt_rows =
+            std::min<uint32_t>(Q, static_cast<uint32_t>(gt_topk.size()));
+        for (uint32_t qi = 0; qi < gt_rows; ++qi) {
+            const uint32_t gt_k =
+                std::min<uint32_t>(gt_limit, static_cast<uint32_t>(gt_topk[qi].size()));
+            truth_row_sets[qi].reserve(gt_k);
+            for (uint32_t gi = 0; gi < gt_k; ++gi) {
+                auto it = image_id_to_row->find(gt_topk[qi][gi]);
+                if (it != image_id_to_row->end()) {
+                    truth_row_sets[qi].insert(it->second);
+                }
+            }
+        }
+    }
+
     std::unique_ptr<OverlapScheduler> scheduler;
     if (data_reader != nullptr) {
         scheduler = std::make_unique<OverlapScheduler>(
@@ -1084,6 +1099,11 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     std::vector<QueryResult> qresults(Q);
     for (uint32_t qi = 0; qi < Q; ++qi) {
         const float* qvec = queries + static_cast<size_t>(qi) * dim;
+        if (!truth_row_sets.empty() && qi < truth_row_sets.size()) {
+            scheduler->SetFalseStatsTrueTopKRows(&truth_row_sets[qi]);
+        } else {
+            scheduler->SetFalseStatsTrueTopKRows(nullptr);
+        }
         auto results = scheduler->Search(qvec);
 
         QueryResult& qr = qresults[qi];
@@ -1115,7 +1135,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.probe_stage1_mask_ms = results.stats().probe_stage1_mask_ms;
         qr.probe_stage1_iterate_ms = results.stats().probe_stage1_iterate_ms;
         qr.probe_stage1_classify_only_ms = results.stats().probe_stage1_classify_only_ms;
-        qr.probe_stage1_envelope_ms = results.stats().probe_stage1_envelope_ms;
         qr.probe_stage2_ms = results.stats().probe_stage2_ms;
         qr.probe_stage2_collect_ms = results.stats().probe_stage2_collect_ms;
         qr.probe_stage2_kernel_ms = results.stats().probe_stage2_kernel_ms;
@@ -1128,9 +1147,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.stage1_fused_blocks = results.stats().stage1_fused_blocks;
         qr.stage1_fused_safeout_lanes = results.stats().stage1_fused_safeout_lanes;
         qr.stage1_fused_safein_lanes = results.stats().stage1_fused_safein_lanes;
-        qr.stage1_envelope_tested_blocks = results.stats().stage1_envelope_tested_blocks;
-        qr.stage1_envelope_skipped_blocks = results.stats().stage1_envelope_skipped_blocks;
-        qr.stage1_envelope_safeout_lanes = results.stats().stage1_envelope_safeout_lanes;
         qr.stage2_masked_kernel_calls = results.stats().stage2_masked_kernel_calls;
         qr.stage2_lanes_requested = results.stats().stage2_lanes_requested;
         qr.stage2_lanes_skipped = results.stats().stage2_lanes_skipped;
@@ -1138,6 +1154,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.stage2_decode_blocks = results.stats().stage2_decode_blocks;
         qr.stage2_decode_input_bytes = results.stats().stage2_decode_input_bytes;
         qr.stage2_decode_output_bytes = results.stats().stage2_decode_output_bytes;
+        qr.stage2_active_ex_bits_sum = results.stats().stage2_active_ex_bits_sum;
         qr.probe_classify_ms = results.stats().probe_classify_ms;
         qr.probe_submit_ms = results.stats().probe_submit_ms;
         qr.probe_submit_prepare_vec_only_ms =
@@ -1151,10 +1168,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
             results.stats().probe_submit_pending_slot_alloc_ms;
         qr.probe_submit_prep_read_ms =
             results.stats().probe_submit_prep_read_ms;
-        qr.probe_submit_address_sort_ms =
-            results.stats().probe_submit_address_sort_ms;
-        qr.probe_submit_address_sorted_requests =
-            results.stats().probe_submit_address_sorted_requests;
         qr.rerank_cpu_ms = results.stats().rerank_cpu_ms;
         qr.safein_payload_prefetch_ms = results.stats().safein_payload_prefetch_ms;
         qr.candidate_collect_ms = results.stats().candidate_collect_ms;
@@ -1339,7 +1352,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_probe_prepare_quant_lut = 0;
     double sum_probe_stage1 = 0, sum_probe_stage1_estimate = 0;
     double sum_probe_stage1_mask = 0, sum_probe_stage1_iterate = 0;
-    double sum_probe_stage1_classify_only = 0, sum_probe_stage1_envelope = 0;
+    double sum_probe_stage1_classify_only = 0;
     double sum_probe_stage2 = 0;
     double sum_probe_stage2_collect = 0;
     double sum_probe_stage2_kernel = 0;
@@ -1352,9 +1365,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_stage1_fused_blocks = 0;
     double sum_stage1_fused_safeout_lanes = 0;
     double sum_stage1_fused_safein_lanes = 0;
-    double sum_stage1_envelope_tested_blocks = 0;
-    double sum_stage1_envelope_skipped_blocks = 0;
-    double sum_stage1_envelope_safeout_lanes = 0;
     double sum_stage2_masked_kernel_calls = 0;
     double sum_stage2_lanes_requested = 0;
     double sum_stage2_lanes_skipped = 0;
@@ -1362,6 +1372,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_stage2_decode_blocks = 0;
     double sum_stage2_decode_input_bytes = 0;
     double sum_stage2_decode_output_bytes = 0;
+    double sum_stage2_active_ex_bits_sum = 0;
     double sum_probe_classify = 0, sum_probe_submit = 0;
     double sum_probe_submit_prepare_vec_only = 0;
     double sum_probe_submit_prepare_all = 0;
@@ -1369,8 +1380,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_probe_submit_vec_only_emit = 0;
     double sum_probe_submit_pending_slot_alloc = 0;
     double sum_probe_submit_prep_read = 0;
-    double sum_probe_submit_address_sort = 0;
-    double sum_probe_submit_address_sorted_requests = 0;
     double sum_rerank_cpu = 0;
     double sum_safein_payload_prefetch = 0, sum_candidate_collect = 0;
     double sum_pool_vector_read = 0, sum_rerank_compute = 0;
@@ -1457,7 +1466,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_probe_stage1_mask += qresults[qi].probe_stage1_mask_ms;
         sum_probe_stage1_iterate += qresults[qi].probe_stage1_iterate_ms;
         sum_probe_stage1_classify_only += qresults[qi].probe_stage1_classify_only_ms;
-        sum_probe_stage1_envelope += qresults[qi].probe_stage1_envelope_ms;
         sum_probe_stage2 += qresults[qi].probe_stage2_ms;
         sum_probe_stage2_collect += qresults[qi].probe_stage2_collect_ms;
         sum_probe_stage2_kernel += qresults[qi].probe_stage2_kernel_ms;
@@ -1470,12 +1478,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_stage1_fused_blocks += qresults[qi].stage1_fused_blocks;
         sum_stage1_fused_safeout_lanes += qresults[qi].stage1_fused_safeout_lanes;
         sum_stage1_fused_safein_lanes += qresults[qi].stage1_fused_safein_lanes;
-        sum_stage1_envelope_tested_blocks +=
-            qresults[qi].stage1_envelope_tested_blocks;
-        sum_stage1_envelope_skipped_blocks +=
-            qresults[qi].stage1_envelope_skipped_blocks;
-        sum_stage1_envelope_safeout_lanes +=
-            qresults[qi].stage1_envelope_safeout_lanes;
         sum_stage2_masked_kernel_calls += qresults[qi].stage2_masked_kernel_calls;
         sum_stage2_lanes_requested += qresults[qi].stage2_lanes_requested;
         sum_stage2_lanes_skipped += qresults[qi].stage2_lanes_skipped;
@@ -1483,6 +1485,7 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_stage2_decode_blocks += qresults[qi].stage2_decode_blocks;
         sum_stage2_decode_input_bytes += qresults[qi].stage2_decode_input_bytes;
         sum_stage2_decode_output_bytes += qresults[qi].stage2_decode_output_bytes;
+        sum_stage2_active_ex_bits_sum += qresults[qi].stage2_active_ex_bits_sum;
         sum_probe_classify += qresults[qi].probe_classify_ms;
         sum_probe_submit += qresults[qi].probe_submit_ms;
         sum_probe_submit_prepare_vec_only +=
@@ -1496,10 +1499,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
             qresults[qi].probe_submit_pending_slot_alloc_ms;
         sum_probe_submit_prep_read +=
             qresults[qi].probe_submit_prep_read_ms;
-        sum_probe_submit_address_sort +=
-            qresults[qi].probe_submit_address_sort_ms;
-        sum_probe_submit_address_sorted_requests +=
-            qresults[qi].probe_submit_address_sorted_requests;
         sum_rerank_cpu += qresults[qi].rerank_cpu_ms;
         sum_safein_payload_prefetch += qresults[qi].safein_payload_prefetch_ms;
         sum_candidate_collect += qresults[qi].candidate_collect_ms;
@@ -1591,7 +1590,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_probe_stage1_mask = sum_probe_stage1_mask / Q;
     m.avg_probe_stage1_iterate = sum_probe_stage1_iterate / Q;
     m.avg_probe_stage1_classify_only = sum_probe_stage1_classify_only / Q;
-    m.avg_probe_stage1_envelope = sum_probe_stage1_envelope / Q;
     m.avg_probe_stage2 = sum_probe_stage2 / Q;
     m.avg_probe_stage2_collect = sum_probe_stage2_collect / Q;
     m.avg_probe_stage2_kernel = sum_probe_stage2_kernel / Q;
@@ -1604,9 +1602,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_stage1_fused_blocks = sum_stage1_fused_blocks / Q;
     m.avg_stage1_fused_safeout_lanes = sum_stage1_fused_safeout_lanes / Q;
     m.avg_stage1_fused_safein_lanes = sum_stage1_fused_safein_lanes / Q;
-    m.avg_stage1_envelope_tested_blocks = sum_stage1_envelope_tested_blocks / Q;
-    m.avg_stage1_envelope_skipped_blocks = sum_stage1_envelope_skipped_blocks / Q;
-    m.avg_stage1_envelope_safeout_lanes = sum_stage1_envelope_safeout_lanes / Q;
     m.avg_stage2_masked_kernel_calls = sum_stage2_masked_kernel_calls / Q;
     m.avg_stage2_lanes_requested = sum_stage2_lanes_requested / Q;
     m.avg_stage2_lanes_skipped = sum_stage2_lanes_skipped / Q;
@@ -1617,6 +1612,10 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_stage2_decode_blocks = sum_stage2_decode_blocks / Q;
     m.avg_stage2_decode_input_bytes = sum_stage2_decode_input_bytes / Q;
     m.avg_stage2_decode_output_bytes = sum_stage2_decode_output_bytes / Q;
+    m.avg_stage2_bitplane_lane_work = sum_stage2_active_ex_bits_sum / Q;
+    m.avg_stage2_active_ex_bits = sum_stage2_lanes_requested > 0.0
+        ? sum_stage2_active_ex_bits_sum / sum_stage2_lanes_requested
+        : 0.0;
     m.avg_probe_classify = sum_probe_classify / Q;
     m.avg_probe_submit = sum_probe_submit / Q;
     m.avg_probe_submit_prepare_vec_only = sum_probe_submit_prepare_vec_only / Q;
@@ -1626,9 +1625,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_probe_submit_pending_slot_alloc =
         sum_probe_submit_pending_slot_alloc / Q;
     m.avg_probe_submit_prep_read = sum_probe_submit_prep_read / Q;
-    m.avg_probe_submit_address_sort = sum_probe_submit_address_sort / Q;
-    m.avg_probe_submit_address_sorted_requests =
-        sum_probe_submit_address_sorted_requests / Q;
     m.avg_rerank_cpu = sum_rerank_cpu / Q;
     m.avg_safein_payload_prefetch = sum_safein_payload_prefetch / Q;
     m.avg_candidate_collect = sum_candidate_collect / Q;
@@ -1734,8 +1730,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         index.segment().resident_parallel_view_build_ms();
     m.resident_parallel_view_bytes =
         static_cast<double>(index.segment().resident_parallel_view_bytes());
-    m.resident_stage1_envelope_bytes =
-        static_cast<double>(index.segment().resident_stage1_envelope_bytes());
     const SmapsRollupStats smaps = ReadSmapsRollupStats();
     m.smaps_anon_huge_pages_kib =
         static_cast<double>(smaps.anon_huge_pages_kib);
@@ -1922,6 +1916,8 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--dynamic-safein-defer-until-ready", 0);
     int arg_dynamic_safein_defer_max_candidates =
         GetIntArg(argc, argv, "--dynamic-safein-defer-max-candidates", 0);
+    int arg_safein_as_vec_only =
+        GetIntArg(argc, argv, "--safein-as-vec-only", 0);
     int arg_non_safeout_candidate_budget =
         GetIntArg(argc, argv, "--non-safeout-candidate-budget", 0);
     int arg_safein_all_threshold_bytes =
@@ -1950,6 +1946,8 @@ int main(int argc, char* argv[]) {
     int arg_seed       = GetIntArg(argc, argv, "--seed", 42);
     int arg_page_size  = GetIntArg(argc, argv, "--page-size", 4096);
     int arg_p_for_dk   = GetIntArg(argc, argv, "--p-for-dk", 99);
+    std::string arg_rotation_mode =
+        GetStringArg(argc, argv, "--rotation-mode", "auto");
     std::string arg_coarse_builder =
         GetStringArg(argc, argv, "--coarse-builder", "auto");
     const bool invoked_as_build_index =
@@ -1971,10 +1969,6 @@ int main(int argc, char* argv[]) {
     int arg_io_queue_depth = GetIntArg(argc, argv, "--io-queue-depth", 64);
     int arg_fixed_vec_buffer_count =
         GetIntArg(argc, argv, "--fixed-vec-buffer-count", 0);
-    int arg_vec_read_address_sort =
-        GetIntArg(argc, argv, "--vec-read-address-sort", 0);
-    int arg_vec_read_address_sort_window =
-        GetIntArg(argc, argv, "--vec-read-address-sort-window", 64);
     int arg_cluster_submit_reserve =
         GetIntArg(argc, argv, "--cluster-submit-reserve", 8);
     std::string arg_submission_mode =
@@ -2018,14 +2012,14 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--two-level-coarse-super-factor", 0);
     int arg_two_level_coarse_budget_factor =
         GetIntArg(argc, argv, "--two-level-coarse-budget-factor", 8);
+    int arg_two_level_coarse_budget_cap =
+        GetIntArg(argc, argv, "--two-level-coarse-budget-cap", 0);
     int arg_two_level_coarse_exact_overlap =
         GetIntArg(argc, argv, "--two-level-coarse-exact-overlap", 0);
     int arg_stage2_block_first =
         GetIntArg(argc, argv, "--stage2-block-first", 1);
     int arg_stage2_batch_classify =
         GetIntArg(argc, argv, "--stage2-batch-classify", 1);
-    int arg_stage1_block_skip_envelope =
-        GetIntArg(argc, argv, "--stage1-block-skip-envelope", 0);
     bool arg_cold = HasFlag(argc, argv, "--cold");
     bool arg_direct_io = HasFlag(argc, argv, "--direct-io");
     bool arg_iopoll = HasFlag(argc, argv, "--iopoll");
@@ -2094,6 +2088,12 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
                      "Invalid --dynamic-safeout: %d (expected 0 or 1)\n",
                      arg_dynamic_safeout);
+        return 1;
+    }
+    if (arg_safein_as_vec_only != 0 && arg_safein_as_vec_only != 1) {
+        std::fprintf(stderr,
+                     "Invalid --safein-as-vec-only: %d (expected 0 or 1)\n",
+                     arg_safein_as_vec_only);
         return 1;
     }
 
@@ -2189,13 +2189,6 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr,
                      "Invalid --enable-stage1-safein: %d (expected 0 or 1)\n",
                      arg_enable_stage1_safein);
-        return 1;
-    }
-    if (arg_stage1_block_skip_envelope != 0 &&
-        arg_stage1_block_skip_envelope != 1) {
-        std::fprintf(stderr,
-                     "Invalid --stage1-block-skip-envelope: %d (expected 0 or 1)\n",
-                     arg_stage1_block_skip_envelope);
         return 1;
     }
     if (arg_safein_dk_samples_only != 0 && arg_safein_dk_samples_only != 1) {
@@ -2422,6 +2415,7 @@ int main(int argc, char* argv[]) {
         }
         cfg.max_iterations = static_cast<uint32_t>(arg_max_iter);
         cfg.seed = static_cast<uint64_t>(arg_seed);
+        cfg.rotation_mode = arg_rotation_mode;
         cfg.metric = "cosine";
         cfg.faiss_train_size = 100000;
         cfg.faiss_niter = static_cast<uint32_t>(arg_max_iter == 20 ? 0 : arg_max_iter);
@@ -2873,6 +2867,7 @@ int main(int argc, char* argv[]) {
         (arg_dynamic_safein_defer_until_ready != 0);
     search_cfg.dynamic_safein_defer_max_candidates =
         static_cast<uint32_t>(std::max(arg_dynamic_safein_defer_max_candidates, 0));
+    search_cfg.safein_as_vec_only = (arg_safein_as_vec_only != 0);
     search_cfg.non_safeout_candidate_budget =
         static_cast<uint32_t>(arg_non_safeout_candidate_budget);
     search_cfg.safein_all_threshold =
@@ -2892,10 +2887,6 @@ int main(int argc, char* argv[]) {
         (arg_hotpath_detailed_timing != 0);
     search_cfg.submit_batch_size = static_cast<uint32_t>(
         GetIntArg(argc, argv, "--submit-batch", 32));
-    search_cfg.enable_vec_read_address_sort =
-        (arg_vec_read_address_sort != 0);
-    search_cfg.vec_read_address_sort_window =
-        static_cast<uint32_t>(std::max(arg_vec_read_address_sort_window, 0));
     search_cfg.enable_online_submit_tuning = (arg_submit_online != 0);
     search_cfg.submit_ema_alpha = arg_submit_ema_alpha;
     search_cfg.enable_address_decode_simd = (arg_address_decode_simd != 0);
@@ -2913,11 +2904,11 @@ int main(int argc, char* argv[]) {
         static_cast<uint32_t>(std::max(0, arg_two_level_coarse_super_factor));
     search_cfg.two_level_coarse_budget_factor =
         static_cast<uint32_t>(std::max(1, arg_two_level_coarse_budget_factor));
+    search_cfg.two_level_coarse_budget_cap =
+        static_cast<uint32_t>(std::max(0, arg_two_level_coarse_budget_cap));
     search_cfg.enable_two_level_coarse_exact_overlap =
         (arg_two_level_coarse_exact_overlap != 0);
     search_cfg.enable_stage1_safein = (arg_enable_stage1_safein != 0);
-    search_cfg.enable_stage1_block_skip_envelope =
-        (arg_stage1_block_skip_envelope != 0);
     search_cfg.enable_stage2_collect_block_first = (arg_stage2_block_first != 0);
     search_cfg.enable_stage2_scatter_batch_classify = (arg_stage2_batch_classify != 0);
     if (has_safein_epsilon_override) {
@@ -2969,7 +2960,6 @@ int main(int argc, char* argv[]) {
                          "resident_file_buffer_bytes,resident_code_storage_bytes,"
                          "resident_decoded_address_bytes,resident_raw_address_bytes,"
                          "resident_parsed_address_duplicate_bytes,resident_cluster_mem_bytes,"
-                         "resident_stage1_envelope_bytes,"
                          "logical_dim,effective_dim,padding_mode,rotation_mode,"
                          "avg_prepare_rotation_ms,avg_prepare_quant_lut_ms,index_total_bytes\n";
         }
@@ -2987,7 +2977,7 @@ int main(int argc, char* argv[]) {
                 auto [wq, wm] = RunQueryRound(
                     "SWEEP-WARMUP", index, cluster_reader, data_reader.get(), search_cfg,
                     qry_emb.data.data(), sw_warmup, dim, qry_ids_vec, gt_topk, gt_dists,
-                    !skip_gt);
+                    !skip_gt, &image_id_to_row);
                 (void)wq; (void)wm;
             }
 
@@ -2995,7 +2985,7 @@ int main(int argc, char* argv[]) {
             auto [sq, sm] = RunQueryRound(
                 "SWEEP-MEASURE", index, cluster_reader, data_reader.get(), search_cfg,
                 qry_emb.data.data(), sw_measure, dim, qry_ids_vec, gt_topk, gt_dists,
-                !skip_gt);
+                !skip_gt, &image_id_to_row);
 
             double safe_out_rate = (sm.avg_probed > 0)
                 ? sm.avg_safe_out / sm.avg_probed * 100.0 : 0.0;
@@ -3040,7 +3030,6 @@ int main(int argc, char* argv[]) {
                       << sm.resident_raw_address_bytes << ","
                       << sm.resident_parsed_address_duplicate_bytes << ","
                       << sm.resident_cluster_mem_bytes << ","
-                      << sm.resident_stage1_envelope_bytes << ","
                       << index.logical_dim() << ","
                       << index.effective_dim() << ","
                       << "\"" << index.padding_mode() << "\"" << ","
@@ -3058,7 +3047,8 @@ int main(int argc, char* argv[]) {
     // Single round: fixed nprobe + dynamic SafeOut
     auto [qresults, metrics] = RunQueryRound(
         arg_cold ? "HOT" : "FIXED", index, cluster_reader, data_reader.get(), search_cfg,
-        qry_emb.data.data(), Q, dim, qry_ids_vec, gt_topk, gt_dists, !skip_gt);
+        qry_emb.data.data(), Q, dim, qry_ids_vec, gt_topk, gt_dists, !skip_gt,
+        &image_id_to_row);
 
     // ================================================================
     // Phase D2: Cold-read round (optional)
@@ -3086,7 +3076,8 @@ int main(int argc, char* argv[]) {
 
         auto [cold_qresults, cm] = RunQueryRound(
             "COLD", index, cluster_reader, data_reader.get(), search_cfg,
-            qry_emb.data.data(), Q, dim, qry_ids_vec, gt_topk, gt_dists, !skip_gt);
+            qry_emb.data.data(), Q, dim, qry_ids_vec, gt_topk, gt_dists, !skip_gt,
+            &image_id_to_row);
         cold_metrics = cm;
 
         Log("\n╔══════════════════════════════════════════════════════════╗\n");
@@ -3184,11 +3175,6 @@ int main(int argc, char* argv[]) {
     Log("  stage1_estimate=%.3f ms  stage1_mask=%.3f ms  stage1_iterate=%.3f ms  stage1_classify=%.3f ms\n",
         metrics.avg_probe_stage1_estimate, metrics.avg_probe_stage1_mask,
         metrics.avg_probe_stage1_iterate, metrics.avg_probe_stage1_classify_only);
-    Log("  stage1_envelope=%.3f ms  envelope_tested_blocks=%.1f  skipped_blocks=%.1f  skipped_lanes=%.1f\n",
-        metrics.avg_probe_stage1_envelope,
-        metrics.avg_stage1_envelope_tested_blocks,
-        metrics.avg_stage1_envelope_skipped_blocks,
-        metrics.avg_stage1_envelope_safeout_lanes);
     Log("  stage1_fused_blocks=%.1f  fused_safeout_lanes=%.1f  fused_safein_lanes=%.1f\n",
         metrics.avg_stage1_fused_blocks,
         metrics.avg_stage1_fused_safeout_lanes,
@@ -3291,6 +3277,7 @@ int main(int argc, char* argv[]) {
         f << "    " << JInt("nlist", arg_nlist) << ",\n";
         f << "    " << JInt("max_iterations", arg_max_iter) << ",\n";
         f << "    " << JInt("seed", arg_seed) << ",\n";
+        f << "    " << JStr("requested_rotation_mode", arg_rotation_mode) << ",\n";
         f << "    " << JInt("rabitq_bits",
                             arg_rabitq_config.effective_total_bits()) << ",\n";
         f << "    " << JInt("rabitq_total_bits",
@@ -3352,14 +3339,14 @@ int main(int argc, char* argv[]) {
                              search_cfg.dynamic_safein_defer_until_ready) << ",\n";
         f << "    " << JInt("dynamic_safein_defer_max_candidates",
                             search_cfg.dynamic_safein_defer_max_candidates) << ",\n";
+        f << "    " << JBool("safein_as_vec_only",
+                             search_cfg.safein_as_vec_only) << ",\n";
         f << "    " << JInt("non_safeout_candidate_budget",
                             search_cfg.non_safeout_candidate_budget) << ",\n";
         f << "    " << JInt("safein_all_threshold_bytes",
                             search_cfg.safein_all_threshold) << ",\n";
         f << "    " << JInt("io_queue_depth", search_cfg.io_queue_depth) << ",\n";
         f << "    " << JInt("fixed_vec_buffer_count", search_cfg.fixed_vec_buffer_count) << ",\n";
-        f << "    " << JBool("enable_vec_read_address_sort", search_cfg.enable_vec_read_address_sort) << ",\n";
-        f << "    " << JInt("vec_read_address_sort_window", search_cfg.vec_read_address_sort_window) << ",\n";
         f << "    " << JInt("cluster_submit_reserve", search_cfg.cluster_submit_reserve) << ",\n";
         f << "    " << JBool("iopoll_requested", arg_iopoll) << ",\n";
         f << "    " << JBool("sqpoll_requested", arg_sqpoll) << ",\n";
@@ -3377,10 +3364,9 @@ int main(int argc, char* argv[]) {
         f << "    " << JInt("two_level_coarse_super_count", search_cfg.two_level_coarse_super_count) << ",\n";
         f << "    " << JInt("two_level_coarse_super_factor", search_cfg.two_level_coarse_super_factor) << ",\n";
         f << "    " << JInt("two_level_coarse_budget_factor", search_cfg.two_level_coarse_budget_factor) << ",\n";
+        f << "    " << JInt("two_level_coarse_budget_cap", search_cfg.two_level_coarse_budget_cap) << ",\n";
         f << "    " << JBool("enable_two_level_coarse_exact_overlap", search_cfg.enable_two_level_coarse_exact_overlap) << ",\n";
         f << "    " << JBool("enable_stage1_safein", search_cfg.enable_stage1_safein) << ",\n";
-        f << "    " << JBool("enable_stage1_block_skip_envelope",
-                             search_cfg.enable_stage1_block_skip_envelope) << ",\n";
         f << "    " << JBool("enable_stage2_scatter_batch_classify",
                              search_cfg.enable_stage2_scatter_batch_classify) << ",\n";
         f << "    " << JBool("enable_online_submit_tuning", search_cfg.enable_online_submit_tuning) << ",\n";
@@ -3478,6 +3464,20 @@ int main(int argc, char* argv[]) {
                             RaBitQFormatKey(index.segment().rabitq_config())) << ",\n";
         f << "    " << JStr("rabitq_validation_mode",
                             RaBitQValidationModeName(arg_rabitq_validation_mode)) << ",\n";
+        f << "    " << JBool("enable_two_level_coarse_routing",
+                             search_cfg.enable_two_level_coarse_routing) << ",\n";
+        f << "    " << JInt("two_level_coarse_threshold",
+                            search_cfg.two_level_coarse_threshold) << ",\n";
+        f << "    " << JInt("two_level_coarse_super_count",
+                            search_cfg.two_level_coarse_super_count) << ",\n";
+        f << "    " << JInt("two_level_coarse_super_factor",
+                            search_cfg.two_level_coarse_super_factor) << ",\n";
+        f << "    " << JInt("two_level_coarse_budget_factor",
+                            search_cfg.two_level_coarse_budget_factor) << ",\n";
+        f << "    " << JInt("two_level_coarse_budget_cap",
+                            search_cfg.two_level_coarse_budget_cap) << ",\n";
+        f << "    " << JBool("enable_two_level_coarse_exact_overlap",
+                             search_cfg.enable_two_level_coarse_exact_overlap) << ",\n";
         f << "    " << JNum("loaded_eps_ip", loaded_eps_ip) << ",\n";
         f << "    " << JNum("loaded_d_k", loaded_d_k) << ",\n";
         f << "    " << JNum("runtime_eps_ip", index.conann().epsilon()) << ",\n";
@@ -3547,7 +3547,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("resident_cluster_mem_bytes", metrics.resident_cluster_mem_bytes) << ",\n";
         f << "    " << JNum("resident_parallel_view_build_ms", metrics.resident_parallel_view_build_ms) << ",\n";
         f << "    " << JNum("resident_parallel_view_bytes", metrics.resident_parallel_view_bytes) << ",\n";
-        f << "    " << JNum("resident_stage1_envelope_bytes", metrics.resident_stage1_envelope_bytes) << ",\n";
         f << "    " << JNum("smaps_anon_huge_pages_kib", metrics.smaps_anon_huge_pages_kib) << ",\n";
         f << "    " << JNum("smaps_file_pmd_mapped_kib", metrics.smaps_file_pmd_mapped_kib) << ",\n";
         f << "    " << JNum("index_total_bytes", metrics.index_total_bytes) << ",\n";
@@ -3602,7 +3601,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_probe_stage1_mask_ms", metrics.avg_probe_stage1_mask) << ",\n";
         f << "    " << JNum("avg_probe_stage1_iterate_ms", metrics.avg_probe_stage1_iterate) << ",\n";
         f << "    " << JNum("avg_probe_stage1_classify_only_ms", metrics.avg_probe_stage1_classify_only) << ",\n";
-        f << "    " << JNum("avg_probe_stage1_envelope_ms", metrics.avg_probe_stage1_envelope) << ",\n";
         f << "    " << JNum("avg_probe_stage2_ms", metrics.avg_probe_stage2) << ",\n";
         f << "    " << JNum("avg_probe_stage2_collect_ms", metrics.avg_probe_stage2_collect) << ",\n";
         f << "    " << JNum("avg_probe_stage2_kernel_ms", metrics.avg_probe_stage2_kernel) << ",\n";
@@ -3615,9 +3613,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_stage1_fused_blocks", metrics.avg_stage1_fused_blocks) << ",\n";
         f << "    " << JNum("avg_stage1_fused_safeout_lanes", metrics.avg_stage1_fused_safeout_lanes) << ",\n";
         f << "    " << JNum("avg_stage1_fused_safein_lanes", metrics.avg_stage1_fused_safein_lanes) << ",\n";
-        f << "    " << JNum("avg_stage1_envelope_tested_blocks", metrics.avg_stage1_envelope_tested_blocks) << ",\n";
-        f << "    " << JNum("avg_stage1_envelope_skipped_blocks", metrics.avg_stage1_envelope_skipped_blocks) << ",\n";
-        f << "    " << JNum("avg_stage1_envelope_safeout_lanes", metrics.avg_stage1_envelope_safeout_lanes) << ",\n";
         f << "    " << JNum("avg_stage2_masked_kernel_calls", metrics.avg_stage2_masked_kernel_calls) << ",\n";
         f << "    " << JNum("avg_stage2_lanes_requested", metrics.avg_stage2_lanes_requested) << ",\n";
         f << "    " << JNum("avg_stage2_lanes_skipped", metrics.avg_stage2_lanes_skipped) << ",\n";
@@ -3626,6 +3621,10 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_stage2_decode_blocks", metrics.avg_stage2_decode_blocks) << ",\n";
         f << "    " << JNum("avg_stage2_decode_input_bytes", metrics.avg_stage2_decode_input_bytes) << ",\n";
         f << "    " << JNum("avg_stage2_decode_output_bytes", metrics.avg_stage2_decode_output_bytes) << ",\n";
+        f << "    " << JNum("avg_stage2_bitplane_lane_work",
+                            metrics.avg_stage2_bitplane_lane_work) << ",\n";
+        f << "    " << JNum("avg_stage2_active_ex_bits",
+                            metrics.avg_stage2_active_ex_bits) << ",\n";
         f << "    " << JNum("avg_probe_classify_ms", metrics.avg_probe_classify) << ",\n";
         f << "    " << JNum("avg_probe_submit_ms", metrics.avg_probe_submit) << ",\n";
         f << "    " << JNum("avg_probe_submit_prepare_vec_only_ms", metrics.avg_probe_submit_prepare_vec_only) << ",\n";
@@ -3634,8 +3633,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_probe_submit_vec_only_emit_ms", metrics.avg_probe_submit_vec_only_emit) << ",\n";
         f << "    " << JNum("avg_probe_submit_pending_slot_alloc_ms", metrics.avg_probe_submit_pending_slot_alloc) << ",\n";
         f << "    " << JNum("avg_probe_submit_prep_read_ms", metrics.avg_probe_submit_prep_read) << ",\n";
-        f << "    " << JNum("avg_probe_submit_address_sort_ms", metrics.avg_probe_submit_address_sort) << ",\n";
-        f << "    " << JNum("avg_probe_submit_address_sorted_requests", metrics.avg_probe_submit_address_sorted_requests) << ",\n";
         f << "    " << JNum("avg_rerank_cpu_ms", metrics.avg_rerank_cpu) << ",\n";
         f << "    " << JNum("avg_safein_payload_prefetch_ms", metrics.avg_safein_payload_prefetch) << ",\n";
         f << "    " << JNum("avg_candidate_collect_ms", metrics.avg_candidate_collect) << ",\n";
@@ -3742,7 +3739,6 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("probe_stage1_mask_ms", qr.probe_stage1_mask_ms) << ",\n";
             f << "      " << JNum("probe_stage1_iterate_ms", qr.probe_stage1_iterate_ms) << ",\n";
             f << "      " << JNum("probe_stage1_classify_only_ms", qr.probe_stage1_classify_only_ms) << ",\n";
-            f << "      " << JNum("probe_stage1_envelope_ms", qr.probe_stage1_envelope_ms) << ",\n";
             f << "      " << JNum("probe_stage2_ms", qr.probe_stage2_ms) << ",\n";
             f << "      " << JNum("probe_stage2_collect_ms", qr.probe_stage2_collect_ms) << ",\n";
             f << "      " << JNum("probe_stage2_kernel_ms", qr.probe_stage2_kernel_ms) << ",\n";
@@ -3755,9 +3751,6 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("stage1_fused_blocks", qr.stage1_fused_blocks) << ",\n";
             f << "      " << JNum("stage1_fused_safeout_lanes", qr.stage1_fused_safeout_lanes) << ",\n";
             f << "      " << JNum("stage1_fused_safein_lanes", qr.stage1_fused_safein_lanes) << ",\n";
-            f << "      " << JNum("stage1_envelope_tested_blocks", qr.stage1_envelope_tested_blocks) << ",\n";
-            f << "      " << JNum("stage1_envelope_skipped_blocks", qr.stage1_envelope_skipped_blocks) << ",\n";
-            f << "      " << JNum("stage1_envelope_safeout_lanes", qr.stage1_envelope_safeout_lanes) << ",\n";
             f << "      " << JNum("stage2_masked_kernel_calls", qr.stage2_masked_kernel_calls) << ",\n";
             f << "      " << JNum("stage2_lanes_requested", qr.stage2_lanes_requested) << ",\n";
             f << "      " << JNum("stage2_lanes_skipped", qr.stage2_lanes_skipped) << ",\n";
@@ -3765,6 +3758,8 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("stage2_decode_blocks", qr.stage2_decode_blocks) << ",\n";
             f << "      " << JNum("stage2_decode_input_bytes", qr.stage2_decode_input_bytes) << ",\n";
             f << "      " << JNum("stage2_decode_output_bytes", qr.stage2_decode_output_bytes) << ",\n";
+            f << "      " << JNum("stage2_active_ex_bits_sum",
+                                  qr.stage2_active_ex_bits_sum) << ",\n";
             f << "      " << JNum("probe_classify_ms", qr.probe_classify_ms) << ",\n";
             f << "      " << JNum("probe_submit_ms", qr.probe_submit_ms) << ",\n";
             f << "      " << JNum("probe_submit_prepare_vec_only_ms", qr.probe_submit_prepare_vec_only_ms) << ",\n";
@@ -3773,8 +3768,6 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("probe_submit_vec_only_emit_ms", qr.probe_submit_vec_only_emit_ms) << ",\n";
             f << "      " << JNum("probe_submit_pending_slot_alloc_ms", qr.probe_submit_pending_slot_alloc_ms) << ",\n";
             f << "      " << JNum("probe_submit_prep_read_ms", qr.probe_submit_prep_read_ms) << ",\n";
-            f << "      " << JNum("probe_submit_address_sort_ms", qr.probe_submit_address_sort_ms) << ",\n";
-            f << "      " << JNum("probe_submit_address_sorted_requests", qr.probe_submit_address_sorted_requests) << ",\n";
             f << "      " << JNum("safein_payload_prefetch_ms", qr.safein_payload_prefetch_ms) << ",\n";
             f << "      " << JNum("candidate_collect_ms", qr.candidate_collect_ms) << ",\n";
             f << "      " << JNum("pool_vector_read_ms", qr.pool_vector_read_ms) << ",\n";

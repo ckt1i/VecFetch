@@ -440,6 +440,10 @@ TEST(TypesTest, RaBitQExDataLayoutParser) {
   EXPECT_EQ(layout, RaBitQExDataLayout::kVectorBitplanesMicroBatch);
   EXPECT_TRUE(ParseRaBitQExDataLayout("cacheline_tiles", &layout));
   EXPECT_EQ(layout, RaBitQExDataLayout::kVectorBitMajorTiles);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("tile_lane_bitmajor", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kTileLaneBitMajor);
+  EXPECT_TRUE(ParseRaBitQExDataLayout("batch_bitmajor_tiles", &layout));
+  EXPECT_EQ(layout, RaBitQExDataLayout::kTileLaneBitMajor);
   EXPECT_TRUE(ParseRaBitQExDataLayout("official_4bit_nibble", &layout));
   EXPECT_EQ(layout, RaBitQExDataLayout::kVectorNibble4);
   EXPECT_TRUE(ParseRaBitQExDataLayout("official_2bit", &layout));
@@ -471,6 +475,36 @@ TEST(TypesTest, RaBitQExDataLayoutParser) {
   EXPECT_EQ(RaBitQDefaultOfficialExDataLayoutForBits(4),
             RaBitQExDataLayout::kVectorNibble4);
   EXPECT_FALSE(ParseRaBitQExDataLayout("packed3", &layout));
+}
+
+TEST(TypesTest, RaBitQExDataLayoutActiveBitsSupport) {
+  EXPECT_TRUE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kSplit1Bitplane));
+  EXPECT_TRUE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kSplit2Bitplanes));
+  EXPECT_TRUE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kSplit3Bitplanes));
+  EXPECT_TRUE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kSplit3TrimmedBitplanes));
+  EXPECT_TRUE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kVectorBitplanes));
+  EXPECT_TRUE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kVectorBitMajorTiles));
+  EXPECT_TRUE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kTileLaneBitMajor));
+
+  EXPECT_FALSE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kSplit3TwoPlusOne));
+  EXPECT_FALSE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kSplit3ZeroPlaneElide));
+  EXPECT_FALSE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kVectorNibble4));
+  EXPECT_FALSE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kVector2Bit));
+  EXPECT_FALSE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kSmallLane4Bitplanes));
+  EXPECT_FALSE(RaBitQExDataLayoutSupportsActiveExBits(
+      RaBitQExDataLayout::kSmallLane2Bitplanes));
 }
 
 }  // namespace

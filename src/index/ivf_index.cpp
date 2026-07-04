@@ -263,13 +263,18 @@ uint32_t IvfIndex::DefaultTwoLevelSuperCount(uint32_t nlist,
 
 uint32_t IvfIndex::DefaultTwoLevelCandidateBudget(uint32_t nlist,
                                                   uint32_t nprobe,
-                                                  uint32_t budget_factor) {
+                                                  uint32_t budget_factor,
+                                                  uint32_t budget_cap) {
     if (nlist == 0 || nprobe == 0) return 0;
     const uint64_t budget =
         static_cast<uint64_t>(std::max<uint32_t>(1, budget_factor)) *
         static_cast<uint64_t>(nprobe);
-    return std::min<uint32_t>(
+    uint32_t resolved = std::min<uint32_t>(
         nlist, static_cast<uint32_t>(std::min<uint64_t>(budget, nlist)));
+    if (budget_cap > 0) {
+        resolved = std::min<uint32_t>(resolved, std::min<uint32_t>(budget_cap, nlist));
+    }
+    return std::max<uint32_t>(std::min<uint32_t>(nprobe, nlist), resolved);
 }
 
 void IvfIndex::SetTwoLevelCoarseRouting(bool enabled,
@@ -277,7 +282,8 @@ void IvfIndex::SetTwoLevelCoarseRouting(bool enabled,
                                         uint32_t super_count,
                                         uint32_t super_factor,
                                         uint32_t budget_factor,
-                                        bool exact_overlap) {
+                                        bool exact_overlap,
+                                        uint32_t budget_cap) {
     const uint32_t sanitized_threshold = std::max<uint32_t>(1, threshold);
     const uint32_t sanitized_super_factor = super_factor;
     const uint32_t sanitized_budget = std::max<uint32_t>(1, budget_factor);
@@ -285,7 +291,8 @@ void IvfIndex::SetTwoLevelCoarseRouting(bool enabled,
         two_level_coarse_threshold_ != sanitized_threshold ||
         two_level_coarse_super_count_ != super_count ||
         two_level_coarse_super_factor_ != sanitized_super_factor ||
-        two_level_coarse_budget_factor_ != sanitized_budget) {
+        two_level_coarse_budget_factor_ != sanitized_budget ||
+        two_level_coarse_budget_cap_ != budget_cap) {
         coarse_hierarchy_ = HierarchicalCoarseIndex{};
     }
     use_two_level_coarse_routing_ = enabled;
@@ -293,6 +300,7 @@ void IvfIndex::SetTwoLevelCoarseRouting(bool enabled,
     two_level_coarse_super_count_ = super_count;
     two_level_coarse_super_factor_ = sanitized_super_factor;
     two_level_coarse_budget_factor_ = sanitized_budget;
+    two_level_coarse_budget_cap_ = budget_cap;
     two_level_coarse_exact_overlap_ = exact_overlap;
 }
 
@@ -305,7 +313,7 @@ uint32_t IvfIndex::ResolveTwoLevelSuperCount(uint32_t nprobe) const {
 
 uint32_t IvfIndex::ResolveTwoLevelCandidateBudget(uint32_t nprobe) const {
     return DefaultTwoLevelCandidateBudget(
-        nlist_, nprobe, two_level_coarse_budget_factor_);
+        nlist_, nprobe, two_level_coarse_budget_factor_, two_level_coarse_budget_cap_);
 }
 
 bool IvfIndex::PrepareTwoLevelCoarseRouting(uint32_t nprobe) const {

@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "vdb/common/status.h"
@@ -38,6 +40,10 @@ class OverlapScheduler {
     /// Execute a single query and return results.
     SearchResults Search(const float* query_vec);
 
+    /// Update query-local truth rows used only by SafeIn/SafeOut false-stat
+    /// accounting. This does not change candidate generation or ranking.
+    void SetFalseStatsTrueTopKRows(const std::unordered_set<uint32_t>* rows);
+
  private:
     friend class ::OverlapSchedulerTest;
 
@@ -51,7 +57,7 @@ class OverlapScheduler {
 
     struct PendingIO {
         enum class Type : uint8_t {
-            VEC_ONLY, VEC_ALL, PAYLOAD
+            VEC_ONLY, VEC_ALL, PAYLOAD, SPEC_VEC_ONLY
         };
         Type type;
         AddressEntry addr;          // VEC_ONLY / VEC_ALL / PAYLOAD
@@ -84,9 +90,10 @@ class OverlapScheduler {
     uint32_t AllocatePendingSlot(PendingIO io, uint8_t* buffer,
                                  PendingBufferCleanup cleanup,
                                  uint16_t fixed_buffer_index = 0);
-    uint32_t AllocateVectorOnlyPendingSlot(AddressEntry addr, uint8_t* buffer,
-                                           PendingBufferCleanup cleanup,
-                                           uint16_t fixed_buffer_index = 0);
+    uint32_t AllocateVectorOnlyPendingSlot(
+        AddressEntry addr, uint8_t* buffer, PendingBufferCleanup cleanup,
+        uint16_t fixed_buffer_index = 0,
+        PendingIO::Type type = PendingIO::Type::VEC_ONLY);
     PendingSlot* GetPendingSlot(uint64_t slot_token);
     void ReleasePendingSlot(uint32_t slot_id);
     void CleanupPendingSlot(PendingSlot& slot);
@@ -174,6 +181,11 @@ class OverlapScheduler {
         AddressEntry addr;
     };
 
+    struct SpeculativeVector {
+        AddressEntry addr;
+        AlignedBufPtr storage;
+    };
+
     struct DeferredSafeInPlan {
         AddressEntry addr;
         float rank_key = std::numeric_limits<float>::infinity();
@@ -202,11 +214,14 @@ class OverlapScheduler {
     SubmitScratch submit_scratch_;
     std::deque<ReadPlanEntry> pending_all_plans_;
     std::vector<VecOnlyReadPlan> pending_vec_only_plans_;
+    std::vector<VecOnlyReadPlan> pending_spec_vec_plans_;
     std::vector<DeferredSafeInPlan> deferred_safein_plans_;
     std::vector<BudgetedReadPlan> budgeted_read_plan_heap_;
-    std::vector<uint64_t> emitted_budgeted_offsets_;
-    uint32_t budgeted_early_submitted_count_ = 0;
     size_t pending_vec_only_head_ = 0;
+    size_t pending_spec_vec_head_ = 0;
+    std::unordered_set<uint64_t> speculative_prefetch_offsets_;
+    std::unordered_set<uint64_t> speculative_final_offsets_;
+    std::unordered_map<uint64_t, SpeculativeVector> speculative_vector_cache_;
 
     uint32_t vec_bytes_;
     uint32_t aligned_vec_bytes_ = 0;
@@ -256,6 +271,8 @@ class OverlapScheduler {
     float dynamic_safein_last_frontier_ = std::numeric_limits<float>::infinity();
     float dynamic_safein_current_frontier_ = std::numeric_limits<float>::infinity();
     float dynamic_safein_current_threshold_ = std::numeric_limits<float>::infinity();
+    uint32_t safein_prefetch_scheduled_count_ = 0;
+    uint64_t safein_prefetch_scheduled_bytes_ = 0;
 
     bool AddSafeOutFrontierEstimate(const EstimateHeapEntry& estimate);
     bool AddSafeInFrontierEstimate(float lower_bound);
@@ -271,15 +288,27 @@ class OverlapScheduler {
     void RecordSafeInPrefetchDecision(SearchContext& ctx,
                                       bool has_truth,
                                       bool is_true_topk) const;
+    bool ShouldScheduleSafeInFullPrefetch(SearchContext& ctx,
+                                          AddressEntry addr);
     void FlushDeferredSafeInPlans(SearchContext& ctx, float threshold,
                                   bool force);
     bool UseNonSafeOutCandidateBudget() const;
     void AddBudgetedReadPlan(SearchContext& ctx, const ReadPlanEntry& plan,
                              float rank_key);
-    void MaterializeBudgetedReadPlans(SearchContext& ctx);
-    void EmitTopBudgetedReadPlans(SearchContext& ctx, uint32_t max_count);
-    bool BudgetedPlanAlreadyEmitted(uint64_t offset) const;
-    void MarkBudgetedPlanEmitted(uint64_t offset);
+    void MaybeScheduleBudgetedPrefetch(SearchContext& ctx,
+                                       const ReadPlanEntry& plan);
+    bool TryUseSpeculativeVector(SearchContext& ctx,
+                                 class RerankConsumer& reranker,
+                                 AddressEntry addr);
+    void CacheSpeculativeVector(SearchContext& ctx, AddressEntry addr,
+                                const uint8_t* vec);
+    void FinalizeBudgetedPrefetchStats(SearchContext& ctx);
+    void MaterializeBudgetedReadPlans(SearchContext& ctx,
+                                      class RerankConsumer& reranker);
+    bool UseSeparateRecordStore() const;
+    const SeparateRecordLocation& LookupSeparateRecordOrAbort(
+        SearchContext& ctx, AddressEntry addr) const;
+    uint64_t SeparateVectorOffset(const SeparateRecordLocation& loc) const;
 
     // Stage 2 ExRaBitQ re-classification
     float margin_s2_divisor_ = 1.0f;  // 2^(total_bits-1), precomputed

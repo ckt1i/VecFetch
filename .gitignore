@@ -85,7 +85,6 @@ profile_output/
 **/online_per_query.csv
 **/summary.json
 **/aggressive*/
-**/dynamic*/
 **/msmarco*/
 **/blend0_check/
 **/frontier_apply_validation/

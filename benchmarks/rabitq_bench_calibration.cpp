@@ -3,12 +3,18 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <random>
 
 #include "vdb/io/vecs_reader.h"
 #include "vdb/rabitq/rabitq_estimator.h"
 #include "vdb/simd/distance_l2.h"
+#include "vdb/storage/pack_codes.h"
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace vdb {
 namespace bench {
@@ -84,6 +90,143 @@ float EstimateRabitqCalibrationDistance(const RaBitQConfig& config,
         return estimator.EstimateDistanceMultiBit(pq, code);
     }
     return estimator.EstimateDistanceAccurate(pq, code);
+}
+
+float CalibrateFastScanPerClusterEpsilon(
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const float* vectors,
+    const std::vector<float>& centroids,
+    const rabitq::RotationMatrix& rotation,
+    Dim dim,
+    uint32_t max_samples_per_cluster,
+    float percentile,
+    uint64_t seed,
+    float d_k,
+    const RaBitQConfig& config,
+    const std::vector<uint32_t>* cluster_subset,
+    EpsilonCalibrationStats* stats) {
+    const float lo = 0.1f * d_k;
+    const float hi = 10.0f * d_k;
+    const uint32_t packed_sz = storage::FastScanPackedSize(dim);
+
+    std::vector<uint32_t> cluster_ids;
+    if (cluster_subset != nullptr && !cluster_subset->empty()) {
+        cluster_ids.reserve(cluster_subset->size());
+        for (uint32_t cid : *cluster_subset) {
+            if (cid < cluster_members.size() && cid < all_codes.size()) {
+                cluster_ids.push_back(cid);
+            }
+        }
+    } else {
+        cluster_ids.resize(cluster_members.size());
+        std::iota(cluster_ids.begin(), cluster_ids.end(), 0u);
+    }
+
+#ifdef _OPENMP
+    const int nt = omp_get_max_threads();
+#else
+    const int nt = 1;
+#endif
+    std::vector<std::vector<float>> tl_errors(static_cast<size_t>(nt));
+    std::vector<uint64_t> tl_attempts(static_cast<size_t>(nt), 0);
+
+#pragma omp parallel
+    {
+#ifdef _OPENMP
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        auto& local_errors = tl_errors[static_cast<size_t>(tid)];
+        rabitq::RaBitQEstimator estimator(dim, config.active_code_bits());
+        std::vector<uint8_t> packed_codes(packed_sz, 0);
+        std::vector<uint32_t> sample_ids;
+        rabitq::ClusterPreparedScratch scratch;
+        rabitq::PreparedQuery pq;
+        alignas(64) float fs_dists[32];
+        float block_norms[32];
+
+#pragma omp for schedule(dynamic, 16)
+        for (int idx = 0; idx < static_cast<int>(cluster_ids.size()); ++idx) {
+            const uint32_t cid = cluster_ids[static_cast<size_t>(idx)];
+            const auto& members = cluster_members[cid];
+            const auto& codes = all_codes[cid];
+            const uint32_t n_members = static_cast<uint32_t>(members.size());
+            if (n_members < 2) continue;
+
+            uint32_t n_queries = max_samples_per_cluster;
+            if (n_members < 2 * max_samples_per_cluster) {
+                n_queries = std::max(n_members / 2, 1u);
+            }
+            n_queries = std::min(n_queries, n_members);
+
+            sample_ids.resize(n_members);
+            std::iota(sample_ids.begin(), sample_ids.end(), 0u);
+            std::mt19937 rng(static_cast<uint32_t>(seed + cid));
+            std::shuffle(sample_ids.begin(), sample_ids.end(), rng);
+
+            const float* centroid =
+                centroids.data() + static_cast<size_t>(cid) * dim;
+            for (uint32_t qi = 0; qi < n_queries; ++qi) {
+                const uint32_t local_q = sample_ids[qi];
+                const float* query =
+                    vectors + static_cast<size_t>(members[local_q]) * dim;
+                estimator.PrepareQueryInto(query, centroid, rotation, &pq, &scratch);
+
+                for (uint32_t t_base = 0; t_base < n_members; t_base += 32) {
+                    const uint32_t block_count =
+                        std::min(32u, n_members - t_base);
+                    storage::PackSignBitsForFastScan(
+                        &codes[t_base], block_count, dim, packed_codes.data());
+                    for (uint32_t j = 0; j < block_count; ++j) {
+                        block_norms[j] = codes[t_base + j].norm;
+                    }
+                    estimator.EstimateDistanceFastScan(
+                        pq, packed_codes.data(), block_norms, block_count,
+                        fs_dists);
+
+                    for (uint32_t j = 0; j < block_count; ++j) {
+                        const uint32_t target_local = t_base + j;
+                        if (target_local == local_q) continue;
+                        ++tl_attempts[static_cast<size_t>(tid)];
+                        const uint32_t target_global = members[target_local];
+                        const float true_dist = simd::L2Sqr(
+                            query,
+                            vectors + static_cast<size_t>(target_global) * dim,
+                            dim);
+                        if (true_dist < lo || true_dist > hi) continue;
+                        const float denom =
+                            2.0f * block_norms[j] * pq.norm_qc;
+                        if (denom > 1e-10f) {
+                            local_errors.push_back(
+                                std::abs(fs_dists[j] - true_dist) / denom);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::vector<float> normalized_errors;
+    size_t total_errors = 0;
+    uint64_t attempts = 0;
+    for (const auto& local : tl_errors) total_errors += local.size();
+    for (uint64_t local_attempts : tl_attempts) attempts += local_attempts;
+    normalized_errors.reserve(total_errors);
+    for (auto& local : tl_errors) {
+        normalized_errors.insert(normalized_errors.end(),
+                                 local.begin(), local.end());
+    }
+    if (stats != nullptr) {
+        stats->valid_error_count =
+            static_cast<uint32_t>(std::min<size_t>(
+                normalized_errors.size(), std::numeric_limits<uint32_t>::max()));
+        stats->attempted_pairs =
+            static_cast<uint32_t>(std::min<uint64_t>(
+                attempts, std::numeric_limits<uint32_t>::max()));
+    }
+    return UpperPercentile(std::move(normalized_errors), percentile);
 }
 
 }  // namespace
@@ -550,49 +693,10 @@ float CalibrateSplitEpsilon(
         }
         return UpperPercentile(std::move(errors), percentile);
     }
-    const auto run_cluster = [&](uint32_t cid) {
-        const auto& members = cluster_members[cid];
-        const auto& codes = all_codes[cid];
-        const uint32_t n_members = static_cast<uint32_t>(members.size());
-        if (n_members < 2) return;
-        uint32_t n_queries = max_samples_per_cluster;
-        if (n_members < 2 * max_samples_per_cluster) {
-            n_queries = std::max(n_members / 2, 1u);
-        }
-        n_queries = std::min(n_queries, n_members);
-        sample_ids.resize(n_members);
-        std::iota(sample_ids.begin(), sample_ids.end(), 0u);
-        std::mt19937 rng(static_cast<uint32_t>(seed + cid));
-        std::shuffle(sample_ids.begin(), sample_ids.end(), rng);
-        const float* centroid = centroids.data() + static_cast<size_t>(cid) * dim;
-        rabitq::PreparedQuery pq;
-        rabitq::ClusterPreparedScratch scratch;
-        for (uint32_t qi = 0; qi < n_queries; ++qi) {
-            const uint32_t local_q = sample_ids[qi];
-            const float* query = vectors + static_cast<size_t>(members[local_q]) * dim;
-            estimator.PrepareQueryInto(query, centroid, rotation, &pq, &scratch);
-            for (uint32_t j = 0; j < n_members; ++j) {
-                if (j == local_q) continue;
-                record_error(pq, codes[j], query,
-                             vectors + static_cast<size_t>(members[j]) * dim);
-            }
-        }
-    };
-    if (use_subset) {
-        for (uint32_t cid : *cluster_subset) {
-            if (cid >= cluster_members.size()) continue;
-            run_cluster(cid);
-        }
-    } else {
-        for (uint32_t cid = 0; cid < cluster_members.size(); ++cid) {
-            run_cluster(cid);
-        }
-    }
-    if (stats != nullptr) {
-        stats->valid_error_count = static_cast<uint32_t>(errors.size());
-        stats->attempted_pairs = static_cast<uint32_t>(errors.size());
-    }
-    return UpperPercentile(std::move(errors), percentile);
+    return CalibrateFastScanPerClusterEpsilon(
+        all_codes, cluster_members, vectors, centroids, rotation, dim,
+        max_samples_per_cluster, percentile, seed, d_k, config,
+        cluster_subset, stats);
 }
 
 const char* EpsilonSamplingModeName(EpsilonSamplingMode mode) {

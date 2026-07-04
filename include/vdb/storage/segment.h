@@ -134,12 +134,16 @@ class Segment {
             cluster_id, std::move(block_buf), block_size, out);
     }
 
-    Status PreloadAllClusters() {
-        return clu_reader_.PreloadAllClusters();
+    Status PreloadAllClusters(uint8_t resident_ex_bits = 0) {
+        return clu_reader_.PreloadAllClusters(resident_ex_bits);
     }
 
     bool resident_preload_enabled() const {
         return clu_reader_.resident_preload_enabled();
+    }
+
+    uint8_t resident_loaded_ex_bits() const {
+        return clu_reader_.resident_loaded_ex_bits();
     }
 
     uint64_t resident_preload_bytes() const {
@@ -181,9 +185,6 @@ class Segment {
     }
     double resident_parallel_view_build_ms() const {
         return clu_reader_.resident_parallel_view_build_ms();
-    }
-    uint64_t resident_stage1_envelope_bytes() const {
-        return clu_reader_.resident_stage1_envelope_bytes();
     }
 
     const ClusterStoreReader::ResidentClusterView* GetResidentClusterView(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -19,6 +20,21 @@ enum class SubmissionMode : uint8_t {
 enum class DynamicSafeInMode : uint8_t {
     Static = 0,
     Frontier = 1,
+};
+
+struct SeparateRecordLocation {
+    uint64_t row_id = 0;
+    uint64_t payload_offset = 0;
+    uint32_t payload_bytes = 0;
+};
+
+using SeparateRecordMap = std::unordered_map<uint64_t, SeparateRecordLocation>;
+
+struct SeparateRecordStoreConfig {
+    bool enabled = false;
+    int vector_fd = -1;
+    int payload_fd = -1;
+    const SeparateRecordMap* address_map = nullptr;
 };
 
 struct SearchConfig {
@@ -51,6 +67,22 @@ struct SearchConfig {
     uint32_t dynamic_safein_defer_initial_clusters = 0;
     bool dynamic_safein_defer_until_ready = false;
     uint32_t dynamic_safein_defer_max_candidates = 0;
+    // Ablation mode: keep SafeIn classification/frontier statistics, but force
+    // candidates that would normally issue full-record VEC_ALL prefetches to
+    // use VEC_ONLY verification instead. Final top-k payload materialization is
+    // unchanged.
+    bool safein_as_vec_only = false;
+
+    // Optional query-level guardrails for SafeIn full-record prefetch.
+    // 0 keeps the legacy unlimited behavior. When either limit is exceeded,
+    // the candidate is downgraded to VEC_ONLY verification; final top-k
+    // payload materialization remains unchanged.
+    uint32_t safein_prefetch_max_count = 0;
+    uint64_t safein_prefetch_max_bytes = 0;
+    // When non-zero, each data-submit flush emits at most this many SafeIn
+    // full-record reads before giving VEC_ONLY reads a chance. Remaining
+    // full-record reads are still emitted in the same flush if capacity remains.
+    uint32_t safein_prefetch_emit_quantum = 0;
 
     // Submit batching: submit when pending vec requests reach N.
     // `0` preserves the legacy "submit on pressure/final drain" behavior.
@@ -60,12 +92,7 @@ struct SearchConfig {
     uint32_t submit_batch_min = 16;
     uint32_t submit_batch_max = 48;
     uint32_t fixed_vec_buffer_count = 0;
-    bool enable_vec_read_address_sort = false;
-    uint32_t vec_read_address_sort_window = 64;
-    bool enable_budgeted_early_submit = false;
-    uint32_t budgeted_early_submit_interval_clusters = 32;
-    uint32_t budgeted_early_submit_count = 64;
-    uint32_t budgeted_early_submit_max = 128;
+    bool serial_data_drains = false;  // Benchmark-only: disable probe/I/O overlap.
 
     bool enable_address_decode_simd = true;
     bool enable_rerank_batched_distance_simd = true;
@@ -76,17 +103,29 @@ struct SearchConfig {
     uint32_t two_level_coarse_super_count = 0;
     uint32_t two_level_coarse_super_factor = 0;
     uint32_t two_level_coarse_budget_factor = 8;
+    uint32_t two_level_coarse_budget_cap = 0;
     bool enable_two_level_coarse_exact_overlap = false;
     bool enable_stage1_safein = true;
-    bool enable_stage1_block_skip_envelope = false;
     bool enable_stage2_collect_block_first = true;
     bool enable_stage2_scatter_batch_classify = true;
+    bool rabitq_active_ex_bits_set = false;
+    uint8_t rabitq_active_ex_bits = 0;
     float safein_epsilon_override = -1.0f;
     float safeout_epsilon_override = -1.0f;
 
     // Optional cap for non-SafeOut candidates. When non-zero, the scheduler
     // keeps only the best estimated candidates for vector verification.
     uint32_t non_safeout_candidate_budget = 0;
+
+    // Optional speculative raw-vector prefetch for budgeted queries. The final
+    // rerank budget remains non_safeout_candidate_budget; prefetched vectors
+    // are only used if their candidate is selected into the final budget.
+    uint32_t budgeted_prefetch_limit = 0;
+
+    // Benchmark-only No Combine mode. Candidate generation and cluster-resident
+    // codes still use the source index, but raw-vector reads and payload reads
+    // are redirected through a separated row-id address map.
+    SeparateRecordStoreConfig separate_record_store;
 
     // Optional benchmark-only truth metadata for per-stage false classification
     // counters. cluster_members maps cluster-local vector offsets to original
@@ -113,6 +152,10 @@ struct SearchStats {
     uint32_t vec_only_read_requests = 0;
     uint32_t all_read_requests = 0;
     uint32_t payload_read_requests = 0;
+    uint32_t separate_store_lookup_misses = 0;
+    uint64_t vec_only_read_bytes = 0;
+    uint64_t all_read_bytes = 0;
+    uint64_t payload_read_bytes = 0;
     uint32_t fixed_vec_buffer_hits = 0;
     uint32_t fixed_vec_buffer_misses = 0;
     uint32_t total_candidate_batches = 0;
@@ -137,6 +180,10 @@ struct SearchStats {
     uint32_t safein_prefetch_true_topk = 0;
     uint32_t safein_prefetch_false = 0;
     uint32_t safein_prefetch_unknown = 0;
+    uint32_t safein_prefetch_considered = 0;
+    uint32_t safein_prefetch_skipped_count_limit = 0;
+    uint32_t safein_prefetch_skipped_byte_limit = 0;
+    uint64_t safein_prefetch_scheduled_bytes = 0;
     uint32_t total_stage2_block_lookups = 0;
     uint32_t total_stage2_block_reuses = 0;
     uint32_t duplicate_candidates = 0;
@@ -147,7 +194,16 @@ struct SearchStats {
     uint32_t candidate_budget_seen = 0;
     uint32_t candidate_budget_selected = 0;
     uint32_t candidate_budget_dropped = 0;
-    uint32_t budgeted_early_submitted_candidates = 0;
+    uint32_t budgeted_prefetch_considered = 0;
+    uint32_t budgeted_prefetch_scheduled = 0;
+    uint32_t budgeted_prefetch_duplicates = 0;
+    uint32_t budgeted_prefetch_skipped_limit = 0;
+    uint32_t budgeted_prefetch_completed = 0;
+    uint32_t budgeted_prefetch_cache_hits = 0;
+    uint32_t budgeted_prefetch_inflight_uses = 0;
+    uint32_t budgeted_prefetch_used = 0;
+    uint32_t budgeted_prefetch_wasted = 0;
+    uint64_t budgeted_prefetch_read_bytes = 0;
     double coarse_select_ms = 0;
     double coarse_score_ms = 0;
     double coarse_topn_ms = 0;
@@ -172,7 +228,6 @@ struct SearchStats {
     double probe_stage1_mask_ms = 0;
     double probe_stage1_iterate_ms = 0;
     double probe_stage1_classify_only_ms = 0;
-    double probe_stage1_envelope_ms = 0;
     double probe_stage2_ms = 0;
     double probe_stage2_collect_ms = 0;
     double probe_stage2_kernel_ms = 0;
@@ -185,9 +240,6 @@ struct SearchStats {
     uint32_t stage1_fused_blocks = 0;
     uint32_t stage1_fused_safeout_lanes = 0;
     uint32_t stage1_fused_safein_lanes = 0;
-    uint32_t stage1_envelope_tested_blocks = 0;
-    uint32_t stage1_envelope_skipped_blocks = 0;
-    uint32_t stage1_envelope_safeout_lanes = 0;
     uint64_t stage2_masked_kernel_calls = 0;
     uint64_t stage2_lanes_requested = 0;
     uint64_t stage2_lanes_skipped = 0;
@@ -195,6 +247,8 @@ struct SearchStats {
     uint64_t stage2_decode_blocks = 0;
     uint64_t stage2_decode_input_bytes = 0;
     uint64_t stage2_decode_output_bytes = 0;
+    uint64_t stage2_active_ex_bits_sum = 0;
+    uint64_t stage2_stored_ex_bits_sum = 0;
     double probe_classify_ms = 0;
     double probe_submit_ms = 0;
     double probe_submit_prepare_vec_only_ms = 0;
@@ -203,8 +257,6 @@ struct SearchStats {
     double probe_submit_vec_only_emit_ms = 0;
     double probe_submit_pending_slot_alloc_ms = 0;
     double probe_submit_prep_read_ms = 0;
-    double probe_submit_address_sort_ms = 0;
-    uint32_t probe_submit_address_sorted_requests = 0;
     double rerank_time_ms = 0;
     double rerank_cpu_ms = 0;
     double total_time_ms = 0;

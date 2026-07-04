@@ -680,6 +680,69 @@ TEST_F(IvfBuilderTest, FhtKacRotatorBuildAndOpen_768D_NoPadding) {
     EXPECT_FALSE(idx.uses_padded_hadamard());
 }
 
+TEST_F(IvfBuilderTest, ForcedRandomRotatorBuildAndOpen_192D) {
+    constexpr uint32_t N = 96;
+    constexpr Dim dim = 192;
+    constexpr uint32_t nlist = 4;
+
+    auto vecs = GenerateVectors(N, dim, 5151);
+
+    IvfBuilderConfig cfg;
+    cfg.nlist = nlist;
+    cfg.max_iterations = 5;
+    cfg.seed = 5151;
+    cfg.rabitq = {1, 64, 5.75f};
+    cfg.calibration_samples = 8;
+    cfg.calibration_topk = 4;
+    cfg.page_size = 1;
+    cfg.rotation_mode = "random_matrix";
+
+    IvfBuilder builder(cfg);
+    auto s = builder.Build(vecs.data(), N, dim, test_dir_);
+    ASSERT_TRUE(s.ok()) << s.message();
+
+    EXPECT_EQ(builder.logical_dim(), dim);
+    EXPECT_EQ(builder.effective_dim(), dim);
+    EXPECT_EQ(builder.padding_mode(), "none");
+    EXPECT_EQ(builder.rotation_mode(), "random_matrix");
+    EXPECT_FALSE(fs::exists(test_dir_ + "/rotated_centroids.bin"));
+
+    const std::string sidecar = ReadFileToString(test_dir_ + "/build_metadata.json");
+    EXPECT_NE(sidecar.find("\"requested_rotation_mode\": \"random_matrix\""),
+              std::string::npos);
+    EXPECT_NE(sidecar.find("\"rotation_mode\": \"random_matrix\""),
+              std::string::npos);
+
+    IvfIndex idx;
+    ASSERT_TRUE(idx.Open(test_dir_).ok());
+    EXPECT_EQ(idx.logical_dim(), dim);
+    EXPECT_EQ(idx.effective_dim(), dim);
+    EXPECT_EQ(idx.rotation_mode(), "random_matrix");
+    EXPECT_FALSE(idx.used_hadamard());
+}
+
+TEST_F(IvfBuilderTest, ForcedHadamardRejectsNonPowerOfTwoDim) {
+    constexpr uint32_t N = 96;
+    constexpr Dim dim = 192;
+
+    auto vecs = GenerateVectors(N, dim, 5252);
+
+    IvfBuilderConfig cfg;
+    cfg.nlist = 4;
+    cfg.max_iterations = 5;
+    cfg.seed = 5252;
+    cfg.rabitq = {1, 64, 5.75f};
+    cfg.calibration_samples = 8;
+    cfg.calibration_topk = 4;
+    cfg.page_size = 1;
+    cfg.rotation_mode = "hadamard";
+
+    IvfBuilder builder(cfg);
+    auto s = builder.Build(vecs.data(), N, dim, test_dir_);
+    EXPECT_FALSE(s.ok());
+    EXPECT_NE(s.message().find("power-of-two"), std::string::npos);
+}
+
 TEST_F(IvfBuilderTest, OpenRejectsLegacyBlockedHadamardMetadata) {
     constexpr uint32_t N = 96;
     constexpr Dim dim = 768;

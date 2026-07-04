@@ -8,6 +8,8 @@
 namespace vdb {
 namespace simd {
 
+constexpr uint8_t kUseStoredExBits = 0xFF;
+
 struct IPExRaBitQBatchPackedSignCompactTiming {
     double sign_flip_ms = 0;
     double abs_fma_ms = 0;
@@ -76,6 +78,22 @@ bool ExRaBitQPackOfficialBitMajorTiles(const uint8_t* VDB_RESTRICT decoded,
 bool ExRaBitQUnpackOfficialBitMajorTiles(const uint8_t* VDB_RESTRICT packed,
                                          uint32_t count, uint8_t bits,
                                          uint8_t* VDB_RESTRICT decoded);
+
+/// Batch-tiled variant of the bit-major layout. Each batch block is stored as
+/// [tile][bit][lane][tile_dims / 8], enabling a query tile to be reused across
+/// all requested lanes and allowing active_bits < stored_bits to skip higher
+/// bitplanes.
+uint32_t ExRaBitQTileLaneBitMajorBatchBytes(uint32_t dim, uint8_t bits,
+                                            uint32_t valid_count);
+
+bool ExRaBitQPackOfficialTileLaneBitMajor(
+    const uint8_t* const* VDB_RESTRICT decoded_lanes, uint32_t valid_count,
+    uint32_t dim, uint8_t bits, uint8_t* VDB_RESTRICT packed,
+    uint32_t packed_bytes);
+
+bool ExRaBitQUnpackOfficialTileLaneBitMajor(
+    const uint8_t* VDB_RESTRICT packed, uint32_t valid_count, uint32_t lane_id,
+    uint32_t dim, uint8_t bits, uint8_t* VDB_RESTRICT decoded);
 
 /// Compute the signed inner product for ExRaBitQ Stage 2:
 ///
@@ -170,13 +188,15 @@ void IPOfficialRaBitQBatchCompactDirectBitplanesMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
-    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr,
+    uint8_t active_bits = kUseStoredExBits);
 
 void IPOfficialRaBitQBatchCompactDirectBitplanesStridedMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t stored_lanes, uint32_t lane_mask, uint32_t valid_count,
     Dim dim, uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
-    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr,
+    uint8_t active_bits = kUseStoredExBits);
 
 /// Mask-aware official ExData kernel over lane-major vector bitplane layout.
 /// `compact_blocks` layout is [valid_count][num_dim_blocks][ceil(dim_block * bits / 8)].
@@ -184,7 +204,8 @@ void IPOfficialRaBitQBatchCompactVectorBitplanesMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
-    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr,
+    uint8_t active_bits = kUseStoredExBits);
 
 /// Same storage contract as IPOfficialRaBitQBatchCompactVectorBitplanesMasked,
 /// but prefetches the next requested lane record before computing the current
@@ -193,7 +214,8 @@ void IPOfficialRaBitQBatchCompactVectorBitplanesPrefetchMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
-    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr,
+    uint8_t active_bits = kUseStoredExBits);
 
 /// Same storage contract as IPOfficialRaBitQBatchCompactVectorBitplanesMasked,
 /// but processes requested lanes in small survivor chunks so each query block is
@@ -202,7 +224,8 @@ void IPOfficialRaBitQBatchCompactVectorBitplanesMicroBatchMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
-    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr,
+    uint8_t active_bits = kUseStoredExBits);
 
 /// Mask-aware official ExData kernel over lane-major bit-major tile layout.
 /// `compact_blocks` layout is [valid_count][tile][bit][tile_dims / 8], where
@@ -211,6 +234,36 @@ void IPOfficialRaBitQBatchCompactVectorBitMajorTilesMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr,
+    uint8_t active_bits = kUseStoredExBits);
+
+/// Mask-aware official ExData kernel over batch-tiled bit-major layout.
+/// `compact_blocks` layout is [tile][bit][lane][tile_dims / 8].
+void IPOfficialRaBitQBatchCompactTileLaneBitMajorMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr,
+    uint8_t active_bits = kUseStoredExBits);
+
+/// Computes one zero-based bit-plane delta over batch-tiled bit-major layout.
+/// Adds `(1 << bit_id) * sum_i query[i] * bit_id(code[i])` to out_ip_ex for
+/// each selected lane. This is intended for progressive Stage2 evaluation,
+/// where callers maintain the accumulator and only add newly needed planes.
+void IPOfficialRaBitQBatchCompactTileLaneBitMajorBitDeltaMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint8_t bit_id, uint32_t lane_mask, uint32_t valid_count,
+    Dim dim, uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
+
+/// Computes a contiguous bit-plane delta range over batch-tiled bit-major
+/// layout. Adds `sum_{b in range} (1 << b) * dot(query, bit_b(code))` to
+/// out_ip_ex. The current optimized path supports one- or two-bit ranges.
+void IPOfficialRaBitQBatchCompactTileLaneBitMajorBitRangeDeltaMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint8_t first_bit, uint8_t bit_count, uint32_t lane_mask,
+    uint32_t valid_count, Dim dim, uint32_t dim_block,
+    float* VDB_RESTRICT out_ip_ex,
     IPExRaBitQBatchPackedSignCompactTiming* timing = nullptr);
 
 /// Mask-aware official ExData kernel over 4-lane subgroup bitplane layout.

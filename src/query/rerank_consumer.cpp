@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_set>
+#include <utility>
 
 #include "vdb/common/distance.h"
 #include "vdb/simd/rerank_distance.h"
@@ -77,6 +78,13 @@ void RerankConsumer::ResetVectorChunks() {
 void RerankConsumer::ConsumeVec(uint8_t* buf, AddressEntry addr) {
     buffered_candidates_.push_back(
         BufferedCandidate{addr, AllocateVectorCopy(buf)});
+    ctx_.stats().buffered_candidates++;
+}
+
+void RerankConsumer::ConsumeOwnedVec(AlignedBufPtr buf, AddressEntry addr) {
+    const float* vec = reinterpret_cast<const float*>(buf.get());
+    owned_vector_buffers_.push_back(std::move(buf));
+    buffered_candidates_.push_back(BufferedCandidate{addr, vec});
     ctx_.stats().buffered_candidates++;
 }
 

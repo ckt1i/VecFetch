@@ -2,11 +2,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
+#include <random>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "vdb/rabitq/rabitq_estimator.h"
 #include "vdb/rabitq/rabitq_rotation.h"
+#include "vdb/simd/distance_l2.h"
+#include "vdb/storage/pack_codes.h"
 
 namespace vdb {
 namespace bench {
@@ -53,6 +58,88 @@ struct ToyCalibrationData {
         return out;
     }
 };
+
+float UpperPercentileForTest(std::vector<float> values, float percentile) {
+    if (values.empty()) return 0.0f;
+    std::sort(values.begin(), values.end());
+    const float findex = percentile * static_cast<float>(values.size() - 1);
+    const auto idx = static_cast<size_t>(
+        std::min(findex, static_cast<float>(values.size() - 1)));
+    return values[idx];
+}
+
+float ManualFastScanPerClusterEpsilon(
+    const std::vector<std::vector<rabitq::RaBitQCode>>& all_codes,
+    const std::vector<std::vector<uint32_t>>& cluster_members,
+    const std::vector<float>& vectors,
+    const std::vector<float>& centroids,
+    const rabitq::RotationMatrix& rotation,
+    Dim dim,
+    uint32_t max_samples_per_cluster,
+    float percentile,
+    uint64_t seed,
+    float d_k,
+    const RaBitQConfig& config) {
+    const float lo = 0.1f * d_k;
+    const float hi = 10.0f * d_k;
+    const uint32_t packed_size = storage::FastScanPackedSize(dim);
+    rabitq::RaBitQEstimator estimator(dim, config.active_code_bits());
+    std::vector<uint8_t> packed_codes(packed_size, 0);
+    std::vector<float> errors;
+    for (uint32_t cid = 0; cid < cluster_members.size(); ++cid) {
+        const auto& members = cluster_members[cid];
+        const auto& codes = all_codes[cid];
+        const uint32_t n_members = static_cast<uint32_t>(members.size());
+        if (n_members < 2) continue;
+        uint32_t n_queries = max_samples_per_cluster;
+        if (n_members < 2 * max_samples_per_cluster) {
+            n_queries = std::max(n_members / 2, 1u);
+        }
+        n_queries = std::min(n_queries, n_members);
+
+        std::vector<uint32_t> sample_ids(n_members);
+        std::iota(sample_ids.begin(), sample_ids.end(), 0u);
+        std::mt19937 rng(static_cast<uint32_t>(seed + cid));
+        std::shuffle(sample_ids.begin(), sample_ids.end(), rng);
+
+        const float* centroid = centroids.data() + static_cast<size_t>(cid) * dim;
+        rabitq::ClusterPreparedScratch scratch;
+        rabitq::PreparedQuery pq;
+        float block_norms[32];
+        alignas(64) float fs_dists[32];
+        for (uint32_t qi = 0; qi < n_queries; ++qi) {
+            const uint32_t local_q = sample_ids[qi];
+            const float* query =
+                vectors.data() + static_cast<size_t>(members[local_q]) * dim;
+            estimator.PrepareQueryInto(query, centroid, rotation, &pq, &scratch);
+            for (uint32_t t_base = 0; t_base < n_members; t_base += 32) {
+                const uint32_t block_count = std::min(32u, n_members - t_base);
+                storage::PackSignBitsForFastScan(&codes[t_base], block_count,
+                                                 dim, packed_codes.data());
+                for (uint32_t j = 0; j < block_count; ++j) {
+                    block_norms[j] = codes[t_base + j].norm;
+                }
+                estimator.EstimateDistanceFastScan(
+                    pq, packed_codes.data(), block_norms, block_count, fs_dists);
+                for (uint32_t j = 0; j < block_count; ++j) {
+                    const uint32_t target_local = t_base + j;
+                    if (target_local == local_q) continue;
+                    const float* target =
+                        vectors.data() +
+                        static_cast<size_t>(members[target_local]) * dim;
+                    const float true_dist = simd::L2Sqr(query, target, dim);
+                    if (true_dist < lo || true_dist > hi) continue;
+                    const float denom = 2.0f * block_norms[j] * pq.norm_qc;
+                    if (denom > 1e-10f) {
+                        errors.push_back(std::abs(fs_dists[j] - true_dist) /
+                                         denom);
+                    }
+                }
+            }
+        }
+    }
+    return UpperPercentileForTest(std::move(errors), percentile);
+}
 
 TEST(EpsilonCalibrationSamplingTest, GlobalPairSampleCountIsBounded) {
     ToyCalibrationData data;
@@ -119,6 +206,34 @@ TEST(EpsilonCalibrationSamplingTest, ParsesSamplingMode) {
 
     auto invalid = ParseEpsilonSamplingModeArg("bad_mode");
     EXPECT_FALSE(invalid.ok());
+}
+
+TEST(EpsilonCalibrationSamplingTest,
+     LegacyPerClusterMatchesFastScanBlockReferenceOfficialBits) {
+    ToyCalibrationData data;
+    RaBitQConfig config;
+    config.total_bits = 4;
+    config.ex_bits = 3;
+    config.estimator_mode = RaBitQEstimatorMode::kOfficial1PlusN;
+
+    std::vector<std::vector<rabitq::RaBitQCode>> official_codes;
+    EncodeAllCodes(data.vectors,
+                   static_cast<uint32_t>(data.vectors.size() / data.dim),
+                   data.dim, data.cluster_members, data.centroids,
+                   data.rotation, config, nullptr, &official_codes);
+
+    EpsilonCalibrationStats stats;
+    const float actual = CalibrateSplitEpsilon(
+        official_codes, data.cluster_members, data.vectors.data(),
+        data.centroids, data.rotation, data.dim, 4, 0.95f, 42, 0.1f,
+        config, nullptr, EpsilonSamplingMode::LegacyPerCluster, &stats);
+    const float expected = ManualFastScanPerClusterEpsilon(
+        official_codes, data.cluster_members, data.vectors, data.centroids,
+        data.rotation, data.dim, 4, 0.95f, 42, 0.1f, config);
+
+    EXPECT_FLOAT_EQ(actual, expected);
+    EXPECT_GT(stats.valid_error_count, 0u);
+    EXPECT_GE(stats.attempted_pairs, stats.valid_error_count);
 }
 
 TEST(SafeInDkCalibrationTest, GeneratesExactQueryToBaseKthSamples) {

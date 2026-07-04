@@ -694,25 +694,68 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
     std::filesystem::create_directories(output_dir);
 
     // --- Generate rotation matrix ---
-    // Power-of-two dimensions use the Hadamard fast path. Non-power-of-two
-    // dimensions use FHT-Kac; any required padding was applied before build.
+    // Default "auto" preserves the repository behavior: power-of-two
+    // dimensions use Hadamard, other dimensions use FHT-Kac and fall back to a
+    // dense random orthogonal rotation only if FHT-Kac cannot be generated.
     rabitq::RotationMatrix rotation(dim);
     bool used_hadamard = false;
-    if (dim > 0 && (dim & (dim - 1)) == 0) {
-        used_hadamard = rotation.GenerateHadamard(config_.seed,
-                                                  /*use_fast_transform=*/true);
-        if (used_hadamard) {
-            rotation_mode_ = "hadamard";
-        }
-    } else {
-        used_hadamard = rotation.GenerateFhtKacRotator(
-            config_.seed, /*use_fast_transform=*/true);
-        if (used_hadamard) {
-            rotation_mode_ = "fht_kac_rotator";
-        }
+    bool generated_rotation = false;
+    std::string requested_rotation = config_.rotation_mode;
+    if (requested_rotation.empty()) {
+        requested_rotation = "auto";
     }
 
-    if (!used_hadamard) {
+    const bool is_power_of_two = dim > 0 && (dim & (dim - 1)) == 0;
+    if (requested_rotation == "auto") {
+        if (is_power_of_two) {
+            generated_rotation =
+                rotation.GenerateHadamard(config_.seed, /*use_fast_transform=*/true);
+            if (generated_rotation) {
+                used_hadamard = true;
+                rotation_mode_ = "hadamard";
+            }
+        } else {
+            generated_rotation = rotation.GenerateFhtKacRotator(
+                config_.seed, /*use_fast_transform=*/true);
+            if (generated_rotation) {
+                used_hadamard = true;
+                rotation_mode_ = "fht_kac_rotator";
+            }
+        }
+    } else if (requested_rotation == "hadamard") {
+        if (!is_power_of_two) {
+            return Status::InvalidArgument(
+                "rotation_mode=hadamard requires a power-of-two effective dimension");
+        }
+        generated_rotation =
+            rotation.GenerateHadamard(config_.seed, /*use_fast_transform=*/true);
+        if (generated_rotation) {
+            used_hadamard = true;
+            rotation_mode_ = "hadamard";
+        }
+    } else if (requested_rotation == "fht_kac" ||
+               requested_rotation == "fht_kac_rotator") {
+        generated_rotation = rotation.GenerateFhtKacRotator(
+            config_.seed, /*use_fast_transform=*/true);
+        if (!generated_rotation) {
+            return Status::InvalidArgument(
+                "rotation_mode=fht_kac_rotator requires the effective dimension "
+                "to be a multiple of 64");
+        }
+        used_hadamard = true;
+        rotation_mode_ = "fht_kac_rotator";
+    } else if (requested_rotation == "random" ||
+               requested_rotation == "random_matrix") {
+        rotation.GenerateRandom(config_.seed);
+        generated_rotation = true;
+        rotation_mode_ = "random_matrix";
+    } else {
+        return Status::InvalidArgument(
+            "unsupported rotation_mode '" + requested_rotation +
+            "' (expected auto, hadamard, fht_kac_rotator, or random_matrix)");
+    }
+
+    if (!generated_rotation) {
         rotation.GenerateRandom(config_.seed);
         rotation_mode_ = "random_matrix";
     }
@@ -1016,6 +1059,7 @@ Status IvfBuilder::WriteIndex(const float* raw_vectors,
             << "  \"logical_dim\": " << logical_dim_ << ",\n"
             << "  \"effective_dim\": " << effective_dim_ << ",\n"
             << "  \"padding_mode\": \"" << padding_mode_ << "\",\n"
+            << "  \"requested_rotation_mode\": \"" << config_.rotation_mode << "\",\n"
             << "  \"rotation_mode\": \"" << rotation_mode_ << "\",\n"
             << "  \"rotation_seed\": " << rotation.seed() << ",\n"
             << "  \"rotation_block_sizes\": "

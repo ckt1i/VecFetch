@@ -40,69 +40,156 @@ VDB_FORCE_INLINE float IPExRaBitQReference(const float* VDB_RESTRICT query,
 	constexpr uint32_t kOfficialDirect3DimBlock = 64;
 	constexpr uint32_t kOfficialDirect3BytesPerLane = 24;
 	constexpr uint32_t kOfficialNibble4GroupDims = 16;
-	constexpr uint32_t kOfficialNibble4BytesPerGroup = 8;
-	constexpr uint32_t kOfficial2BitDimBlock = 64;
-	constexpr uint32_t kOfficial2BitBytesPerBlock = 16;
+		constexpr uint32_t kOfficialNibble4BytesPerGroup = 8;
+		constexpr uint32_t kOfficial2BitDimBlock = 64;
+		constexpr uint32_t kOfficial2BitBytesPerBlock = 16;
 
-	VDB_FORCE_INLINE float IPOfficialDirectBitplanesReference(
-	    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, uint8_t bits,
-	    Dim dim) {
-	    if (bits == 0 || bits > 4) {
-	        return 0.0f;
-	    }
-	    float sum = 0.0f;
-	    const uint32_t bytes_per_lane = ExRaBitQPackedMagnitudeBytes(kOfficialDirect3DimBlock, bits);
-	    uint32_t d = 0;
-	    uint32_t chunk = 0;
-	    while (d < dim) {
-	        const uint8_t* planes = compact + static_cast<size_t>(chunk) * bytes_per_lane;
-	        const uint32_t remaining = std::min<uint32_t>(kOfficialDirect3DimBlock, dim - d);
-	        for (uint32_t i = 0; i < remaining; ++i) {
-	            uint8_t v = 0;
-	            for (uint8_t bit = 0; bit < bits; ++bit) {
-	                const uint8_t plane_bit = static_cast<uint8_t>(
-	                    (planes[static_cast<uint32_t>(bit) * 8u + i / 8u] >> (i % 8u)) & 0x01u);
-	                v = static_cast<uint8_t>(v | (plane_bit << bit));
-	            }
+		VDB_FORCE_INLINE uint8_t ResolveActiveBits(uint8_t stored_bits, uint8_t active_bits) {
+		    if (active_bits == kUseStoredExBits) {
+		        return stored_bits;
+		    }
+		    return std::min<uint8_t>(active_bits, stored_bits);
+		}
+
+		VDB_FORCE_INLINE float IPOfficialDirectBitplanesReferenceStored(
+		    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+		    uint8_t stored_bits, uint8_t active_bits, Dim dim) {
+		    active_bits = ResolveActiveBits(stored_bits, active_bits);
+		    if (stored_bits == 0 || stored_bits > 4 || active_bits > stored_bits) {
+		        return 0.0f;
+		    }
+		    float sum = 0.0f;
+		    const uint32_t bytes_per_lane =
+		        ExRaBitQPackedMagnitudeBytes(kOfficialDirect3DimBlock, stored_bits);
+		    uint32_t d = 0;
+		    uint32_t chunk = 0;
+		    while (d < dim) {
+		        const uint8_t* planes = compact + static_cast<size_t>(chunk) * bytes_per_lane;
+		        const uint32_t remaining = std::min<uint32_t>(kOfficialDirect3DimBlock, dim - d);
+		        for (uint32_t i = 0; i < remaining; ++i) {
+		            uint8_t v = 0;
+		            for (uint8_t bit = 0; bit < active_bits; ++bit) {
+		                const uint8_t plane_bit = static_cast<uint8_t>(
+		                    (planes[static_cast<uint32_t>(bit) * 8u + i / 8u] >> (i % 8u)) & 0x01u);
+		                v = static_cast<uint8_t>(v | (plane_bit << bit));
+		            }
 	            sum += query[d + i] * static_cast<float>(v);
 	        }
 	        d += remaining;
 	        ++chunk;
-	    }
-	    return sum;
-	}
+		    }
+		    return sum;
+		}
 
-	VDB_FORCE_INLINE float IPOfficialBitMajorTilesReference(
-	    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, uint8_t bits,
-	    Dim dim) {
-	    if (bits == 0 || bits > 3) {
-	        return 0.0f;
-	    }
-	    float sum = 0.0f;
-	    uint32_t d = 0;
-	    const uint8_t* tile = compact;
+		VDB_FORCE_INLINE float IPOfficialDirectBitplanesReference(
+		    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, uint8_t bits,
+		    Dim dim) {
+		    return IPOfficialDirectBitplanesReferenceStored(
+		        query, compact, bits, kUseStoredExBits, dim);
+		}
+
+		VDB_FORCE_INLINE float IPOfficialBitMajorTilesReferenceStored(
+		    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+		    uint8_t stored_bits, uint8_t active_bits, Dim dim) {
+		    active_bits = ResolveActiveBits(stored_bits, active_bits);
+		    if (stored_bits == 0 || stored_bits > 3 || active_bits > stored_bits) {
+		        return 0.0f;
+		    }
+		    float sum = 0.0f;
+		    uint32_t d = 0;
+		    const uint8_t* tile = compact;
 	    while (d < dim) {
 	        const uint32_t tile_dims = ExRaBitQBitMajorTileDims(dim - d);
 	        const uint32_t plane_bytes = tile_dims / 8u;
-	        const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - d);
-	        for (uint32_t i = 0; i < remaining; ++i) {
-	            uint8_t v = 0;
-	            for (uint8_t bit = 0; bit < bits; ++bit) {
-	                const uint8_t* plane = tile + static_cast<uint32_t>(bit) * plane_bytes;
-	                const uint8_t plane_bit =
-	                    static_cast<uint8_t>((plane[i / 8u] >> (i % 8u)) & 0x01u);
-	                v = static_cast<uint8_t>(v | (plane_bit << bit));
-	            }
-	            sum += query[d + i] * static_cast<float>(v);
-	        }
-	        tile += static_cast<size_t>(bits) * plane_bytes;
-	        d += remaining;
-	    }
-	    return sum;
-	}
+		        const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - d);
+		        for (uint32_t i = 0; i < remaining; ++i) {
+		            uint8_t v = 0;
+		            for (uint8_t bit = 0; bit < active_bits; ++bit) {
+		                const uint8_t* plane = tile + static_cast<uint32_t>(bit) * plane_bytes;
+		                const uint8_t plane_bit =
+		                    static_cast<uint8_t>((plane[i / 8u] >> (i % 8u)) & 0x01u);
+		                v = static_cast<uint8_t>(v | (plane_bit << bit));
+		            }
+		            sum += query[d + i] * static_cast<float>(v);
+		        }
+		        tile += static_cast<size_t>(stored_bits) * plane_bytes;
+		        d += remaining;
+		    }
+		    return sum;
+		}
 
-	VDB_FORCE_INLINE float IPOfficialDirect3TwoPlusOneReference(
-	    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, Dim dim) {
+		VDB_FORCE_INLINE float IPOfficialBitMajorTilesReference(
+		    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, uint8_t bits,
+		    Dim dim) {
+		    return IPOfficialBitMajorTilesReferenceStored(
+		        query, compact, bits, kUseStoredExBits, dim);
+		}
+
+			VDB_FORCE_INLINE float IPOfficialTileLaneBitMajorReferenceStored(
+			    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+			    uint32_t valid_count, uint32_t lane, uint8_t stored_bits,
+			    uint8_t active_bits, Dim dim) {
+		    active_bits = ResolveActiveBits(stored_bits, active_bits);
+		    if (valid_count == 0 || lane >= valid_count || stored_bits == 0 ||
+		        stored_bits > 3 || active_bits > stored_bits) {
+		        return 0.0f;
+		    }
+		    float sum = 0.0f;
+		    uint32_t d = 0;
+		    const uint8_t* tile = compact;
+		    while (d < dim) {
+		        const uint32_t tile_dims = ExRaBitQBitMajorTileDims(dim - d);
+		        const uint32_t plane_bytes = tile_dims / 8u;
+		        const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - d);
+		        for (uint32_t i = 0; i < remaining; ++i) {
+		            uint8_t v = 0;
+		            for (uint8_t bit = 0; bit < active_bits; ++bit) {
+		                const uint8_t* plane =
+		                    tile + (static_cast<size_t>(bit) * valid_count + lane) *
+		                               plane_bytes;
+		                const uint8_t plane_bit =
+		                    static_cast<uint8_t>((plane[i / 8u] >> (i % 8u)) & 0x01u);
+		                v = static_cast<uint8_t>(v | (plane_bit << bit));
+		            }
+		            sum += query[d + i] * static_cast<float>(v);
+		        }
+		        tile += static_cast<size_t>(stored_bits) * valid_count * plane_bytes;
+		        d += remaining;
+			    }
+			    return sum;
+			}
+
+			VDB_FORCE_INLINE float IPOfficialTileLaneBitMajorReferenceBitDeltaStored(
+			    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+			    uint32_t valid_count, uint32_t lane, uint8_t stored_bits,
+			    uint8_t bit_id, Dim dim) {
+			    if (valid_count == 0 || lane >= valid_count || stored_bits == 0 ||
+			        stored_bits > 3 || bit_id >= stored_bits) {
+			        return 0.0f;
+			    }
+			    float sum = 0.0f;
+			    uint32_t d = 0;
+			    const uint8_t* tile = compact;
+			    while (d < dim) {
+			        const uint32_t tile_dims = ExRaBitQBitMajorTileDims(dim - d);
+			        const uint32_t plane_bytes = tile_dims / 8u;
+			        const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - d);
+			        const uint8_t* plane =
+			            tile + (static_cast<size_t>(bit_id) * valid_count + lane) *
+			                       plane_bytes;
+			        for (uint32_t i = 0; i < remaining; ++i) {
+			            const uint8_t plane_bit =
+			                static_cast<uint8_t>((plane[i / 8u] >> (i % 8u)) & 0x01u);
+			            sum += query[d + i] * static_cast<float>(plane_bit);
+			        }
+			        tile += static_cast<size_t>(stored_bits) * valid_count * plane_bytes;
+			        d += remaining;
+			    }
+			    return static_cast<float>(1u << bit_id) * sum;
+			}
+
+		VDB_FORCE_INLINE float IPOfficialDirect3TwoPlusOneReference(
+		    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, Dim dim) {
 	    float sum = 0.0f;
 	    uint32_t d = 0;
 	    uint32_t chunk = 0;
@@ -403,10 +490,10 @@ VDB_FORCE_INLINE float IPExRaBitQPackedSignAvx512(const float* VDB_RESTRICT quer
 	    return IPOfficialDirectBitplanesAvx512Fixed<3>(query, compact, dim);
 	}
 
-		VDB_FORCE_INLINE float IPOfficialDirectBitplanesAvx512(
-		    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, uint8_t bits,
-		    Dim dim) {
-		    switch (bits) {
+			VDB_FORCE_INLINE float IPOfficialDirectBitplanesAvx512(
+			    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, uint8_t bits,
+			    Dim dim) {
+			    switch (bits) {
 	        case 1:
 	            return IPOfficialDirectBitplanesAvx512Fixed<1>(query, compact, dim);
 	        case 2:
@@ -417,98 +504,673 @@ VDB_FORCE_INLINE float IPExRaBitQPackedSignAvx512(const float* VDB_RESTRICT quer
 	            return IPOfficialDirectBitplanesAvx512Fixed<4>(query, compact, dim);
 	        default:
 		            return 0.0f;
-		    }
-		}
+			    }
+			}
 
-	template <uint8_t Bits>
-	VDB_FORCE_INLINE float IPOfficialBitMajorTilesAvx512Fixed(
-	    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, Dim dim) {
-	    static_assert(Bits >= 1 && Bits <= 3, "Bits must be in [1,3]");
-	    __m512 dot0 = _mm512_setzero_ps();
-	    __m512 dot1 = _mm512_setzero_ps();
-	    __m512 dot2 = _mm512_setzero_ps();
-	    uint32_t d = 0;
-	    const uint8_t* tile = compact;
-	    while (d < dim) {
-	        const uint32_t tile_dims = ExRaBitQBitMajorTileDims(dim - d);
-	        const uint32_t plane_bytes = tile_dims / 8u;
-	        const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - d);
-	        const uint8_t* plane0 = tile;
-	        const uint8_t* plane1 = tile + plane_bytes;
-	        const uint8_t* plane2 = tile + 2u * plane_bytes;
-	        const uint32_t full_slices = remaining / 16u;
-	        for (uint32_t sub = 0; sub < full_slices; ++sub) {
-	            const __m512 q = _mm512_loadu_ps(query + d + sub * 16u);
-	            uint16_t mask0 = 0;
-	            std::memcpy(&mask0, plane0 + sub * sizeof(uint16_t), sizeof(uint16_t));
-	            dot0 = _mm512_add_ps(dot0, _mm512_maskz_mov_ps(
-	                                           static_cast<__mmask16>(mask0), q));
-	            if constexpr (Bits > 1) {
-	                uint16_t mask1 = 0;
-	                std::memcpy(&mask1, plane1 + sub * sizeof(uint16_t), sizeof(uint16_t));
-	                dot1 = _mm512_add_ps(dot1, _mm512_maskz_mov_ps(
-	                                               static_cast<__mmask16>(mask1), q));
+	        template <uint8_t ActiveBits>
+	        VDB_FORCE_INLINE float IPOfficialDirectBitplanesAvx512FixedStored(
+	            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+	            uint8_t stored_bits, Dim dim) {
+	            static_assert(ActiveBits >= 1 && ActiveBits <= 4, "ActiveBits must be in [1,4]");
+	            if (stored_bits < ActiveBits || stored_bits > 4) {
+	                return 0.0f;
 	            }
-	            if constexpr (Bits > 2) {
-	                uint16_t mask2 = 0;
-	                std::memcpy(&mask2, plane2 + sub * sizeof(uint16_t), sizeof(uint16_t));
-	                dot2 = _mm512_add_ps(dot2, _mm512_maskz_mov_ps(
-	                                               static_cast<__mmask16>(mask2), q));
+	            const uint32_t bytes_per_lane =
+	                ExRaBitQPackedMagnitudeBytes(kOfficialDirect3DimBlock, stored_bits);
+	            __m512 dot0 = _mm512_setzero_ps();
+	            __m512 dot1 = _mm512_setzero_ps();
+	            __m512 dot2 = _mm512_setzero_ps();
+	            __m512 dot3 = _mm512_setzero_ps();
+	            uint32_t d = 0;
+	            uint32_t chunk = 0;
+	            while (d + kOfficialDirect3DimBlock <= dim) {
+	                const uint8_t* planes = compact + static_cast<size_t>(chunk) * bytes_per_lane;
+	                uint64_t bits0 = 0;
+	                uint64_t bits1 = 0;
+	                uint64_t bits2 = 0;
+	                uint64_t bits3 = 0;
+	                std::memcpy(&bits0, planes, sizeof(bits0));
+	                if constexpr (ActiveBits > 1) {
+	                    std::memcpy(&bits1, planes + 8, sizeof(bits1));
+	                }
+	                if constexpr (ActiveBits > 2) {
+	                    std::memcpy(&bits2, planes + 16, sizeof(bits2));
+	                }
+	                if constexpr (ActiveBits > 3) {
+	                    std::memcpy(&bits3, planes + 24, sizeof(bits3));
+	                }
+	                for (uint32_t sub = 0; sub < 4; ++sub) {
+	                    const __m512 q = _mm512_loadu_ps(query + d + sub * 16u);
+	                    dot0 = _mm512_add_ps(
+	                        dot0,
+	                        _mm512_maskz_mov_ps(
+	                            static_cast<__mmask16>((bits0 >> (sub * 16u)) & 0xFFFFu),
+	                            q));
+	                    if constexpr (ActiveBits > 1) {
+	                        dot1 = _mm512_add_ps(
+	                            dot1,
+	                            _mm512_maskz_mov_ps(
+	                                static_cast<__mmask16>((bits1 >> (sub * 16u)) & 0xFFFFu),
+	                                q));
+	                    }
+	                    if constexpr (ActiveBits > 2) {
+	                        dot2 = _mm512_add_ps(
+	                            dot2,
+	                            _mm512_maskz_mov_ps(
+	                                static_cast<__mmask16>((bits2 >> (sub * 16u)) & 0xFFFFu),
+	                                q));
+	                    }
+	                    if constexpr (ActiveBits > 3) {
+	                        dot3 = _mm512_add_ps(
+	                            dot3,
+	                            _mm512_maskz_mov_ps(
+	                                static_cast<__mmask16>((bits3 >> (sub * 16u)) & 0xFFFFu),
+	                                q));
+	                    }
+	                }
+	                d += kOfficialDirect3DimBlock;
+	                ++chunk;
+	            }
+	            float result = _mm512_reduce_add_ps(dot0);
+	            if constexpr (ActiveBits > 1) {
+	                result += 2.0f * _mm512_reduce_add_ps(dot1);
+	            }
+	            if constexpr (ActiveBits > 2) {
+	                result += 4.0f * _mm512_reduce_add_ps(dot2);
+	            }
+	            if constexpr (ActiveBits > 3) {
+	                result += 8.0f * _mm512_reduce_add_ps(dot3);
+	            }
+	            if (d < dim) {
+	                result += IPOfficialDirectBitplanesReferenceStored(
+	                    query + d, compact + static_cast<size_t>(chunk) * bytes_per_lane,
+	                    stored_bits, ActiveBits, dim - d);
+	            }
+	            return result;
+	        }
+
+	        VDB_FORCE_INLINE float IPOfficialDirectBitplanesAvx512Stored(
+	            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+	            uint8_t stored_bits, uint8_t active_bits, Dim dim) {
+	            active_bits = ResolveActiveBits(stored_bits, active_bits);
+	            if (active_bits == 0) {
+	                return 0.0f;
+	            }
+	            if (active_bits == stored_bits) {
+	                return IPOfficialDirectBitplanesAvx512(query, compact, stored_bits, dim);
+	            }
+	            switch (active_bits) {
+	                case 1:
+	                    return IPOfficialDirectBitplanesAvx512FixedStored<1>(
+	                        query, compact, stored_bits, dim);
+	                case 2:
+	                    return IPOfficialDirectBitplanesAvx512FixedStored<2>(
+	                        query, compact, stored_bits, dim);
+	                case 3:
+	                    return IPOfficialDirectBitplanesAvx512FixedStored<3>(
+	                        query, compact, stored_bits, dim);
+	                case 4:
+	                    return IPOfficialDirectBitplanesAvx512FixedStored<4>(
+	                        query, compact, stored_bits, dim);
+	                default:
+	                    return 0.0f;
 	            }
 	        }
-	        const uint32_t tail = remaining - full_slices * 16u;
-	        if (tail != 0) {
-	            const __mmask16 valid =
-	                static_cast<__mmask16>((1u << tail) - 1u);
-	            const __m512 q =
-	                _mm512_maskz_loadu_ps(valid, query + d + full_slices * 16u);
-	            uint16_t mask0 = 0;
-	            std::memcpy(&mask0, plane0 + full_slices * sizeof(uint16_t),
-	                        sizeof(uint16_t));
-	            dot0 = _mm512_add_ps(
-	                dot0, _mm512_maskz_mov_ps(static_cast<__mmask16>(mask0) & valid, q));
-	            if constexpr (Bits > 1) {
-	                uint16_t mask1 = 0;
-	                std::memcpy(&mask1, plane1 + full_slices * sizeof(uint16_t),
-	                            sizeof(uint16_t));
-	                dot1 = _mm512_add_ps(
-	                    dot1, _mm512_maskz_mov_ps(static_cast<__mmask16>(mask1) & valid, q));
+
+	        template <uint8_t ActiveBits>
+	        VDB_FORCE_INLINE float IPOfficialBitMajorTilesAvx512FixedStored(
+	            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+	            uint8_t stored_bits, Dim dim) {
+	            static_assert(ActiveBits >= 1 && ActiveBits <= 3, "ActiveBits must be in [1,3]");
+	            if (stored_bits < ActiveBits || stored_bits > 3) {
+	                return 0.0f;
 	            }
-	            if constexpr (Bits > 2) {
-	                uint16_t mask2 = 0;
-	                std::memcpy(&mask2, plane2 + full_slices * sizeof(uint16_t),
-	                            sizeof(uint16_t));
-	                dot2 = _mm512_add_ps(
-	                    dot2, _mm512_maskz_mov_ps(static_cast<__mmask16>(mask2) & valid, q));
+	            __m512 dot0 = _mm512_setzero_ps();
+	            __m512 dot1 = _mm512_setzero_ps();
+	            __m512 dot2 = _mm512_setzero_ps();
+	            uint32_t d = 0;
+	            const uint8_t* tile = compact;
+	            while (d < dim) {
+	                const uint32_t tile_dims = ExRaBitQBitMajorTileDims(dim - d);
+	                const uint32_t plane_bytes = tile_dims / 8u;
+	                const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - d);
+	                const uint8_t* plane0 = tile;
+	                const uint8_t* plane1 = tile + plane_bytes;
+	                const uint8_t* plane2 = tile + 2u * plane_bytes;
+	                const uint32_t full_slices = remaining / 16u;
+	                for (uint32_t sub = 0; sub < full_slices; ++sub) {
+	                    const __m512 q = _mm512_loadu_ps(query + d + sub * 16u);
+	                    uint16_t mask0 = 0;
+	                    std::memcpy(&mask0, plane0 + sub * sizeof(uint16_t), sizeof(uint16_t));
+	                    dot0 = _mm512_add_ps(
+	                        dot0, _mm512_maskz_mov_ps(static_cast<__mmask16>(mask0), q));
+	                    if constexpr (ActiveBits > 1) {
+	                        uint16_t mask1 = 0;
+	                        std::memcpy(&mask1, plane1 + sub * sizeof(uint16_t), sizeof(uint16_t));
+	                        dot1 = _mm512_add_ps(
+	                            dot1, _mm512_maskz_mov_ps(static_cast<__mmask16>(mask1), q));
+	                    }
+	                    if constexpr (ActiveBits > 2) {
+	                        uint16_t mask2 = 0;
+	                        std::memcpy(&mask2, plane2 + sub * sizeof(uint16_t), sizeof(uint16_t));
+	                        dot2 = _mm512_add_ps(
+	                            dot2, _mm512_maskz_mov_ps(static_cast<__mmask16>(mask2), q));
+	                    }
+	                }
+	                const uint32_t tail = remaining - full_slices * 16u;
+	                if (tail != 0) {
+	                    const __mmask16 valid = static_cast<__mmask16>((1u << tail) - 1u);
+	                    const __m512 q =
+	                        _mm512_maskz_loadu_ps(valid, query + d + full_slices * 16u);
+	                    uint16_t mask0 = 0;
+	                    std::memcpy(&mask0, plane0 + full_slices * sizeof(uint16_t),
+	                                sizeof(uint16_t));
+	                    dot0 = _mm512_add_ps(
+	                        dot0, _mm512_maskz_mov_ps(static_cast<__mmask16>(mask0) & valid, q));
+	                    if constexpr (ActiveBits > 1) {
+	                        uint16_t mask1 = 0;
+	                        std::memcpy(&mask1, plane1 + full_slices * sizeof(uint16_t),
+	                                    sizeof(uint16_t));
+	                        dot1 = _mm512_add_ps(
+	                            dot1,
+	                            _mm512_maskz_mov_ps(static_cast<__mmask16>(mask1) & valid, q));
+	                    }
+	                    if constexpr (ActiveBits > 2) {
+	                        uint16_t mask2 = 0;
+	                        std::memcpy(&mask2, plane2 + full_slices * sizeof(uint16_t),
+	                                    sizeof(uint16_t));
+	                        dot2 = _mm512_add_ps(
+	                            dot2,
+	                            _mm512_maskz_mov_ps(static_cast<__mmask16>(mask2) & valid, q));
+	                    }
+	                }
+	                tile += static_cast<size_t>(stored_bits) * plane_bytes;
+	                d += remaining;
+	            }
+	            float result = _mm512_reduce_add_ps(dot0);
+	            if constexpr (ActiveBits > 1) {
+	                result += 2.0f * _mm512_reduce_add_ps(dot1);
+	            }
+	            if constexpr (ActiveBits > 2) {
+	                result += 4.0f * _mm512_reduce_add_ps(dot2);
+	            }
+	            return result;
+	        }
+
+	        template <uint8_t Bits>
+	        VDB_FORCE_INLINE float IPOfficialBitMajorTilesAvx512Fixed(
+	            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, Dim dim) {
+	            return IPOfficialBitMajorTilesAvx512FixedStored<Bits>(
+	                query, compact, Bits, dim);
+	        }
+
+	        VDB_FORCE_INLINE float IPOfficialBitMajorTilesAvx512(
+	            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+	            uint8_t bits, Dim dim) {
+	            switch (bits) {
+	                case 1:
+	                    return IPOfficialBitMajorTilesAvx512Fixed<1>(query, compact, dim);
+	                case 2:
+	                    return IPOfficialBitMajorTilesAvx512Fixed<2>(query, compact, dim);
+	                case 3:
+	                    return IPOfficialBitMajorTilesAvx512Fixed<3>(query, compact, dim);
+	                default:
+	                    return 0.0f;
 	            }
 	        }
-	        tile += static_cast<size_t>(Bits) * plane_bytes;
-	        d += remaining;
-	    }
-	    float result = _mm512_reduce_add_ps(dot0);
-	    if constexpr (Bits > 1) {
-	        result += 2.0f * _mm512_reduce_add_ps(dot1);
-	    }
-	    if constexpr (Bits > 2) {
-	        result += 4.0f * _mm512_reduce_add_ps(dot2);
-	    }
-	    return result;
-	}
 
-	VDB_FORCE_INLINE float IPOfficialBitMajorTilesAvx512(
-	    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact, uint8_t bits,
-	    Dim dim) {
-	    switch (bits) {
-	        case 1:
-	            return IPOfficialBitMajorTilesAvx512Fixed<1>(query, compact, dim);
-	        case 2:
-	            return IPOfficialBitMajorTilesAvx512Fixed<2>(query, compact, dim);
-	        case 3:
-	            return IPOfficialBitMajorTilesAvx512Fixed<3>(query, compact, dim);
-	        default:
-	            return 0.0f;
-	    }
-	}
+	        VDB_FORCE_INLINE float IPOfficialBitMajorTilesAvx512Stored(
+	            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+	            uint8_t stored_bits, uint8_t active_bits, Dim dim) {
+	            active_bits = ResolveActiveBits(stored_bits, active_bits);
+	            if (active_bits == 0) {
+	                return 0.0f;
+	            }
+	            if (active_bits == stored_bits) {
+	                return IPOfficialBitMajorTilesAvx512(query, compact, stored_bits, dim);
+	            }
+	            switch (active_bits) {
+	                case 1:
+	                    return IPOfficialBitMajorTilesAvx512FixedStored<1>(
+	                        query, compact, stored_bits, dim);
+	                case 2:
+	                    return IPOfficialBitMajorTilesAvx512FixedStored<2>(
+	                        query, compact, stored_bits, dim);
+	                case 3:
+	                    return IPOfficialBitMajorTilesAvx512FixedStored<3>(
+	                        query, compact, stored_bits, dim);
+	                default:
+	                    return 0.0f;
+	            }
+	        }
+
+	        template <uint8_t ActiveBits>
+	        VDB_FORCE_INLINE void IPOfficialTileLaneBitMajorAvx512FixedStored(
+	            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+	            uint8_t stored_bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+	            float* VDB_RESTRICT out_ip_ex) {
+	            static_assert(ActiveBits >= 1 && ActiveBits <= 3,
+	                          "ActiveBits must be in [1,3]");
+	            if (stored_bits < ActiveBits || stored_bits > 3 || valid_count == 0) {
+	                return;
+	            }
+	            uint32_t lanes[32] = {};
+	            uint32_t lane_count = 0;
+	            uint32_t m = lane_mask;
+	            while (m != 0) {
+	                const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(m));
+	                if (lane < valid_count) {
+	                    lanes[lane_count++] = lane;
+	                }
+	                m &= (m - 1u);
+	            }
+	            if (lane_count == 0) {
+	                return;
+	            }
+
+	            __m512 dot0[32];
+	            __m512 dot1[32];
+	            __m512 dot2[32];
+	            for (uint32_t i = 0; i < lane_count; ++i) {
+	                dot0[i] = _mm512_setzero_ps();
+	                if constexpr (ActiveBits > 1) {
+	                    dot1[i] = _mm512_setzero_ps();
+	                }
+	                if constexpr (ActiveBits > 2) {
+	                    dot2[i] = _mm512_setzero_ps();
+	                }
+	            }
+
+	            uint32_t d = 0;
+	            const uint8_t* tile = compact;
+	            while (d < dim) {
+	                const uint32_t tile_dims = ExRaBitQBitMajorTileDims(dim - d);
+	                const uint32_t plane_bytes = tile_dims / 8u;
+	                const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - d);
+	                const uint32_t full_slices = remaining / 16u;
+	                const uint8_t* plane0_base = tile;
+	                const uint8_t* plane1_base = nullptr;
+	                const uint8_t* plane2_base = nullptr;
+	                if constexpr (ActiveBits > 1) {
+	                    plane1_base = tile + static_cast<size_t>(valid_count) * plane_bytes;
+	                }
+	                if constexpr (ActiveBits > 2) {
+	                    plane2_base =
+	                        tile + static_cast<size_t>(2u) * valid_count * plane_bytes;
+	                }
+	                for (uint32_t sub = 0; sub < full_slices; ++sub) {
+	                    const __m512 q = _mm512_loadu_ps(query + d + sub * 16u);
+	                    for (uint32_t li = 0; li < lane_count; ++li) {
+	                        const uint32_t lane = lanes[li];
+	                        uint16_t mask0 = 0;
+	                        const uint8_t* plane0 =
+	                            plane0_base + static_cast<size_t>(lane) * plane_bytes;
+	                        std::memcpy(&mask0, plane0 + sub * sizeof(uint16_t),
+	                                    sizeof(uint16_t));
+	                        dot0[li] = _mm512_add_ps(
+	                            dot0[li],
+	                            _mm512_maskz_mov_ps(static_cast<__mmask16>(mask0), q));
+	                        if constexpr (ActiveBits > 1) {
+	                            uint16_t mask1 = 0;
+	                            const uint8_t* plane1 =
+	                                plane1_base + static_cast<size_t>(lane) * plane_bytes;
+	                            std::memcpy(&mask1, plane1 + sub * sizeof(uint16_t),
+	                                        sizeof(uint16_t));
+	                            dot1[li] = _mm512_add_ps(
+	                                dot1[li],
+	                                _mm512_maskz_mov_ps(static_cast<__mmask16>(mask1), q));
+	                        }
+	                        if constexpr (ActiveBits > 2) {
+	                            uint16_t mask2 = 0;
+	                            const uint8_t* plane2 =
+	                                plane2_base + static_cast<size_t>(lane) * plane_bytes;
+	                            std::memcpy(&mask2, plane2 + sub * sizeof(uint16_t),
+	                                        sizeof(uint16_t));
+	                            dot2[li] = _mm512_add_ps(
+	                                dot2[li],
+	                                _mm512_maskz_mov_ps(static_cast<__mmask16>(mask2), q));
+	                        }
+	                    }
+	                }
+	                const uint32_t tail = remaining - full_slices * 16u;
+	                if (tail != 0) {
+	                    const __mmask16 valid =
+	                        static_cast<__mmask16>((1u << tail) - 1u);
+	                    const __m512 q =
+	                        _mm512_maskz_loadu_ps(valid, query + d + full_slices * 16u);
+	                    for (uint32_t li = 0; li < lane_count; ++li) {
+	                        const uint32_t lane = lanes[li];
+	                        uint16_t mask0 = 0;
+	                        const uint8_t* plane0 =
+	                            plane0_base + static_cast<size_t>(lane) * plane_bytes;
+	                        std::memcpy(&mask0, plane0 + full_slices * sizeof(uint16_t),
+	                                    sizeof(uint16_t));
+	                        dot0[li] = _mm512_add_ps(
+	                            dot0[li],
+	                            _mm512_maskz_mov_ps(static_cast<__mmask16>(mask0) & valid, q));
+	                        if constexpr (ActiveBits > 1) {
+	                            uint16_t mask1 = 0;
+	                            const uint8_t* plane1 =
+	                                plane1_base + static_cast<size_t>(lane) * plane_bytes;
+	                            std::memcpy(&mask1, plane1 + full_slices * sizeof(uint16_t),
+	                                        sizeof(uint16_t));
+	                            dot1[li] = _mm512_add_ps(
+	                                dot1[li],
+	                                _mm512_maskz_mov_ps(
+	                                    static_cast<__mmask16>(mask1) & valid, q));
+	                        }
+	                        if constexpr (ActiveBits > 2) {
+	                            uint16_t mask2 = 0;
+	                            const uint8_t* plane2 =
+	                                plane2_base + static_cast<size_t>(lane) * plane_bytes;
+	                            std::memcpy(&mask2, plane2 + full_slices * sizeof(uint16_t),
+	                                        sizeof(uint16_t));
+	                            dot2[li] = _mm512_add_ps(
+	                                dot2[li],
+	                                _mm512_maskz_mov_ps(
+	                                    static_cast<__mmask16>(mask2) & valid, q));
+	                        }
+	                    }
+	                }
+	                tile += static_cast<size_t>(stored_bits) * valid_count * plane_bytes;
+	                d += remaining;
+	            }
+
+		            for (uint32_t li = 0; li < lane_count; ++li) {
+		                float result = _mm512_reduce_add_ps(dot0[li]);
+		                if constexpr (ActiveBits > 1) {
+		                    result += 2.0f * _mm512_reduce_add_ps(dot1[li]);
+		                }
+	                if constexpr (ActiveBits > 2) {
+	                    result += 4.0f * _mm512_reduce_add_ps(dot2[li]);
+	                }
+		                out_ip_ex[lanes[li]] += result;
+		            }
+		        }
+
+		        template <uint8_t BitId>
+		        VDB_FORCE_INLINE void IPOfficialTileLaneBitMajorAvx512BitDeltaFixedStored(
+		            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+		            uint8_t stored_bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+		            float* VDB_RESTRICT out_ip_ex) {
+		            static_assert(BitId <= 2, "BitId must be in [0,2]");
+		            if (stored_bits <= BitId || stored_bits > 3 || valid_count == 0) {
+		                return;
+		            }
+		            uint32_t lanes[32] = {};
+		            uint32_t lane_count = 0;
+		            uint32_t m = lane_mask;
+		            while (m != 0) {
+		                const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(m));
+		                if (lane < valid_count) {
+		                    lanes[lane_count++] = lane;
+		                }
+		                m &= (m - 1u);
+		            }
+		            if (lane_count == 0) {
+		                return;
+		            }
+
+		            __m512 dot[32];
+		            for (uint32_t i = 0; i < lane_count; ++i) {
+		                dot[i] = _mm512_setzero_ps();
+		            }
+
+		            uint32_t d = 0;
+		            const uint8_t* tile = compact;
+		            while (d < dim) {
+		                const uint32_t tile_dims = ExRaBitQBitMajorTileDims(dim - d);
+		                const uint32_t plane_bytes = tile_dims / 8u;
+		                const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - d);
+		                const uint32_t full_slices = remaining / 16u;
+		                const uint8_t* plane_base =
+		                    tile + static_cast<size_t>(BitId) * valid_count * plane_bytes;
+		                for (uint32_t sub = 0; sub < full_slices; ++sub) {
+		                    const __m512 q = _mm512_loadu_ps(query + d + sub * 16u);
+		                    for (uint32_t li = 0; li < lane_count; ++li) {
+		                        const uint32_t lane = lanes[li];
+		                        uint16_t mask = 0;
+		                        const uint8_t* plane =
+		                            plane_base + static_cast<size_t>(lane) * plane_bytes;
+		                        std::memcpy(&mask, plane + sub * sizeof(uint16_t),
+		                                    sizeof(uint16_t));
+		                        dot[li] = _mm512_add_ps(
+		                            dot[li],
+		                            _mm512_maskz_mov_ps(static_cast<__mmask16>(mask), q));
+		                    }
+		                }
+		                const uint32_t tail = remaining - full_slices * 16u;
+		                if (tail != 0) {
+		                    const __mmask16 valid =
+		                        static_cast<__mmask16>((1u << tail) - 1u);
+		                    const __m512 q =
+		                        _mm512_maskz_loadu_ps(valid, query + d + full_slices * 16u);
+		                    for (uint32_t li = 0; li < lane_count; ++li) {
+		                        const uint32_t lane = lanes[li];
+		                        uint16_t mask = 0;
+		                        const uint8_t* plane =
+		                            plane_base + static_cast<size_t>(lane) * plane_bytes;
+		                        std::memcpy(&mask, plane + full_slices * sizeof(uint16_t),
+		                                    sizeof(uint16_t));
+		                        dot[li] = _mm512_add_ps(
+		                            dot[li],
+		                            _mm512_maskz_mov_ps(static_cast<__mmask16>(mask) & valid,
+		                                                q));
+		                    }
+		                }
+		                tile += static_cast<size_t>(stored_bits) * valid_count * plane_bytes;
+		                d += remaining;
+		            }
+
+		            const float weight = static_cast<float>(1u << BitId);
+		            for (uint32_t li = 0; li < lane_count; ++li) {
+		                out_ip_ex[lanes[li]] += weight * _mm512_reduce_add_ps(dot[li]);
+		            }
+		        }
+
+		        VDB_FORCE_INLINE void IPOfficialTileLaneBitMajorAvx512BitDeltaStored(
+		            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+		            uint8_t stored_bits, uint8_t bit_id, uint32_t lane_mask,
+		            uint32_t valid_count, Dim dim, float* VDB_RESTRICT out_ip_ex) {
+		            switch (bit_id) {
+		                case 0:
+		                    IPOfficialTileLaneBitMajorAvx512BitDeltaFixedStored<0>(
+		                        query, compact, stored_bits, lane_mask, valid_count, dim,
+		                        out_ip_ex);
+		                    break;
+		                case 1:
+		                    IPOfficialTileLaneBitMajorAvx512BitDeltaFixedStored<1>(
+		                        query, compact, stored_bits, lane_mask, valid_count, dim,
+		                        out_ip_ex);
+		                    break;
+		                case 2:
+		                    IPOfficialTileLaneBitMajorAvx512BitDeltaFixedStored<2>(
+		                        query, compact, stored_bits, lane_mask, valid_count, dim,
+		                        out_ip_ex);
+		                    break;
+		                default:
+		                    break;
+		            }
+		        }
+
+		        template <uint8_t FirstBit, uint8_t BitCount>
+		        VDB_FORCE_INLINE void IPOfficialTileLaneBitMajorAvx512BitRangeDeltaFixedStored(
+		            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+		            uint8_t stored_bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+		            float* VDB_RESTRICT out_ip_ex) {
+		            static_assert(BitCount >= 1 && BitCount <= 2,
+		                          "BitCount must be one or two");
+		            static_assert(FirstBit + BitCount <= 3,
+		                          "Bit range must fit stored 3-bit payloads");
+		            if (stored_bits < FirstBit + BitCount || stored_bits > 3 ||
+		                valid_count == 0) {
+		                return;
+		            }
+		            uint32_t lanes[32] = {};
+		            uint32_t lane_count = 0;
+		            uint32_t m = lane_mask;
+		            while (m != 0) {
+		                const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(m));
+		                if (lane < valid_count) {
+		                    lanes[lane_count++] = lane;
+		                }
+		                m &= (m - 1u);
+		            }
+		            if (lane_count == 0) {
+		                return;
+		            }
+
+		            __m512 dot0[32];
+		            __m512 dot1[32];
+		            for (uint32_t i = 0; i < lane_count; ++i) {
+		                dot0[i] = _mm512_setzero_ps();
+		                if constexpr (BitCount > 1) {
+		                    dot1[i] = _mm512_setzero_ps();
+		                }
+		            }
+
+		            uint32_t d = 0;
+		            const uint8_t* tile = compact;
+		            while (d < dim) {
+		                const uint32_t tile_dims = ExRaBitQBitMajorTileDims(dim - d);
+		                const uint32_t plane_bytes = tile_dims / 8u;
+		                const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - d);
+		                const uint32_t full_slices = remaining / 16u;
+		                const uint8_t* plane0_base =
+		                    tile + static_cast<size_t>(FirstBit) * valid_count * plane_bytes;
+		                const uint8_t* plane1_base = nullptr;
+		                if constexpr (BitCount > 1) {
+		                    plane1_base = plane0_base +
+		                                  static_cast<size_t>(valid_count) * plane_bytes;
+		                }
+		                for (uint32_t sub = 0; sub < full_slices; ++sub) {
+		                    const __m512 q = _mm512_loadu_ps(query + d + sub * 16u);
+		                    for (uint32_t li = 0; li < lane_count; ++li) {
+		                        const uint32_t lane = lanes[li];
+		                        uint16_t mask0 = 0;
+		                        const uint8_t* plane0 =
+		                            plane0_base + static_cast<size_t>(lane) * plane_bytes;
+		                        std::memcpy(&mask0, plane0 + sub * sizeof(uint16_t),
+		                                    sizeof(uint16_t));
+		                        dot0[li] = _mm512_add_ps(
+		                            dot0[li],
+		                            _mm512_maskz_mov_ps(static_cast<__mmask16>(mask0), q));
+		                        if constexpr (BitCount > 1) {
+		                            uint16_t mask1 = 0;
+		                            const uint8_t* plane1 =
+		                                plane1_base + static_cast<size_t>(lane) * plane_bytes;
+		                            std::memcpy(&mask1, plane1 + sub * sizeof(uint16_t),
+		                                        sizeof(uint16_t));
+		                            dot1[li] = _mm512_add_ps(
+		                                dot1[li],
+		                                _mm512_maskz_mov_ps(static_cast<__mmask16>(mask1), q));
+		                        }
+		                    }
+		                }
+		                const uint32_t tail = remaining - full_slices * 16u;
+		                if (tail != 0) {
+		                    const __mmask16 valid =
+		                        static_cast<__mmask16>((1u << tail) - 1u);
+		                    const __m512 q =
+		                        _mm512_maskz_loadu_ps(valid, query + d + full_slices * 16u);
+		                    for (uint32_t li = 0; li < lane_count; ++li) {
+		                        const uint32_t lane = lanes[li];
+		                        uint16_t mask0 = 0;
+		                        const uint8_t* plane0 =
+		                            plane0_base + static_cast<size_t>(lane) * plane_bytes;
+		                        std::memcpy(&mask0, plane0 + full_slices * sizeof(uint16_t),
+		                                    sizeof(uint16_t));
+		                        dot0[li] = _mm512_add_ps(
+		                            dot0[li],
+		                            _mm512_maskz_mov_ps(static_cast<__mmask16>(mask0) & valid,
+		                                                q));
+		                        if constexpr (BitCount > 1) {
+		                            uint16_t mask1 = 0;
+		                            const uint8_t* plane1 =
+		                                plane1_base + static_cast<size_t>(lane) * plane_bytes;
+		                            std::memcpy(&mask1,
+		                                        plane1 + full_slices * sizeof(uint16_t),
+		                                        sizeof(uint16_t));
+		                            dot1[li] = _mm512_add_ps(
+		                                dot1[li],
+		                                _mm512_maskz_mov_ps(
+		                                    static_cast<__mmask16>(mask1) & valid, q));
+		                        }
+		                    }
+		                }
+		                tile += static_cast<size_t>(stored_bits) * valid_count * plane_bytes;
+		                d += remaining;
+		            }
+
+		            const float weight0 = static_cast<float>(1u << FirstBit);
+		            const float weight1 = static_cast<float>(1u << (FirstBit + 1u));
+		            for (uint32_t li = 0; li < lane_count; ++li) {
+		                float result = weight0 * _mm512_reduce_add_ps(dot0[li]);
+		                if constexpr (BitCount > 1) {
+		                    result += weight1 * _mm512_reduce_add_ps(dot1[li]);
+		                }
+		                out_ip_ex[lanes[li]] += result;
+		            }
+		        }
+
+		        VDB_FORCE_INLINE void IPOfficialTileLaneBitMajorAvx512BitRangeDeltaStored(
+		            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+		            uint8_t stored_bits, uint8_t first_bit, uint8_t bit_count,
+		            uint32_t lane_mask, uint32_t valid_count, Dim dim,
+		            float* VDB_RESTRICT out_ip_ex) {
+		            if (bit_count == 1) {
+		                IPOfficialTileLaneBitMajorAvx512BitDeltaStored(
+		                    query, compact, stored_bits, first_bit, lane_mask, valid_count,
+		                    dim, out_ip_ex);
+		                return;
+		            }
+		            if (bit_count != 2) {
+		                return;
+		            }
+		            switch (first_bit) {
+		                case 0:
+		                    IPOfficialTileLaneBitMajorAvx512BitRangeDeltaFixedStored<0, 2>(
+		                        query, compact, stored_bits, lane_mask, valid_count, dim,
+		                        out_ip_ex);
+		                    break;
+		                case 1:
+		                    IPOfficialTileLaneBitMajorAvx512BitRangeDeltaFixedStored<1, 2>(
+		                        query, compact, stored_bits, lane_mask, valid_count, dim,
+		                        out_ip_ex);
+		                    break;
+		                default:
+		                    break;
+		            }
+		        }
+
+		        VDB_FORCE_INLINE void IPOfficialTileLaneBitMajorAvx512Stored(
+		            const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact,
+		            uint8_t stored_bits, uint8_t active_bits, uint32_t lane_mask,
+	            uint32_t valid_count, Dim dim, float* VDB_RESTRICT out_ip_ex) {
+	            active_bits = ResolveActiveBits(stored_bits, active_bits);
+	            if (active_bits == 0) {
+	                return;
+	            }
+	            switch (active_bits) {
+	                case 1:
+	                    IPOfficialTileLaneBitMajorAvx512FixedStored<1>(
+	                        query, compact, stored_bits, lane_mask, valid_count, dim,
+	                        out_ip_ex);
+	                    break;
+	                case 2:
+	                    IPOfficialTileLaneBitMajorAvx512FixedStored<2>(
+	                        query, compact, stored_bits, lane_mask, valid_count, dim,
+	                        out_ip_ex);
+	                    break;
+	                case 3:
+	                    IPOfficialTileLaneBitMajorAvx512FixedStored<3>(
+	                        query, compact, stored_bits, lane_mask, valid_count, dim,
+	                        out_ip_ex);
+	                    break;
+	                default:
+	                    break;
+	            }
+	        }
 
         template <uint8_t Bits>
         VDB_FORCE_INLINE void IPOfficialDirectBitplanesMicroBatchAvx512Fixed(
@@ -1000,6 +1662,19 @@ uint32_t ExRaBitQBitMajorTileVectorBytes(uint32_t dim, uint8_t bits) {
     return static_cast<uint32_t>(bytes);
 }
 
+uint32_t ExRaBitQTileLaneBitMajorBatchBytes(uint32_t dim, uint8_t bits,
+                                            uint32_t valid_count) {
+    if (bits < 1 || bits > 3 || valid_count == 0) {
+        return 0;
+    }
+    const uint32_t vector_bytes = ExRaBitQBitMajorTileVectorBytes(dim, bits);
+    if (vector_bytes == 0 ||
+        vector_bytes > UINT32_MAX / std::max<uint32_t>(valid_count, 1u)) {
+        return 0;
+    }
+    return vector_bytes * valid_count;
+}
+
 bool ExRaBitQPackMagnitudes(const uint8_t* VDB_RESTRICT decoded, uint32_t count, uint8_t bits,
                             uint8_t* VDB_RESTRICT packed, uint32_t packed_bytes) {
     if (decoded == nullptr || packed == nullptr) {
@@ -1317,6 +1992,84 @@ bool ExRaBitQUnpackOfficialBitMajorTiles(const uint8_t* VDB_RESTRICT packed, uin
             decoded[done + i] = v;
         }
         tile += static_cast<size_t>(bits) * plane_bytes;
+        done += remaining;
+    }
+    return true;
+}
+
+bool ExRaBitQPackOfficialTileLaneBitMajor(
+    const uint8_t* const* VDB_RESTRICT decoded_lanes, uint32_t valid_count,
+    uint32_t dim, uint8_t bits, uint8_t* VDB_RESTRICT packed,
+    uint32_t packed_bytes) {
+    if (decoded_lanes == nullptr || packed == nullptr || valid_count == 0 ||
+        bits < 1 || bits > 3) {
+        return false;
+    }
+    const uint32_t expected_bytes =
+        ExRaBitQTileLaneBitMajorBatchBytes(dim, bits, valid_count);
+    if (expected_bytes == 0 || packed_bytes < expected_bytes) {
+        return false;
+    }
+    const uint8_t max_value = static_cast<uint8_t>((1u << bits) - 1u);
+    std::memset(packed, 0, packed_bytes);
+    uint32_t done = 0;
+    uint8_t* tile = packed;
+    while (done < dim) {
+        const uint32_t tile_dims = ExRaBitQBitMajorTileDims(dim - done);
+        const uint32_t plane_bytes = tile_dims / 8u;
+        const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - done);
+        for (uint32_t lane = 0; lane < valid_count; ++lane) {
+            if (decoded_lanes[lane] == nullptr) {
+                return false;
+            }
+            for (uint32_t i = 0; i < remaining; ++i) {
+                const uint8_t v = decoded_lanes[lane][done + i];
+                if (v > max_value) {
+                    return false;
+                }
+                for (uint8_t bit = 0; bit < bits; ++bit) {
+                    if ((v & (1u << bit)) != 0) {
+                        uint8_t* plane =
+                            tile + (static_cast<size_t>(bit) * valid_count + lane) *
+                                       plane_bytes;
+                        plane[i / 8u] |= static_cast<uint8_t>(1u << (i % 8u));
+                    }
+                }
+            }
+        }
+        tile += static_cast<size_t>(bits) * valid_count * plane_bytes;
+        done += remaining;
+    }
+    return true;
+}
+
+bool ExRaBitQUnpackOfficialTileLaneBitMajor(
+    const uint8_t* VDB_RESTRICT packed, uint32_t valid_count, uint32_t lane_id,
+    uint32_t dim, uint8_t bits, uint8_t* VDB_RESTRICT decoded) {
+    if (packed == nullptr || decoded == nullptr || valid_count == 0 ||
+        lane_id >= valid_count || bits < 1 || bits > 3) {
+        return false;
+    }
+    std::memset(decoded, 0, dim);
+    uint32_t done = 0;
+    const uint8_t* tile = packed;
+    while (done < dim) {
+        const uint32_t tile_dims = ExRaBitQBitMajorTileDims(dim - done);
+        const uint32_t plane_bytes = tile_dims / 8u;
+        const uint32_t remaining = std::min<uint32_t>(tile_dims, dim - done);
+        for (uint32_t i = 0; i < remaining; ++i) {
+            uint8_t v = 0;
+            for (uint8_t bit = 0; bit < bits; ++bit) {
+                const uint8_t* plane =
+                    tile + (static_cast<size_t>(bit) * valid_count + lane_id) *
+                               plane_bytes;
+                const uint8_t plane_bit =
+                    static_cast<uint8_t>((plane[i / 8u] >> (i % 8u)) & 0x01u);
+                v = static_cast<uint8_t>(v | (plane_bit << bit));
+            }
+            decoded[done + i] = v;
+        }
+        tile += static_cast<size_t>(bits) * valid_count * plane_bytes;
         done += remaining;
     }
     return true;
@@ -2030,19 +2783,24 @@ void IPOfficialRaBitQBatchCompactDirect3Masked(
 void IPOfficialRaBitQBatchCompactDirectBitplanesMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks, uint8_t bits,
     uint32_t lane_mask, uint32_t valid_count, Dim dim, uint32_t dim_block,
-    float* VDB_RESTRICT out_ip_ex, IPExRaBitQBatchPackedSignCompactTiming* timing) {
+    float* VDB_RESTRICT out_ip_ex, IPExRaBitQBatchPackedSignCompactTiming* timing,
+    uint8_t active_bits) {
     IPOfficialRaBitQBatchCompactDirectBitplanesStridedMasked(
         query, compact_blocks, bits, 8, lane_mask, valid_count, dim, dim_block, out_ip_ex,
-        timing);
+        timing, active_bits);
 }
 
 void IPOfficialRaBitQBatchCompactDirectBitplanesStridedMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks, uint8_t bits,
     uint32_t stored_lanes, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
-    IPExRaBitQBatchPackedSignCompactTiming* timing) {
+    IPExRaBitQBatchPackedSignCompactTiming* timing, uint8_t active_bits) {
+    active_bits = ResolveActiveBits(bits, active_bits);
     if (compact_blocks == nullptr || dim_block != kOfficialDirect3DimBlock || bits < 1 ||
-        bits > 4 || stored_lanes == 0) {
+        bits > 4 || active_bits > bits || stored_lanes == 0) {
+        return;
+    }
+    if (active_bits == 0) {
         return;
     }
     const uint32_t valid_mask = valid_count >= 32 ? 0xFFFFFFFFu : ((1u << valid_count) - 1u);
@@ -2066,11 +2824,11 @@ void IPOfficialRaBitQBatchCompactDirectBitplanesStridedMasked(
             const uint8_t* lane_compact =
                 block_base + static_cast<size_t>(lane) * bytes_per_lane;
         #if defined(VDB_USE_AVX512)
-            out_ip_ex[lane] += IPOfficialDirectBitplanesAvx512(
-                query + dim_start, lane_compact, bits, remaining);
+            out_ip_ex[lane] += IPOfficialDirectBitplanesAvx512Stored(
+                query + dim_start, lane_compact, bits, active_bits, remaining);
         #else
-            out_ip_ex[lane] += IPOfficialDirectBitplanesReference(
-                query + dim_start, lane_compact, bits, remaining);
+            out_ip_ex[lane] += IPOfficialDirectBitplanesReferenceStored(
+                query + dim_start, lane_compact, bits, active_bits, remaining);
         #endif
             if (measure) {
                 timing->abs_fma_ms += std::chrono::duration<double, std::milli>(
@@ -2086,9 +2844,13 @@ void IPOfficialRaBitQBatchCompactVectorBitplanesMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
-    IPExRaBitQBatchPackedSignCompactTiming* timing) {
+    IPExRaBitQBatchPackedSignCompactTiming* timing, uint8_t active_bits) {
+    active_bits = ResolveActiveBits(bits, active_bits);
     if (compact_blocks == nullptr || dim_block != kOfficialDirect3DimBlock ||
-        bits < 1 || bits > 4) {
+        bits < 1 || bits > 4 || active_bits > bits) {
+        return;
+    }
+    if (active_bits == 0) {
         return;
     }
     const uint32_t valid_mask = valid_count >= 32 ? 0xFFFFFFFFu : ((1u << valid_count) - 1u);
@@ -2112,11 +2874,11 @@ void IPOfficialRaBitQBatchCompactVectorBitplanesMasked(
         const auto abs_start = measure ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
     #if defined(VDB_USE_AVX512)
-        out_ip_ex[lane] += IPOfficialDirectBitplanesAvx512(
-            query, lane_compact, bits, dim);
+        out_ip_ex[lane] += IPOfficialDirectBitplanesAvx512Stored(
+            query, lane_compact, bits, active_bits, dim);
     #else
-        out_ip_ex[lane] += IPOfficialDirectBitplanesReference(
-            query, lane_compact, bits, dim);
+        out_ip_ex[lane] += IPOfficialDirectBitplanesReferenceStored(
+            query, lane_compact, bits, active_bits, dim);
     #endif
         if (measure) {
             timing->abs_fma_ms += std::chrono::duration<double, std::milli>(
@@ -2131,9 +2893,13 @@ void IPOfficialRaBitQBatchCompactVectorBitMajorTilesMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
-    IPExRaBitQBatchPackedSignCompactTiming* timing) {
+    IPExRaBitQBatchPackedSignCompactTiming* timing, uint8_t active_bits) {
+    active_bits = ResolveActiveBits(bits, active_bits);
     if (compact_blocks == nullptr || dim_block != kOfficialDirect3DimBlock ||
-        bits < 1 || bits > 3) {
+        bits < 1 || bits > 3 || active_bits > bits) {
+        return;
+    }
+    if (active_bits == 0) {
         return;
     }
     const uint32_t valid_mask = valid_count >= 32 ? 0xFFFFFFFFu : ((1u << valid_count) - 1u);
@@ -2155,11 +2921,11 @@ void IPOfficialRaBitQBatchCompactVectorBitMajorTilesMasked(
         const auto abs_start = measure ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
     #if defined(VDB_USE_AVX512)
-        out_ip_ex[lane] += IPOfficialBitMajorTilesAvx512(
-            query, lane_compact, bits, dim);
+        out_ip_ex[lane] += IPOfficialBitMajorTilesAvx512Stored(
+            query, lane_compact, bits, active_bits, dim);
     #else
-        out_ip_ex[lane] += IPOfficialBitMajorTilesReference(
-            query, lane_compact, bits, dim);
+        out_ip_ex[lane] += IPOfficialBitMajorTilesReferenceStored(
+            query, lane_compact, bits, active_bits, dim);
     #endif
         if (measure) {
             timing->abs_fma_ms += std::chrono::duration<double, std::milli>(
@@ -2170,13 +2936,152 @@ void IPOfficialRaBitQBatchCompactVectorBitMajorTilesMasked(
     }
 }
 
+void IPOfficialRaBitQBatchCompactTileLaneBitMajorMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
+    uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing, uint8_t active_bits) {
+    active_bits = ResolveActiveBits(bits, active_bits);
+    if (compact_blocks == nullptr || dim_block != kOfficialDirect3DimBlock ||
+        bits < 1 || bits > 3 || active_bits > bits || valid_count == 0) {
+        return;
+    }
+    if (active_bits == 0) {
+        return;
+    }
+    const uint32_t valid_mask = valid_count >= 32 ? 0xFFFFFFFFu : ((1u << valid_count) - 1u);
+    lane_mask &= valid_mask;
+    if (lane_mask == 0) {
+        return;
+    }
+    const uint32_t batch_bytes =
+        ExRaBitQTileLaneBitMajorBatchBytes(dim, bits, valid_count);
+    if (batch_bytes == 0) {
+        return;
+    }
+    const bool measure = timing != nullptr;
+    const auto abs_start = measure ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+#if defined(VDB_USE_AVX512)
+    IPOfficialTileLaneBitMajorAvx512Stored(query, compact_blocks, bits, active_bits,
+                                           lane_mask, valid_count, dim, out_ip_ex);
+#else
+    uint32_t m = lane_mask;
+    while (m != 0) {
+        const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(m));
+        out_ip_ex[lane] += IPOfficialTileLaneBitMajorReferenceStored(
+            query, compact_blocks, valid_count, lane, bits, active_bits, dim);
+        m &= (m - 1u);
+    }
+#endif
+    if (measure) {
+        timing->abs_fma_ms += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - abs_start)
+                                  .count();
+    }
+}
+
+void IPOfficialRaBitQBatchCompactTileLaneBitMajorBitDeltaMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint8_t bit_id, uint32_t lane_mask, uint32_t valid_count,
+    Dim dim, uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing) {
+    if (compact_blocks == nullptr || dim_block != kOfficialDirect3DimBlock ||
+        bits < 1 || bits > 3 || bit_id >= bits || valid_count == 0) {
+        return;
+    }
+    const uint32_t valid_mask = valid_count >= 32 ? 0xFFFFFFFFu : ((1u << valid_count) - 1u);
+    lane_mask &= valid_mask;
+    if (lane_mask == 0) {
+        return;
+    }
+    const uint32_t batch_bytes =
+        ExRaBitQTileLaneBitMajorBatchBytes(dim, bits, valid_count);
+    if (batch_bytes == 0) {
+        return;
+    }
+    const bool measure = timing != nullptr;
+    const auto abs_start = measure ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+#if defined(VDB_USE_AVX512)
+    IPOfficialTileLaneBitMajorAvx512BitDeltaStored(
+        query, compact_blocks, bits, bit_id, lane_mask, valid_count, dim, out_ip_ex);
+#else
+    uint32_t m = lane_mask;
+    while (m != 0) {
+        const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(m));
+        out_ip_ex[lane] += IPOfficialTileLaneBitMajorReferenceBitDeltaStored(
+            query, compact_blocks, valid_count, lane, bits, bit_id, dim);
+        m &= (m - 1u);
+    }
+#endif
+    if (measure) {
+        timing->abs_fma_ms += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - abs_start)
+                                  .count();
+    }
+}
+
+void IPOfficialRaBitQBatchCompactTileLaneBitMajorBitRangeDeltaMasked(
+    const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
+    uint8_t bits, uint8_t first_bit, uint8_t bit_count, uint32_t lane_mask,
+    uint32_t valid_count, Dim dim, uint32_t dim_block,
+    float* VDB_RESTRICT out_ip_ex,
+    IPExRaBitQBatchPackedSignCompactTiming* timing) {
+    if (bit_count == 0 || first_bit >= bits ||
+        static_cast<uint32_t>(first_bit) + bit_count > bits) {
+        return;
+    }
+    if (compact_blocks == nullptr || dim_block != kOfficialDirect3DimBlock ||
+        bits < 1 || bits > 3 || valid_count == 0) {
+        return;
+    }
+    const uint32_t valid_mask = valid_count >= 32 ? 0xFFFFFFFFu : ((1u << valid_count) - 1u);
+    lane_mask &= valid_mask;
+    if (lane_mask == 0) {
+        return;
+    }
+    const uint32_t batch_bytes =
+        ExRaBitQTileLaneBitMajorBatchBytes(dim, bits, valid_count);
+    if (batch_bytes == 0) {
+        return;
+    }
+    const bool measure = timing != nullptr;
+    const auto abs_start = measure ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+#if defined(VDB_USE_AVX512)
+    IPOfficialTileLaneBitMajorAvx512BitRangeDeltaStored(
+        query, compact_blocks, bits, first_bit, bit_count, lane_mask, valid_count,
+        dim, out_ip_ex);
+#else
+    for (uint8_t bit = first_bit; bit < first_bit + bit_count; ++bit) {
+        uint32_t m = lane_mask;
+        while (m != 0) {
+            const uint32_t lane = static_cast<uint32_t>(__builtin_ctz(m));
+            out_ip_ex[lane] += IPOfficialTileLaneBitMajorReferenceBitDeltaStored(
+                query, compact_blocks, valid_count, lane, bits, bit, dim);
+            m &= (m - 1u);
+        }
+    }
+#endif
+    if (measure) {
+        timing->abs_fma_ms += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - abs_start)
+                                  .count();
+    }
+}
+
 void IPOfficialRaBitQBatchCompactVectorBitplanesPrefetchMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
-    IPExRaBitQBatchPackedSignCompactTiming* timing) {
+    IPExRaBitQBatchPackedSignCompactTiming* timing, uint8_t active_bits) {
+    active_bits = ResolveActiveBits(bits, active_bits);
     if (compact_blocks == nullptr || dim_block != kOfficialDirect3DimBlock ||
-        bits < 1 || bits > 4) {
+        bits < 1 || bits > 4 || active_bits > bits) {
+        return;
+    }
+    if (active_bits == 0) {
         return;
     }
     const uint32_t valid_mask = valid_count >= 32 ? 0xFFFFFFFFu : ((1u << valid_count) - 1u);
@@ -2206,11 +3111,11 @@ void IPOfficialRaBitQBatchCompactVectorBitplanesPrefetchMasked(
         const auto abs_start = measure ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
     #if defined(VDB_USE_AVX512)
-        out_ip_ex[lane] += IPOfficialDirectBitplanesAvx512(
-            query, lane_compact, bits, dim);
+        out_ip_ex[lane] += IPOfficialDirectBitplanesAvx512Stored(
+            query, lane_compact, bits, active_bits, dim);
     #else
-        out_ip_ex[lane] += IPOfficialDirectBitplanesReference(
-            query, lane_compact, bits, dim);
+        out_ip_ex[lane] += IPOfficialDirectBitplanesReferenceStored(
+            query, lane_compact, bits, active_bits, dim);
     #endif
         if (measure) {
             timing->abs_fma_ms += std::chrono::duration<double, std::milli>(
@@ -2225,9 +3130,13 @@ void IPOfficialRaBitQBatchCompactVectorBitplanesMicroBatchMasked(
     const float* VDB_RESTRICT query, const uint8_t* VDB_RESTRICT compact_blocks,
     uint8_t bits, uint32_t lane_mask, uint32_t valid_count, Dim dim,
     uint32_t dim_block, float* VDB_RESTRICT out_ip_ex,
-    IPExRaBitQBatchPackedSignCompactTiming* timing) {
+    IPExRaBitQBatchPackedSignCompactTiming* timing, uint8_t active_bits) {
+    active_bits = ResolveActiveBits(bits, active_bits);
     if (compact_blocks == nullptr || dim_block != kOfficialDirect3DimBlock ||
-        bits < 1 || bits > 4) {
+        bits < 1 || bits > 4 || active_bits > bits) {
+        return;
+    }
+    if (active_bits == 0) {
         return;
     }
     const uint32_t valid_mask = valid_count >= 32 ? 0xFFFFFFFFu : ((1u << valid_count) - 1u);
@@ -2236,10 +3145,10 @@ void IPOfficialRaBitQBatchCompactVectorBitplanesMicroBatchMasked(
         return;
     }
     const uint32_t requested_lanes = static_cast<uint32_t>(__builtin_popcount(lane_mask));
-    if (requested_lanes <= 1) {
+    if (requested_lanes <= 1 || active_bits != bits) {
         IPOfficialRaBitQBatchCompactVectorBitplanesMasked(
             query, compact_blocks, bits, lane_mask, valid_count, dim, dim_block, out_ip_ex,
-            timing);
+            timing, active_bits);
         return;
     }
 
