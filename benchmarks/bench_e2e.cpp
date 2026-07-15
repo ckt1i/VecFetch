@@ -111,6 +111,29 @@ static const char* DynamicSafeInModeName(DynamicSafeInMode mode) {
     return "unknown";
 }
 
+static bool ParseMaterializationModeArg(const std::string& value,
+                                        MaterializationMode* out) {
+    if (value == "eager" || value == "eager_safein") {
+        *out = MaterializationMode::EagerSafeIn;
+        return true;
+    }
+    if (value == "late" || value == "late_materialization") {
+        *out = MaterializationMode::Late;
+        return true;
+    }
+    return false;
+}
+
+static const char* MaterializationModeName(MaterializationMode mode) {
+    switch (mode) {
+        case MaterializationMode::EagerSafeIn:
+            return "eager";
+        case MaterializationMode::Late:
+            return "late";
+    }
+    return "unknown";
+}
+
 static bool RejectDeletedDynamicSafeInFlag(int argc, char* argv[]) {
     static constexpr const char* kDeletedFlags[] = {
         "--dynamic-safein-scale",
@@ -1916,12 +1939,26 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--dynamic-safein-defer-until-ready", 0);
     int arg_dynamic_safein_defer_max_candidates =
         GetIntArg(argc, argv, "--dynamic-safein-defer-max-candidates", 0);
+    MaterializationMode arg_materialization_mode =
+        MaterializationMode::EagerSafeIn;
+    const std::string arg_materialization_mode_str =
+        GetStringArg(argc, argv, "--materialization-mode", "eager");
+    if (!ParseMaterializationModeArg(arg_materialization_mode_str,
+                                     &arg_materialization_mode)) {
+        std::fprintf(stderr,
+                     "Invalid --materialization-mode: %s "
+                     "(expected eager or late)\n",
+                     arg_materialization_mode_str.c_str());
+        return 1;
+    }
     int arg_safein_as_vec_only =
         GetIntArg(argc, argv, "--safein-as-vec-only", 0);
     int arg_non_safeout_candidate_budget =
         GetIntArg(argc, argv, "--non-safeout-candidate-budget", 0);
-    int arg_safein_all_threshold_bytes =
-        GetIntArg(argc, argv, "--safein-all-threshold-bytes", 256 * 1024);
+    int arg_safein_threshold_bytes =
+        GetIntArg(argc, argv, "--safein-threshold-bytes",
+                  GetIntArg(argc, argv, "--safein-all-threshold-bytes",
+                            256 * 1024));
     int arg_bits       = GetIntArg(argc, argv, "--bits", 1);
     int arg_block_size = GetIntArg(argc, argv, "--block-size", 64);
     float arg_c_factor = GetFloatArg(argc, argv, "--c-factor", 5.75f);
@@ -2038,11 +2075,11 @@ int main(int argc, char* argv[]) {
                      arg_submission_mode.c_str());
         return 1;
     }
-    if (arg_safein_all_threshold_bytes < 0) {
+    if (arg_safein_threshold_bytes < 0) {
         std::fprintf(stderr,
-                     "Invalid --safein-all-threshold-bytes: %d "
+                     "Invalid --safein-threshold-bytes: %d "
                      "(expected >= 0)\n",
-                     arg_safein_all_threshold_bytes);
+                     arg_safein_threshold_bytes);
         return 1;
     }
     if (arg_non_safeout_candidate_budget < 0) {
@@ -2095,6 +2132,9 @@ int main(int argc, char* argv[]) {
                      "Invalid --safein-as-vec-only: %d (expected 0 or 1)\n",
                      arg_safein_as_vec_only);
         return 1;
+    }
+    if (arg_safein_as_vec_only == 1) {
+        arg_materialization_mode = MaterializationMode::Late;
     }
 
     // nprobe sweep: --nprobe-sweep 50,100,150,200 (mutually exclusive with --nprobe)
@@ -2867,11 +2907,12 @@ int main(int argc, char* argv[]) {
         (arg_dynamic_safein_defer_until_ready != 0);
     search_cfg.dynamic_safein_defer_max_candidates =
         static_cast<uint32_t>(std::max(arg_dynamic_safein_defer_max_candidates, 0));
+    search_cfg.materialization_mode = arg_materialization_mode;
     search_cfg.safein_as_vec_only = (arg_safein_as_vec_only != 0);
     search_cfg.non_safeout_candidate_budget =
         static_cast<uint32_t>(arg_non_safeout_candidate_budget);
-    search_cfg.safein_all_threshold =
-        static_cast<uint32_t>(arg_safein_all_threshold_bytes);
+    search_cfg.safein_threshold_bytes =
+        static_cast<uint32_t>(arg_safein_threshold_bytes);
     search_cfg.io_queue_depth = static_cast<uint32_t>(arg_io_queue_depth);
     search_cfg.fixed_vec_buffer_count =
         static_cast<uint32_t>(std::max(arg_fixed_vec_buffer_count, 0));
@@ -3339,12 +3380,16 @@ int main(int argc, char* argv[]) {
                              search_cfg.dynamic_safein_defer_until_ready) << ",\n";
         f << "    " << JInt("dynamic_safein_defer_max_candidates",
                             search_cfg.dynamic_safein_defer_max_candidates) << ",\n";
+        f << "    " << JStr("materialization_mode",
+                            MaterializationModeName(search_cfg.materialization_mode)) << ",\n";
+        f << "    " << JBool("late_materialization_enabled",
+                             search_cfg.late_materialization_enabled()) << ",\n";
         f << "    " << JBool("safein_as_vec_only",
                              search_cfg.safein_as_vec_only) << ",\n";
         f << "    " << JInt("non_safeout_candidate_budget",
                             search_cfg.non_safeout_candidate_budget) << ",\n";
-        f << "    " << JInt("safein_all_threshold_bytes",
-                            search_cfg.safein_all_threshold) << ",\n";
+        f << "    " << JInt("safein_threshold_bytes",
+                            search_cfg.safein_threshold_bytes) << ",\n";
         f << "    " << JInt("io_queue_depth", search_cfg.io_queue_depth) << ",\n";
         f << "    " << JInt("fixed_vec_buffer_count", search_cfg.fixed_vec_buffer_count) << ",\n";
         f << "    " << JInt("cluster_submit_reserve", search_cfg.cluster_submit_reserve) << ",\n";

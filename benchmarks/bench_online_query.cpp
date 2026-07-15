@@ -2,11 +2,13 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -27,6 +29,7 @@
 #include "vdb/query/overlap_scheduler.h"
 #include "vdb/query/search_results.h"
 #include "vdb/storage/cluster_store.h"
+#include "vdb/storage/hot_record.h"
 
 namespace fs = std::filesystem;
 
@@ -37,13 +40,18 @@ using vdb::Status;
 using vdb::StatusOr;
 using vdb::index::IvfIndex;
 using vdb::query::DynamicSafeInMode;
+using vdb::query::InlineHotRecordStoreConfig;
 using vdb::query::IoUringReader;
+using vdb::query::MaterializationMode;
 using vdb::query::OverlapScheduler;
+using vdb::query::QueryExecutionMode;
 using vdb::query::SeparateRecordMap;
 using vdb::query::SeparateRecordLocation;
 using vdb::query::SearchConfig;
 using vdb::query::SearchResults;
+using vdb::query::SafeInPrefetchOrder;
 using vdb::query::SubmissionMode;
+using vdb::query::VectorReadTraceEntry;
 using vdb::bench::BuildClusterMembers;
 using vdb::bench::CalibrateSplitEpsilon;
 using vdb::bench::EncodeAllCodes;
@@ -52,6 +60,7 @@ using vdb::bench::EpsilonSamplingMode;
 using vdb::bench::EpsilonSamplingModeName;
 using vdb::bench::LoadAssignments;
 using vdb::bench::ParseEpsilonSamplingModeArg;
+using vdb::storage::HotPayloadDescriptor;
 using vdb::bench::RecoverClusterMembersFromIndex;
 
 static void Log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -130,6 +139,79 @@ static std::string JInt(const std::string& k, int64_t v) {
 
 static std::string JBool(const std::string& k, bool v) {
     return "\"" + k + "\": " + (v ? "true" : "false");
+}
+
+static uint64_t ReadJsonUint64Field(const std::string& path,
+                                    const std::string& key,
+                                    uint64_t fallback) {
+    std::ifstream f(path);
+    if (!f.is_open()) return fallback;
+    std::string content((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+    const std::string quoted_key = "\"" + key + "\"";
+    const size_t key_pos = content.find(quoted_key);
+    if (key_pos == std::string::npos) return fallback;
+    const size_t colon = content.find(':', key_pos + quoted_key.size());
+    if (colon == std::string::npos) return fallback;
+    size_t pos = colon + 1;
+    while (pos < content.size() &&
+           std::isspace(static_cast<unsigned char>(content[pos]))) {
+        ++pos;
+    }
+    if (pos >= content.size() ||
+        !std::isdigit(static_cast<unsigned char>(content[pos]))) {
+        return fallback;
+    }
+    char* end = nullptr;
+    const uint64_t value =
+        std::strtoull(content.c_str() + pos, &end, 10);
+    return end == content.c_str() + pos ? fallback : value;
+}
+
+static const char* QueryExecutionModeName(QueryExecutionMode mode) {
+    switch (mode) {
+        case QueryExecutionMode::Overlap:
+            return "overlap";
+        case QueryExecutionMode::SerialNoOverlap:
+            return "serial_no_overlap";
+    }
+    return "unknown";
+}
+
+static bool ParseQueryExecutionModeArg(const std::string& value,
+                                       QueryExecutionMode* out) {
+    if (value == "overlap") {
+        *out = QueryExecutionMode::Overlap;
+        return true;
+    }
+    if (value == "serial-no-overlap" || value == "serial_no_overlap") {
+        *out = QueryExecutionMode::SerialNoOverlap;
+        return true;
+    }
+    return false;
+}
+
+static bool ParseMaterializationModeArg(const std::string& value,
+                                        MaterializationMode* out) {
+    if (value == "eager" || value == "eager_safein") {
+        *out = MaterializationMode::EagerSafeIn;
+        return true;
+    }
+    if (value == "late" || value == "late_materialization") {
+        *out = MaterializationMode::Late;
+        return true;
+    }
+    return false;
+}
+
+static const char* MaterializationModeName(MaterializationMode mode) {
+    switch (mode) {
+        case MaterializationMode::EagerSafeIn:
+            return "eager";
+        case MaterializationMode::Late:
+            return "late";
+    }
+    return "unknown";
 }
 
 static bool ReadFloatCache(const std::string& path, float* out) {
@@ -237,34 +319,123 @@ static_assert(sizeof(SeparateStoreMapHeader) == 32,
 static_assert(sizeof(SeparateStoreMapRecord) == 32,
               "Unexpected SeparateStoreMapRecord layout");
 
+enum class RecordSidecarLayout {
+    None,
+    NoCombineFlatStor,
+    HotColdRecordStore,
+    ShadowVectorStore,
+    InlineHotRecordStore,
+    InlineHotShadowVectorStore,
+};
+
+static const char* RecordSidecarLayoutName(RecordSidecarLayout layout) {
+    switch (layout) {
+        case RecordSidecarLayout::NoCombineFlatStor:
+            return "no_combine_flatstor";
+        case RecordSidecarLayout::HotColdRecordStore:
+            return "hotcold_record_store";
+        case RecordSidecarLayout::ShadowVectorStore:
+            return "combined_shadow_vector";
+        case RecordSidecarLayout::InlineHotRecordStore:
+            return "inline_hot_record_store";
+        case RecordSidecarLayout::InlineHotShadowVectorStore:
+            return "inline_hot_record_store_shadow_vector";
+        case RecordSidecarLayout::None:
+        default:
+            return "combined";
+    }
+}
+
 struct SeparateStoreMapData {
     SeparateRecordMap records;
     uint64_t record_count = 0;
     uint32_t vec_bytes = 0;
 };
 
-static StatusOr<SeparateStoreMapData> LoadSeparateStoreMap(
+struct InlineDescriptorMapRecord {
+    uint64_t combined_offset;
+    uint64_t payload_offset;
+    uint32_t payload_bytes;
+    uint32_t inline_bytes;
+    uint8_t payload_storage_type;
+    uint8_t reserved[7];
+};
+
+static_assert(sizeof(InlineDescriptorMapRecord) == 32,
+              "Unexpected InlineDescriptorMapRecord layout");
+
+struct InlineDescriptorMapData {
+    InlineHotRecordStoreConfig::PayloadMetadataMap records;
+    uint64_t record_count = 0;
+    uint32_t vec_bytes = 0;
+    uint64_t file_bytes = 0;
+};
+
+static StatusOr<InlineDescriptorMapData> LoadInlineDescriptorMap(
     const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) {
-        return Status::IOError("Failed to open separate-store map: " + path);
+        return Status::IOError("Failed to open inline descriptor map: " + path);
+    }
+    SeparateStoreMapHeader hdr{};
+    f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    const char magic[8] = {'R', 'G', 'I', 'D', 'M', 'A', 'P', '1'};
+    if (!f.good() || std::memcmp(hdr.magic, magic, sizeof(magic)) != 0 ||
+        hdr.version != 1 ||
+        hdr.record_size != sizeof(InlineDescriptorMapRecord)) {
+        return Status::InvalidArgument(
+            "Invalid inline descriptor map header: " + path);
+    }
+
+    InlineDescriptorMapData out;
+    out.record_count = hdr.count;
+    out.vec_bytes = hdr.vec_bytes;
+    out.file_bytes = sizeof(hdr) +
+        hdr.count * static_cast<uint64_t>(sizeof(InlineDescriptorMapRecord));
+    out.records.reserve(static_cast<size_t>(hdr.count));
+    for (uint64_t i = 0; i < hdr.count; ++i) {
+        InlineDescriptorMapRecord rec{};
+        f.read(reinterpret_cast<char*>(&rec), sizeof(rec));
+        if (!f.good()) {
+            return Status::IOError("Truncated inline descriptor map: " + path);
+        }
+        InlineHotRecordStoreConfig::PayloadMetadata metadata;
+        metadata.payload_offset = rec.payload_offset;
+        metadata.payload_bytes = rec.payload_bytes;
+        metadata.inline_bytes = rec.inline_bytes;
+        metadata.payload_storage_type = rec.payload_storage_type;
+        if (!out.records.emplace(rec.combined_offset, metadata).second) {
+            return Status::InvalidArgument(
+                "Duplicate offset in inline descriptor map: " + path);
+        }
+    }
+    return out;
+}
+
+static StatusOr<SeparateStoreMapData> LoadRecordSidecarMap(
+    const std::string& path, const char expected_magic[8],
+    const char* layout_label) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        return Status::IOError(std::string("Failed to open ") +
+                               layout_label + " map: " + path);
     }
 
     SeparateStoreMapHeader hdr{};
     f.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
     if (!f.good()) {
-        return Status::IOError("Failed to read separate-store map header: " +
-                               path);
+        return Status::IOError(std::string("Failed to read ") +
+                               layout_label + " map header: " + path);
     }
-    const char expected_magic[8] = {'N', 'C', 'M', 'B', 'M', 'A', 'P', '1'};
-    if (std::memcmp(hdr.magic, expected_magic, sizeof(expected_magic)) != 0) {
+    if (std::memcmp(hdr.magic, expected_magic, sizeof(hdr.magic)) != 0) {
         return Status::InvalidArgument(
-            "Invalid separate-store map magic: " + path);
+            std::string("Invalid ") + layout_label + " map magic: " + path);
     }
     if (hdr.version != 1 ||
         hdr.record_size != sizeof(SeparateStoreMapRecord)) {
         return Status::InvalidArgument(
-            "Unsupported separate-store map version/record size: " + path);
+            std::string("Unsupported ") + layout_label +
+            " map version/record size: " + path);
     }
 
     SeparateStoreMapData out;
@@ -275,7 +446,8 @@ static StatusOr<SeparateStoreMapData> LoadSeparateStoreMap(
         SeparateStoreMapRecord rec{};
         f.read(reinterpret_cast<char*>(&rec), sizeof(rec));
         if (!f.good()) {
-            return Status::IOError("Truncated separate-store map: " + path);
+            return Status::IOError(std::string("Truncated ") +
+                                   layout_label + " map: " + path);
         }
         SeparateRecordLocation loc;
         loc.row_id = rec.row_id;
@@ -284,6 +456,18 @@ static StatusOr<SeparateStoreMapData> LoadSeparateStoreMap(
         out.records.emplace(rec.combined_offset, loc);
     }
     return out;
+}
+
+static StatusOr<SeparateStoreMapData> LoadSeparateStoreMap(
+    const std::string& path) {
+    const char magic[8] = {'N', 'C', 'M', 'B', 'M', 'A', 'P', '1'};
+    return LoadRecordSidecarMap(path, magic, "separate-store");
+}
+
+static StatusOr<SeparateStoreMapData> LoadHotColdStoreMap(
+    const std::string& path) {
+    const char magic[8] = {'R', 'G', 'H', 'C', 'M', 'A', 'P', '1'};
+    return LoadRecordSidecarMap(path, magic, "hot/cold");
 }
 
 struct ProcRss {
@@ -676,8 +860,23 @@ struct QueryMetrics {
     uint64_t all_reads = 0;
     uint64_t payload_reads = 0;
     uint64_t vec_only_read_bytes = 0;
+    uint64_t vec_span_read_requests = 0;
+    uint64_t vec_span_candidates = 0;
+    uint64_t vec_span_read_bytes = 0;
     uint64_t all_read_bytes = 0;
     uint64_t payload_read_bytes = 0;
+    uint64_t safein_prefix_read_requests = 0;
+    uint64_t safein_full_read_requests = 0;
+    uint64_t safein_suffix_read_requests = 0;
+    uint64_t safein_prefix_read_bytes = 0;
+    uint64_t safein_full_read_bytes = 0;
+    uint64_t safein_suffix_read_bytes = 0;
+    uint64_t serial_vector_read_requests = 0;
+    uint64_t serial_full_record_read_requests = 0;
+    uint64_t serial_payload_read_requests = 0;
+    uint64_t serial_vector_read_bytes = 0;
+    uint64_t serial_full_record_read_bytes = 0;
+    uint64_t serial_payload_read_bytes = 0;
     uint64_t budgeted_prefetch_considered = 0;
     uint64_t budgeted_prefetch_scheduled = 0;
     uint64_t budgeted_prefetch_duplicates = 0;
@@ -696,6 +895,15 @@ struct QueryMetrics {
     uint64_t safein_prefetch_skipped_count_limit = 0;
     uint64_t safein_prefetch_skipped_byte_limit = 0;
     uint64_t safein_prefetch_scheduled_bytes = 0;
+    uint64_t bextra_windows = 0;
+    uint64_t bextra_eligible_candidates = 0;
+    uint64_t bextra_scheduled_candidates = 0;
+    uint64_t bextra_predicted_service_bytes = 0;
+    uint64_t bextra_predicted_extra_bytes = 0;
+    uint64_t bextra_eligible_extra_bytes = 0;
+    uint64_t bextra_scheduled_extra_bytes = 0;
+    uint64_t bextra_completed_before_final_drain_bytes = 0;
+    uint64_t bextra_spilled_to_final_drain_bytes = 0;
     uint64_t dynamic_safein_clusters = 0;
     uint64_t dynamic_safein_active_clusters = 0;
     uint64_t dynamic_safein_disabled_clusters = 0;
@@ -711,7 +919,13 @@ struct QueryMetrics {
     uint64_t total_submit_calls = 0;
     uint64_t total_submit_window_flushes = 0;
     uint64_t total_submit_window_requests = 0;
+    uint64_t fixed_vec_buffer_hits = 0;
+    uint64_t fixed_vec_buffer_misses = 0;
     uint64_t separate_store_lookup_misses = 0;
+    uint64_t inline_descriptor_read_requests = 0;
+    uint64_t inline_descriptor_errors = 0;
+    uint64_t inline_cold_payload_deferred = 0;
+    uint64_t inline_payload_cache_hits = 0;
     uint64_t stage2_lanes_requested = 0;
     uint64_t stage2_decode_blocks = 0;
     uint64_t stage2_decode_input_bytes = 0;
@@ -742,6 +956,9 @@ struct QueryMetrics {
     double collector_finalize_ms = 0.0;
     double assemble_results_ms = 0.0;
     double search_unaccounted_ms = 0.0;
+    double serial_vector_read_ms = 0.0;
+    double serial_full_record_read_ms = 0.0;
+    double serial_payload_read_ms = 0.0;
 };
 
 static void Accumulate(QueryMetrics& m, const SearchResults& results,
@@ -760,8 +977,23 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.all_reads += st.all_read_requests;
     m.payload_reads += st.payload_read_requests;
     m.vec_only_read_bytes += st.vec_only_read_bytes;
+    m.vec_span_read_requests += st.vec_span_read_requests;
+    m.vec_span_candidates += st.vec_span_candidates;
+    m.vec_span_read_bytes += st.vec_span_read_bytes;
     m.all_read_bytes += st.all_read_bytes;
     m.payload_read_bytes += st.payload_read_bytes;
+    m.safein_prefix_read_requests += st.safein_prefix_read_requests;
+    m.safein_full_read_requests += st.safein_full_read_requests;
+    m.safein_suffix_read_requests += st.safein_suffix_read_requests;
+    m.safein_prefix_read_bytes += st.safein_prefix_read_bytes;
+    m.safein_full_read_bytes += st.safein_full_read_bytes;
+    m.safein_suffix_read_bytes += st.safein_suffix_read_bytes;
+    m.serial_vector_read_requests += st.serial_vector_read_requests;
+    m.serial_full_record_read_requests += st.serial_full_record_read_requests;
+    m.serial_payload_read_requests += st.serial_payload_read_requests;
+    m.serial_vector_read_bytes += st.serial_vector_read_bytes;
+    m.serial_full_record_read_bytes += st.serial_full_record_read_bytes;
+    m.serial_payload_read_bytes += st.serial_payload_read_bytes;
     m.budgeted_prefetch_considered += st.budgeted_prefetch_considered;
     m.budgeted_prefetch_scheduled += st.budgeted_prefetch_scheduled;
     m.budgeted_prefetch_duplicates += st.budgeted_prefetch_duplicates;
@@ -782,6 +1014,17 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.safein_prefetch_skipped_byte_limit +=
         st.safein_prefetch_skipped_byte_limit;
     m.safein_prefetch_scheduled_bytes += st.safein_prefetch_scheduled_bytes;
+    m.bextra_windows += st.bextra_windows;
+    m.bextra_eligible_candidates += st.bextra_eligible_candidates;
+    m.bextra_scheduled_candidates += st.bextra_scheduled_candidates;
+    m.bextra_predicted_service_bytes += st.bextra_predicted_service_bytes;
+    m.bextra_predicted_extra_bytes += st.bextra_predicted_extra_bytes;
+    m.bextra_eligible_extra_bytes += st.bextra_eligible_extra_bytes;
+    m.bextra_scheduled_extra_bytes += st.bextra_scheduled_extra_bytes;
+    m.bextra_completed_before_final_drain_bytes +=
+        st.bextra_completed_before_final_drain_bytes;
+    m.bextra_spilled_to_final_drain_bytes +=
+        st.bextra_spilled_to_final_drain_bytes;
     m.dynamic_safein_clusters += st.dynamic_safein_clusters;
     m.dynamic_safein_active_clusters += st.dynamic_safein_active_clusters;
     m.dynamic_safein_disabled_clusters += st.dynamic_safein_disabled_clusters;
@@ -797,7 +1040,13 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.total_submit_calls += st.total_submit_calls;
     m.total_submit_window_flushes += st.total_submit_window_flushes;
     m.total_submit_window_requests += st.total_submit_window_requests;
+    m.fixed_vec_buffer_hits += st.fixed_vec_buffer_hits;
+    m.fixed_vec_buffer_misses += st.fixed_vec_buffer_misses;
     m.separate_store_lookup_misses += st.separate_store_lookup_misses;
+    m.inline_descriptor_read_requests += st.inline_descriptor_read_requests;
+    m.inline_descriptor_errors += st.inline_descriptor_errors;
+    m.inline_cold_payload_deferred += st.inline_cold_payload_deferred;
+    m.inline_payload_cache_hits += st.inline_payload_cache_hits;
     m.stage2_lanes_requested += st.stage2_lanes_requested;
     m.stage2_decode_blocks += st.stage2_decode_blocks;
     m.stage2_decode_input_bytes += st.stage2_decode_input_bytes;
@@ -828,6 +1077,9 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.collector_finalize_ms += st.collector_finalize_ms;
     m.assemble_results_ms += st.assemble_results_ms;
     m.search_unaccounted_ms += st.search_unaccounted_ms;
+    m.serial_vector_read_ms += st.serial_vector_read_ms;
+    m.serial_full_record_read_ms += st.serial_full_record_read_ms;
+    m.serial_payload_read_ms += st.serial_payload_read_ms;
 
     if (gt != nullptr) {
         std::vector<int64_t> predicted;
@@ -868,13 +1120,29 @@ static int Usage() {
         "  --gt-offset N               First GT row (default: query-offset)\n"
         "  --topk N                    Top-k (default: 10)\n"
         "  --nprobe N                  Probed clusters (default: 64)\n"
+        "  --execution-mode overlap|serial-no-overlap Query scheduling mode (default: overlap)\n"
         "  --separate-store-dir DIR    No Combine store with vector.dat/payload.dat/address_map.bin\n"
+        "  --hotcold-store-dir DIR     Hot/cold store with hotvec.dat/payload.cold.dat/hotcold_map.bin\n"
+        "  --shadow-vector-store-dir DIR Read VEC_ONLY rerank vectors from a hot/cold or no-combine sidecar while payloads remain in combined data.dat\n"
+        "  --inline-hot-record-store-dir DIR Inline hot-record index dir with data.dat/payload.cold.dat\n"
+        "  --vector-read-trace FILE    Write scheduled raw-vector reads as CSV (profiling only)\n"
+        "  --safein-confidence-trace FILE  Write first-decision SafeIn snapshots as CSV\n"
         "  --dynamic-safein static|frontier (default: static)\n"
+        "  --materialization-mode eager|late SafeIn full-record reads eagerly or only final top-k payloads (default: eager)\n"
         "  --safein-as-vec-only 0|1 Keep SafeIn labels but force SafeIn VEC_ALL prefetches to VEC_ONLY (default: 0)\n"
-        "  --safein-all-threshold-bytes N Max single record bytes for SafeIn VEC_ALL (default: 262144)\n"
+        "  --safein-threshold-bytes N SafeIn record-prefix prefetch bytes (default: 262144)\n"
         "  --safein-prefetch-max-count N Query-level SafeIn VEC_ALL count cap (default: 0 = unlimited)\n"
         "  --safein-prefetch-max-bytes N Query-level SafeIn VEC_ALL byte cap (default: 0 = unlimited)\n"
         "  --safein-prefetch-emit-quantum N Emit at most N SafeIn full reads before VEC_ONLY in each flush (default: 0 = legacy all-first)\n"
+        "  --safein-prefetch-order arrival|confidence|confidence-per-byte (default: arrival)\n"
+        "  --safein-prefetch-rank-batch-size N Confidence ranking batch (default: 32)\n"
+        "  --safein-prefetch-global-window N Cross-batch rolling admission window (default: 0)\n"
+        "  --safein-query-extra-bytes N Query-level bytes beyond vector verification (default: 0 = unlimited)\n"
+        "  --safein-max-full-payload-bytes N Per-candidate extra-byte cap (default: 0 = unlimited)\n"
+        "  --safein-bextra-probe-budget 0|1 Enable benchmark probe-overlap byte budget\n"
+        "  --safein-bextra-rho R       Budget safety multiplier\n"
+        "  --safein-bextra-bytes-per-ms B Tune-split calibrated service rate\n"
+        "  --safein-bextra-window-trace FILE Write submit-window budget trace CSV\n"
         "  --false-stats-cluster-members-cache FILE Cache cluster members for SafeIn truth metrics\n"
         "  --skip-false-stats 0|1     Disable SafeIn truth metrics (default: 0)\n"
         "  --dynamic-safein-defer-initial-clusters N Defer SafeIn prefetch for first N clusters (default: 0)\n"
@@ -891,6 +1159,9 @@ static int Usage() {
         "  --non-safeout-candidate-budget N (default: 0)\n"
         "  --budgeted-prefetch-limit N Speculative raw-vector prefetch cap for budgeted queries (default: 0)\n"
         "  --fixed-vec-buffer-count N  Fixed vector buffers (default: 0)\n"
+        "  --vec-span-coalescing 0|1  Merge nearby VEC_ONLY reads (default: 0)\n"
+        "  --vec-span-tile-bytes N    Tile boundary for span grouping (default: 4096)\n"
+        "  --vec-span-max-byte-amplification R  Span admission cap (default: 1.10)\n"
         "  --serial-data-drain 0|1    Drain data I/O after each cluster (default: 0)\n"
         "  --two-level-coarse-routing 0|1 Enable two-level coarse routing (default: 0)\n"
         "  --two-level-coarse-budget-factor N Candidate budget = nprobe*N (default: 8)\n"
@@ -926,6 +1197,62 @@ int main(int argc, char** argv) {
         GetIntArg(argc, argv, "--skip-false-stats", 0) != 0;
     const std::string separate_store_dir =
         GetStringArg(argc, argv, "--separate-store-dir", "");
+    const std::string hotcold_store_dir =
+        GetStringArg(argc, argv, "--hotcold-store-dir", "");
+    const std::string shadow_vector_store_dir =
+        GetStringArg(argc, argv, "--shadow-vector-store-dir", "");
+    const std::string inline_hot_record_store_dir =
+        GetStringArg(argc, argv, "--inline-hot-record-store-dir", "");
+    const std::string vector_read_trace_path =
+        GetStringArg(argc, argv, "--vector-read-trace", "");
+    const std::string safein_confidence_trace_path =
+        GetStringArg(argc, argv, "--safein-confidence-trace", "");
+    const std::string bextra_window_trace_path =
+        GetStringArg(argc, argv, "--safein-bextra-window-trace", "");
+    const bool inline_with_shadow =
+        !inline_hot_record_store_dir.empty() &&
+        !shadow_vector_store_dir.empty();
+    const int selected_record_layouts =
+        (!separate_store_dir.empty() ? 1 : 0) +
+        (!hotcold_store_dir.empty() ? 1 : 0) +
+        (!shadow_vector_store_dir.empty() && !inline_with_shadow ? 1 : 0) +
+        (!inline_hot_record_store_dir.empty() ? 1 : 0);
+    if (selected_record_layouts > 1) {
+        std::fprintf(stderr,
+                     "--separate-store-dir, --hotcold-store-dir, "
+                     "--shadow-vector-store-dir, and "
+                     "--inline-hot-record-store-dir are mutually exclusive "
+                     "except that inline+shadow is a supported combined mode\n");
+        return 1;
+    }
+    if (!inline_hot_record_store_dir.empty() &&
+        fs::weakly_canonical(fs::path(inline_hot_record_store_dir)) !=
+            fs::weakly_canonical(fs::path(index_dir))) {
+        std::fprintf(stderr,
+                     "--inline-hot-record-store-dir must match --index-dir "
+                     "because inline mode rewrites cluster addresses into "
+                     "that index's data.dat\n");
+        return 1;
+    }
+    const RecordSidecarLayout record_sidecar_layout =
+        inline_with_shadow
+            ? RecordSidecarLayout::InlineHotShadowVectorStore
+            : (!inline_hot_record_store_dir.empty()
+            ? RecordSidecarLayout::InlineHotRecordStore
+            : (!shadow_vector_store_dir.empty()
+                   ? RecordSidecarLayout::ShadowVectorStore
+                   : (!hotcold_store_dir.empty()
+                          ? RecordSidecarLayout::HotColdRecordStore
+                          : (!separate_store_dir.empty()
+                                 ? RecordSidecarLayout::NoCombineFlatStor
+                                 : RecordSidecarLayout::None))));
+    const std::string record_sidecar_dir =
+        !inline_hot_record_store_dir.empty()
+            ? inline_hot_record_store_dir
+            : (!shadow_vector_store_dir.empty()
+                   ? shadow_vector_store_dir
+                   : (!hotcold_store_dir.empty() ? hotcold_store_dir
+                                                  : separate_store_dir));
     const double safeout_epsilon_percentile =
         GetDoubleArg(argc, argv, "--safeout-epsilon-percentile",
                      GetDoubleArg(argc, argv, "--epsilon-percentile", -1.0));
@@ -1014,8 +1341,29 @@ int main(int argc, char** argv) {
     const bool direct_io = HasFlag(argc, argv, "--direct-io");
     const std::string submission_mode =
         GetStringArg(argc, argv, "--submission-mode", "shared");
+    const std::string execution_mode_arg =
+        GetStringArg(argc, argv, "--execution-mode", "overlap");
+    QueryExecutionMode execution_mode = QueryExecutionMode::Overlap;
+    if (!ParseQueryExecutionModeArg(execution_mode_arg, &execution_mode)) {
+        std::fprintf(stderr,
+                     "Invalid --execution-mode: %s "
+                     "(expected overlap or serial-no-overlap)\n",
+                     execution_mode_arg.c_str());
+        return 1;
+    }
     const std::string dynamic_safein =
         GetStringArg(argc, argv, "--dynamic-safein", "static");
+    const std::string materialization_mode_arg =
+        GetStringArg(argc, argv, "--materialization-mode", "eager");
+    MaterializationMode materialization_mode = MaterializationMode::EagerSafeIn;
+    if (!ParseMaterializationModeArg(materialization_mode_arg,
+                                     &materialization_mode)) {
+        std::fprintf(stderr,
+                     "Invalid --materialization-mode: %s "
+                     "(expected eager or late)\n",
+                     materialization_mode_arg.c_str());
+        return 1;
+    }
     const std::string rabitq_mode =
         GetStringArg(argc, argv, "--rabitq-validation-mode",
                      GetStringArg(argc, argv, "--rabitq-query-mode", "auto"));
@@ -1162,11 +1510,114 @@ int main(int argc, char** argv) {
     SeparateStoreMapData separate_store;
     int separate_vector_fd = -1;
     int separate_payload_fd = -1;
-    if (!separate_store_dir.empty()) {
-        const std::string map_path = separate_store_dir + "/address_map.bin";
-        auto map_or = LoadSeparateStoreMap(map_path);
+    int inline_cold_payload_fd = -1;
+    int inline_buffered_hot_record_fd = -1;
+    InlineDescriptorMapData inline_descriptor_map;
+    uint32_t inline_descriptor_bytes = sizeof(HotPayloadDescriptor);
+    uint64_t inline_payload_threshold = 0;
+    uint64_t effective_safein_inline_threshold = 0;
+    const bool use_inline_hot_record_store =
+        record_sidecar_layout == RecordSidecarLayout::InlineHotRecordStore ||
+        record_sidecar_layout ==
+            RecordSidecarLayout::InlineHotShadowVectorStore;
+    const bool use_shadow_vector_store =
+        record_sidecar_layout == RecordSidecarLayout::ShadowVectorStore ||
+        record_sidecar_layout ==
+            RecordSidecarLayout::InlineHotShadowVectorStore;
+    if (use_inline_hot_record_store) {
+        const std::string manifest_path =
+            (fs::path(record_sidecar_dir) / "manifest.json").string();
+        inline_descriptor_bytes = static_cast<uint32_t>(
+            ReadJsonUint64Field(manifest_path, "descriptor_bytes",
+                                sizeof(HotPayloadDescriptor)));
+        inline_payload_threshold =
+            ReadJsonUint64Field(manifest_path, "inline_payload_threshold", 0);
+        inline_payload_threshold = static_cast<uint64_t>(
+            std::max<int64_t>(0, GetInt64Arg(
+                argc, argv, "--inline-payload-threshold",
+                static_cast<int64_t>(inline_payload_threshold))));
+        effective_safein_inline_threshold = ReadJsonUint64Field(
+            manifest_path, "effective_safein_inline_threshold",
+            inline_payload_threshold);
+        if (inline_descriptor_bytes != sizeof(HotPayloadDescriptor)) {
+            std::fprintf(stderr,
+                         "Inline hot-record descriptor size mismatch: "
+                         "manifest=%u expected=%zu\n",
+                         inline_descriptor_bytes,
+                         sizeof(HotPayloadDescriptor));
+            return 1;
+        }
+        const std::string cold_path =
+            (fs::path(record_sidecar_dir) / "payload.cold.dat").string();
+        inline_cold_payload_fd = ::open(cold_path.c_str(), O_RDONLY);
+        if (inline_cold_payload_fd < 0) {
+            std::perror(("open " + cold_path).c_str());
+            return 1;
+        }
+        const std::string hot_path =
+            (fs::path(record_sidecar_dir) / "data.dat").string();
+        inline_buffered_hot_record_fd = ::open(hot_path.c_str(), O_RDONLY);
+        if (inline_buffered_hot_record_fd < 0) {
+            std::perror(("open " + hot_path).c_str());
+            ::close(inline_cold_payload_fd);
+            return 1;
+        }
+        const std::string inline_descriptor_map_path = GetStringArg(
+            argc, argv, "--inline-descriptor-map",
+            (fs::path(record_sidecar_dir) / "inline_descriptor_map.bin").string());
+        if (fs::exists(inline_descriptor_map_path)) {
+            auto map_or = LoadInlineDescriptorMap(inline_descriptor_map_path);
+            if (!map_or.ok()) {
+                std::fprintf(stderr, "Failed to load inline descriptor map: %s\n",
+                             map_or.status().ToString().c_str());
+                return 1;
+            }
+            inline_descriptor_map = std::move(map_or.value());
+            const uint32_t expected_vec_bytes =
+                index.logical_dim() * sizeof(float);
+            if (inline_descriptor_map.vec_bytes != expected_vec_bytes) {
+                std::fprintf(stderr,
+                             "Inline descriptor map vector size mismatch: "
+                             "map=%u expected=%u\n",
+                             inline_descriptor_map.vec_bytes,
+                             expected_vec_bytes);
+                return 1;
+            }
+            Log("  Inline descriptor map: %s records=%llu bytes=%llu\n",
+                inline_descriptor_map_path.c_str(),
+                static_cast<unsigned long long>(
+                    inline_descriptor_map.record_count),
+                static_cast<unsigned long long>(
+                    inline_descriptor_map.file_bytes));
+        }
+        Log("Record sidecar: layout=%s dir=%s descriptor_bytes=%u inline_threshold=%llu\n",
+            RecordSidecarLayoutName(record_sidecar_layout),
+            record_sidecar_dir.c_str(),
+            inline_descriptor_bytes,
+            static_cast<unsigned long long>(inline_payload_threshold));
+    }
+    if (use_shadow_vector_store ||
+        (!use_inline_hot_record_store &&
+         record_sidecar_layout != RecordSidecarLayout::None)) {
+        const bool shadow_vector = use_shadow_vector_store;
+        const std::string sidecar_load_dir = shadow_vector
+            ? shadow_vector_store_dir
+            : record_sidecar_dir;
+        // Shadow mode is intentionally compatible with either sidecar
+        // representation: a dedicated hot/cold store or an existing
+        // no-combine vector store.  In both cases payload reads stay on the
+        // combined record file; only VEC_ONLY reads are redirected.
+        const bool hotcold =
+            record_sidecar_layout == RecordSidecarLayout::HotColdRecordStore ||
+            (shadow_vector && fs::exists(
+                fs::path(sidecar_load_dir) / "hotcold_map.bin"));
+        const std::string map_path =
+            sidecar_load_dir + (hotcold ? "/hotcold_map.bin"
+                                        : "/address_map.bin");
+        auto map_or = hotcold ? LoadHotColdStoreMap(map_path)
+                              : LoadSeparateStoreMap(map_path);
         if (!map_or.ok()) {
-            std::fprintf(stderr, "Failed to load separate-store map: %s\n",
+            std::fprintf(stderr, "Failed to load record sidecar map: %s\n",
                          map_or.status().ToString().c_str());
             return 1;
         }
@@ -1178,21 +1629,27 @@ int main(int argc, char** argv) {
                          separate_store.vec_bytes, expected_vec_bytes);
             return 1;
         }
-        const std::string vector_path = separate_store_dir + "/vector.dat";
-        const std::string payload_path = separate_store_dir + "/payload.dat";
+        const std::string vector_path =
+            sidecar_load_dir + (hotcold ? "/hotvec.dat" : "/vector.dat");
+        const std::string payload_path =
+            sidecar_load_dir + (hotcold ? "/payload.cold.dat"
+                                        : "/payload.dat");
         separate_vector_fd = ::open(vector_path.c_str(), O_RDONLY);
         if (separate_vector_fd < 0) {
             std::perror(("open " + vector_path).c_str());
             return 1;
         }
-        separate_payload_fd = ::open(payload_path.c_str(), O_RDONLY);
-        if (separate_payload_fd < 0) {
-            std::perror(("open " + payload_path).c_str());
-            ::close(separate_vector_fd);
-            return 1;
+        if (!shadow_vector) {
+            separate_payload_fd = ::open(payload_path.c_str(), O_RDONLY);
+            if (separate_payload_fd < 0) {
+                std::perror(("open " + payload_path).c_str());
+                ::close(separate_vector_fd);
+                return 1;
+            }
         }
-        Log("Separate store: %s records=%llu vec_bytes=%u\n",
-            separate_store_dir.c_str(),
+        Log("Record sidecar: layout=%s dir=%s records=%llu vec_bytes=%u\n",
+            RecordSidecarLayoutName(record_sidecar_layout),
+            sidecar_load_dir.c_str(),
             static_cast<unsigned long long>(separate_store.record_count),
             separate_store.vec_bytes);
     }
@@ -1232,6 +1689,10 @@ int main(int argc, char** argv) {
         !validate_ex_bits_arg("--rabitq-resident-bits", resident_ex_bits_arg)) {
         if (separate_payload_fd >= 0) ::close(separate_payload_fd);
         if (separate_vector_fd >= 0) ::close(separate_vector_fd);
+        if (inline_cold_payload_fd >= 0) ::close(inline_cold_payload_fd);
+        if (inline_buffered_hot_record_fd >= 0) {
+            ::close(inline_buffered_hot_record_fd);
+        }
         return 1;
     }
 
@@ -1388,6 +1849,8 @@ int main(int argc, char** argv) {
     }
 
     std::unique_ptr<IoUringReader> data_reader;
+    Status cluster_file_registration = Status::OK();
+    Status data_file_registration = Status::OK();
     if (submission_mode == "isolated") {
         data_reader = std::make_unique<IoUringReader>();
         auto data_status = data_reader->Init(
@@ -1398,16 +1861,25 @@ int main(int argc, char** argv) {
             return 1;
         }
         int clu_fd = index.segment().clu_fd();
-        (void)cluster_reader.RegisterFiles(&clu_fd, 1);
+        cluster_file_registration = cluster_reader.RegisterFiles(&clu_fd, 1);
         int dat_fd = index.segment().data_reader().fd();
-        (void)data_reader->RegisterFiles(&dat_fd, 1);
+        data_file_registration = data_reader->RegisterFiles(&dat_fd, 1);
     } else if (submission_mode == "shared") {
         int fds[2] = {index.segment().clu_fd(), index.segment().data_reader().fd()};
-        (void)cluster_reader.RegisterFiles(fds, 2);
+        cluster_file_registration = cluster_reader.RegisterFiles(fds, 2);
+        data_file_registration = cluster_file_registration;
     } else {
         std::fprintf(stderr, "Invalid --submission-mode: %s\n",
                      submission_mode.c_str());
         return 1;
+    }
+    if (!cluster_file_registration.ok()) {
+        Log("  cluster fixed-file registration disabled: %s\n",
+            cluster_file_registration.ToString().c_str());
+    }
+    if (!data_file_registration.ok()) {
+        Log("  data fixed-file registration disabled: %s\n",
+            data_file_registration.ToString().c_str());
     }
 
     SearchConfig cfg;
@@ -1418,6 +1890,7 @@ int main(int argc, char** argv) {
     cfg.submission_mode = submission_mode == "isolated"
         ? SubmissionMode::Isolated
         : SubmissionMode::Shared;
+    cfg.execution_mode = execution_mode;
     cfg.enable_dynamic_safeout =
         GetIntArg(argc, argv, "--dynamic-safeout", 1) != 0;
     cfg.dynamic_safein_mode = dynamic_safein == "frontier"
@@ -1437,26 +1910,90 @@ int main(int argc, char** argv) {
         GetIntArg(argc, argv, "--dynamic-safein-defer-until-ready", 0) != 0;
     cfg.dynamic_safein_defer_max_candidates = static_cast<uint32_t>(
         std::max(0, GetIntArg(argc, argv, "--dynamic-safein-defer-max-candidates", 0)));
-    cfg.safein_as_vec_only =
-        GetIntArg(argc, argv, "--safein-as-vec-only", 0) != 0;
-    cfg.safein_all_threshold = static_cast<uint32_t>(
-        std::max(0, GetIntArg(argc, argv, "--safein-all-threshold-bytes", 256 * 1024)));
+    const int safein_as_vec_only_arg =
+        GetIntArg(argc, argv, "--safein-as-vec-only", 0);
+    if (safein_as_vec_only_arg != 0 && safein_as_vec_only_arg != 1) {
+        std::fprintf(stderr,
+                     "Invalid --safein-as-vec-only: %d (expected 0 or 1)\n",
+                     safein_as_vec_only_arg);
+        return 1;
+    }
+    if (safein_as_vec_only_arg == 1) {
+        materialization_mode = MaterializationMode::Late;
+    }
+    cfg.materialization_mode = materialization_mode;
+    cfg.safein_as_vec_only = (safein_as_vec_only_arg != 0);
+    cfg.safein_threshold_bytes = static_cast<uint32_t>(
+        std::max(0, GetIntArg(
+            argc, argv, "--safein-threshold-bytes",
+            GetIntArg(argc, argv, "--safein-all-threshold-bytes", 256 * 1024))));
+    if (use_inline_hot_record_store) {
+        cfg.safein_threshold_bytes = static_cast<uint32_t>(
+            std::min<uint64_t>(effective_safein_inline_threshold, UINT32_MAX));
+    }
     cfg.safein_prefetch_max_count = static_cast<uint32_t>(
         std::max(0, GetIntArg(argc, argv, "--safein-prefetch-max-count", 0)));
     cfg.safein_prefetch_max_bytes = static_cast<uint64_t>(
         std::max<int64_t>(0, GetInt64Arg(argc, argv, "--safein-prefetch-max-bytes", 0)));
     cfg.safein_prefetch_emit_quantum = static_cast<uint32_t>(
         std::max(0, GetIntArg(argc, argv, "--safein-prefetch-emit-quantum", 0)));
+    const std::string safein_prefetch_order =
+        GetStringArg(argc, argv, "--safein-prefetch-order", "arrival");
+    if (safein_prefetch_order == "arrival") {
+        cfg.safein_prefetch_order = SafeInPrefetchOrder::Arrival;
+    } else if (safein_prefetch_order == "confidence") {
+        cfg.safein_prefetch_order = SafeInPrefetchOrder::Confidence;
+    } else if (safein_prefetch_order == "confidence-per-byte") {
+        cfg.safein_prefetch_order = SafeInPrefetchOrder::ConfidencePerByte;
+    } else {
+        std::fprintf(stderr,
+                     "Invalid --safein-prefetch-order: %s\n",
+                     safein_prefetch_order.c_str());
+        return 1;
+    }
+    cfg.safein_prefetch_rank_batch_size = static_cast<uint32_t>(
+        std::max(1, GetIntArg(
+            argc, argv, "--safein-prefetch-rank-batch-size", 32)));
+    cfg.safein_prefetch_global_window = static_cast<uint32_t>(
+        std::max(0, GetIntArg(
+            argc, argv, "--safein-prefetch-global-window", 0)));
+    cfg.safein_query_extra_bytes = static_cast<uint64_t>(
+        std::max<int64_t>(0, GetInt64Arg(
+            argc, argv, "--safein-query-extra-bytes", 0)));
+    cfg.safein_max_full_payload_bytes = static_cast<uint32_t>(
+        std::min<int64_t>(UINT32_MAX, std::max<int64_t>(0, GetInt64Arg(
+            argc, argv, "--safein-max-full-payload-bytes", 0))));
+    cfg.enable_safein_bextra_probe_budget =
+        GetIntArg(argc, argv, "--safein-bextra-probe-budget", 0) != 0;
+    cfg.safein_bextra_rho =
+        std::max(0.0, GetDoubleArg(argc, argv, "--safein-bextra-rho", 0.0));
+    cfg.safein_bextra_bytes_per_ms = std::max(
+        0.0, GetDoubleArg(argc, argv, "--safein-bextra-bytes-per-ms", 0.0));
+    cfg.safein_bextra_ema_alpha = static_cast<float>(std::clamp(
+        GetDoubleArg(argc, argv, "--safein-bextra-ema-alpha", 0.25), 0.0, 1.0));
     cfg.non_safeout_candidate_budget = static_cast<uint32_t>(
         std::max(0, GetIntArg(argc, argv, "--non-safeout-candidate-budget", 0)));
     cfg.budgeted_prefetch_limit = static_cast<uint32_t>(
         std::max(0, GetIntArg(argc, argv, "--budgeted-prefetch-limit", 0)));
+    if (cfg.execution_mode == QueryExecutionMode::SerialNoOverlap &&
+        cfg.budgeted_prefetch_limit > 0) {
+        Log("  serial-no-overlap disables budgeted prefetch: requested=%u effective=0\n",
+            cfg.budgeted_prefetch_limit);
+        cfg.budgeted_prefetch_limit = 0;
+    }
     cfg.fixed_vec_buffer_count = static_cast<uint32_t>(
         std::max(0, GetIntArg(argc, argv, "--fixed-vec-buffer-count", 0)));
     cfg.cluster_submit_reserve = static_cast<uint32_t>(
         std::max(1, GetIntArg(argc, argv, "--cluster-submit-reserve", 8)));
     cfg.submit_batch_size = static_cast<uint32_t>(
         std::max(0, GetIntArg(argc, argv, "--submit-batch", 32)));
+    cfg.enable_vec_span_coalescing =
+        GetIntArg(argc, argv, "--vec-span-coalescing", 0) != 0;
+    cfg.vec_span_tile_bytes = static_cast<uint32_t>(
+        std::max(1, GetIntArg(argc, argv, "--vec-span-tile-bytes", 4096)));
+    cfg.vec_span_max_byte_amplification = static_cast<float>(
+        std::max(1.0, GetDoubleArg(
+            argc, argv, "--vec-span-max-byte-amplification", 1.10)));
     cfg.serial_data_drains =
         GetIntArg(argc, argv, "--serial-data-drain", 0) != 0;
     cfg.enable_fine_grained_timing =
@@ -1499,14 +2036,78 @@ int main(int argc, char** argv) {
     if (runtime_safeout_epsilon_overridden) {
         cfg.safeout_epsilon_override = runtime_safeout_epsilon;
     }
-    if (!separate_store_dir.empty()) {
+    if (record_sidecar_layout == RecordSidecarLayout::NoCombineFlatStor ||
+        record_sidecar_layout == RecordSidecarLayout::HotColdRecordStore ||
+        use_shadow_vector_store) {
         cfg.separate_record_store.enabled = true;
+        cfg.separate_record_store.redirect_payload_reads =
+            !use_shadow_vector_store;
         cfg.separate_record_store.vector_fd = separate_vector_fd;
         cfg.separate_record_store.payload_fd = separate_payload_fd;
         cfg.separate_record_store.address_map = &separate_store.records;
     }
+    if (use_inline_hot_record_store) {
+        if (!use_shadow_vector_store) {
+            cfg.separate_record_store.enabled = false;
+        }
+        cfg.inline_hot_record_store.enabled = true;
+        cfg.inline_hot_record_store.cold_payload_fd = inline_cold_payload_fd;
+        cfg.inline_hot_record_store.buffered_hot_record_fd =
+            inline_buffered_hot_record_fd;
+        cfg.inline_hot_record_store.descriptor_bytes = inline_descriptor_bytes;
+        cfg.inline_hot_record_store.inline_payload_threshold =
+            static_cast<uint32_t>(
+                std::min<uint64_t>(inline_payload_threshold, UINT32_MAX));
+        if (!inline_descriptor_map.records.empty()) {
+            cfg.inline_hot_record_store.payload_metadata =
+                &inline_descriptor_map.records;
+        }
+    }
     if (have_false_stats_cluster_members) {
         cfg.false_stats_cluster_members = &false_stats_cluster_members;
+    }
+
+    std::vector<VectorReadTraceEntry> vector_read_trace;
+    if (!vector_read_trace_path.empty()) {
+        vector_read_trace.reserve(static_cast<size_t>(queries.rows) * 512u);
+        cfg.vector_read_trace = &vector_read_trace;
+    }
+    std::vector<vdb::query::SafeInConfidenceTraceEntry> safein_confidence_trace;
+    if (!safein_confidence_trace_path.empty()) {
+        if (cfg.materialization_mode != MaterializationMode::Late ||
+            cfg.non_safeout_candidate_budget != 0 || gt.empty() ||
+            !have_false_stats_cluster_members) {
+            std::fprintf(
+                stderr,
+                "--safein-confidence-trace requires materialization-mode=late, "
+                "non-safeout-candidate-budget=0, GT, and SafeIn cluster members\n");
+            return 1;
+        }
+        safein_confidence_trace.reserve(static_cast<size_t>(queries.rows) * 256u);
+        cfg.safein_confidence_trace = &safein_confidence_trace;
+    }
+    std::vector<vdb::query::BextraWindowTraceEntry> bextra_window_trace;
+    if (cfg.enable_safein_bextra_probe_budget) {
+        if (!use_inline_hot_record_store ||
+            cfg.materialization_mode != MaterializationMode::EagerSafeIn ||
+            cfg.execution_mode != QueryExecutionMode::Overlap ||
+            cfg.non_safeout_candidate_budget != 0 ||
+            cfg.safein_prefetch_max_count != 0 ||
+            cfg.safein_prefetch_max_bytes != 0 ||
+            cfg.safein_query_extra_bytes != 0 ||
+            cfg.safein_max_full_payload_bytes != 0 ||
+            cfg.safein_prefetch_order != SafeInPrefetchOrder::Arrival ||
+            cfg.safein_prefetch_global_window != 0 ||
+            cfg.safein_bextra_bytes_per_ms <= 0.0 ||
+            bextra_window_trace_path.empty()) {
+            std::fprintf(stderr,
+                "SafeIn B_extra probe budget requires inline eager overlap, "
+                "candidate/count/byte caps disabled, positive service rate, "
+                "and --safein-bextra-window-trace\n");
+            return 1;
+        }
+        bextra_window_trace.reserve(static_cast<size_t>(queries.rows) * 32u);
+        cfg.bextra_window_trace = &bextra_window_trace;
     }
 
     double two_level_coarse_warmup_ms = 0.0;
@@ -1533,6 +2134,15 @@ int main(int argc, char** argv) {
     } else {
         scheduler = std::make_unique<OverlapScheduler>(index, cluster_reader, cfg);
     }
+    const IoUringReader& effective_data_reader =
+        data_reader ? *data_reader : cluster_reader;
+    Log("  io_uring actual: defer_taskrun=%d sqpoll=%d iopoll=%d "
+        "fixed_files=%d fixed_buffers=%d\n",
+        effective_data_reader.defer_taskrun_enabled() ? 1 : 0,
+        effective_data_reader.sqpoll_enabled() ? 1 : 0,
+        effective_data_reader.iopoll_enabled() ? 1 : 0,
+        effective_data_reader.registered_files_enabled() ? 1 : 0,
+        scheduler->fixed_vec_buffers_enabled() ? 1 : 0);
 
     std::vector<std::unordered_set<uint32_t>> false_stats_truth_sets;
     if (have_false_stats_cluster_members && !false_stats_image_id_to_row.empty() &&
@@ -1559,6 +2169,7 @@ int main(int argc, char** argv) {
         } else {
             scheduler->SetFalseStatsTrueTopKRows(nullptr);
         }
+        scheduler->SetVectorReadTraceQueryIndex(qi);
         SearchResults results = scheduler->Search(q);
         const std::vector<int64_t>* gt_row =
             (!gt.empty() && qi < gt.size()) ? &gt[qi] : nullptr;
@@ -1578,6 +2189,93 @@ int main(int argc, char** argv) {
     const SmapsRollupStats smaps_after_queries = ReadSmapsRollupStats();
     const double process_wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_process_start).count();
+
+    if (!vector_read_trace_path.empty()) {
+        const fs::path trace_parent = fs::path(vector_read_trace_path).parent_path();
+        if (!trace_parent.empty()) fs::create_directories(trace_parent);
+        std::ofstream trace(vector_read_trace_path);
+        if (!trace.is_open()) {
+            std::fprintf(stderr, "Failed to open vector trace: %s\n",
+                         vector_read_trace_path.c_str());
+            return 1;
+        }
+        trace << "query_index,request_index,combined_offset,read_length,request_type\n";
+        for (const auto& entry : vector_read_trace) {
+            trace << entry.query_index << ',' << entry.request_index << ','
+                  << entry.combined_offset << ',' << entry.read_length << ','
+                  << static_cast<uint32_t>(entry.request_type) << '\n';
+        }
+        Log("  Vector read trace: %s (%zu records)\n",
+            vector_read_trace_path.c_str(), vector_read_trace.size());
+    }
+
+    if (!safein_confidence_trace_path.empty()) {
+        const fs::path trace_parent =
+            fs::path(safein_confidence_trace_path).parent_path();
+        if (!trace_parent.empty()) fs::create_directories(trace_parent);
+        std::ofstream trace(safein_confidence_trace_path);
+        if (!trace.is_open()) {
+            std::fprintf(stderr, "Failed to open SafeIn confidence trace: %s\n",
+                         safein_confidence_trace_path.c_str());
+            return 1;
+        }
+        trace << "query_index,probe_index,cluster_id,cluster_local_index,"
+                 "candidate_offset,record_bytes,classification_stage,frontier_ready,"
+                 "has_gt_label,gt_topk,selected_topk,est_dist,est_error,safein_margin,"
+                 "safein_upper_bound,safein_threshold,safein_frontier,raw_slack,"
+                 "normalized_slack_error,normalized_slack_safein_margin\n";
+        trace << std::setprecision(9);
+        for (const auto& entry : safein_confidence_trace) {
+            trace << entry.query_index << ',' << entry.probe_index << ','
+                  << entry.cluster_id << ',' << entry.cluster_local_index << ','
+                  << entry.candidate_offset << ',' << entry.record_bytes << ','
+                  << static_cast<uint32_t>(entry.classification_stage) << ','
+                  << static_cast<uint32_t>(entry.frontier_ready) << ','
+                  << static_cast<uint32_t>(entry.has_gt_label) << ','
+                  << static_cast<uint32_t>(entry.gt_topk) << ','
+                  << static_cast<uint32_t>(entry.selected_topk) << ','
+                  << entry.est_dist << ',' << entry.est_error << ','
+                  << entry.safein_margin << ',' << entry.safein_upper_bound << ','
+                  << entry.safein_threshold << ',' << entry.safein_frontier << ','
+                  << entry.raw_slack << ',' << entry.normalized_slack_error << ','
+                  << entry.normalized_slack_safein_margin << '\n';
+        }
+        Log("  SafeIn confidence trace: %s (%zu records)\n",
+            safein_confidence_trace_path.c_str(), safein_confidence_trace.size());
+    }
+
+    if (!bextra_window_trace_path.empty()) {
+        const fs::path trace_parent =
+            fs::path(bextra_window_trace_path).parent_path();
+        if (!trace_parent.empty()) fs::create_directories(trace_parent);
+        std::ofstream trace(bextra_window_trace_path);
+        if (!trace.is_open()) {
+            std::fprintf(stderr, "Failed to open B_extra window trace: %s\n",
+                         bextra_window_trace_path.c_str());
+            return 1;
+        }
+        trace << "query_index,window_index,clusters_processed,clusters_remaining,"
+                 "eligible_candidates,scheduled_candidates,rho,probe_cluster_ema_ms,"
+                 "hide_time_ms,predicted_service_bytes,inflight_bytes,"
+                 "mandatory_pending_bytes,mandatory_future_bytes,eligible_extra_bytes,"
+                 "predicted_extra_bytes,scheduled_extra_bytes,"
+                 "completed_before_final_drain_bytes,spilled_to_final_drain_bytes\n";
+        trace << std::setprecision(9);
+        for (const auto& entry : bextra_window_trace) {
+            trace << entry.query_index << ',' << entry.window_index << ','
+                  << entry.clusters_processed << ',' << entry.clusters_remaining << ','
+                  << entry.eligible_candidates << ',' << entry.scheduled_candidates << ','
+                  << entry.rho << ',' << entry.probe_cluster_ema_ms << ','
+                  << entry.hide_time_ms << ',' << entry.predicted_service_bytes << ','
+                  << entry.inflight_bytes << ',' << entry.mandatory_pending_bytes << ','
+                  << entry.mandatory_future_bytes << ',' << entry.eligible_extra_bytes << ','
+                  << entry.predicted_extra_bytes << ',' << entry.scheduled_extra_bytes << ','
+                  << entry.completed_before_final_drain_bytes << ','
+                  << entry.spilled_to_final_drain_bytes << '\n';
+        }
+        Log("  B_extra window trace: %s (%zu records)\n",
+            bextra_window_trace_path.c_str(), bextra_window_trace.size());
+    }
 
     const uint32_t Q = queries.rows;
     const double inv_q = Q > 0 ? 1.0 / static_cast<double>(Q) : 0.0;
@@ -1643,13 +2341,34 @@ int main(int argc, char** argv) {
     f << "    " << JStr("benchmark_mode", "online_query") << ",\n";
     f << "    " << JStr("index_dir", index_dir) << ",\n";
     f << "    " << JStr("record_layout",
-                        separate_store_dir.empty() ? "combined"
-                                                   : "no_combine_flatstor") << ",\n";
+                        RecordSidecarLayoutName(record_sidecar_layout)) << ",\n";
     f << "    " << JStr("separate_store_dir", separate_store_dir) << ",\n";
+    f << "    " << JStr("hotcold_store_dir", hotcold_store_dir) << ",\n";
+    f << "    " << JStr("shadow_vector_store_dir",
+                        shadow_vector_store_dir) << ",\n";
+    f << "    " << JStr("inline_hot_record_store_dir",
+                        inline_hot_record_store_dir) << ",\n";
+    f << "    " << JStr("record_sidecar_dir", record_sidecar_dir) << ",\n";
     f << "    " << JInt("separate_store_records",
                         static_cast<int64_t>(separate_store.record_count)) << ",\n";
     f << "    " << JInt("separate_store_vec_bytes",
                         static_cast<int64_t>(separate_store.vec_bytes)) << ",\n";
+    f << "    " << JStr("vector_read_trace", vector_read_trace_path) << ",\n";
+    f << "    " << JInt("vector_read_trace_records",
+                        static_cast<int64_t>(vector_read_trace.size())) << ",\n";
+    f << "    " << JInt("inline_descriptor_bytes",
+                        inline_descriptor_bytes) << ",\n";
+    f << "    " << JInt("inline_payload_threshold",
+                        static_cast<int64_t>(inline_payload_threshold)) << ",\n";
+    f << "    " << JInt("effective_safein_inline_threshold",
+                        static_cast<int64_t>(
+                            effective_safein_inline_threshold)) << ",\n";
+    f << "    " << JInt("inline_sidecar_map_records",
+                        static_cast<int64_t>(
+                            inline_descriptor_map.record_count)) << ",\n";
+    f << "    " << JInt("inline_sidecar_map_bytes",
+                        static_cast<int64_t>(
+                            inline_descriptor_map.file_bytes)) << ",\n";
     f << "    " << JStr("query_file", query_file) << ",\n";
     f << "    " << JInt("query_offset", static_cast<int64_t>(query_offset)) << ",\n";
     f << "    " << JInt("num_queries", Q) << ",\n";
@@ -1657,12 +2376,37 @@ int main(int argc, char** argv) {
     f << "    " << JInt("topk", topk) << ",\n";
     f << "    " << JInt("nprobe", nprobe) << ",\n";
     f << "    " << JInt("io_queue_depth", cfg.io_queue_depth) << ",\n";
+    f << "    " << JBool("direct_io", direct_io) << ",\n";
+    f << "    " << JBool("io_uring_defer_taskrun_enabled",
+                         effective_data_reader.defer_taskrun_enabled()) << ",\n";
+    f << "    " << JBool("io_uring_sqpoll_enabled",
+                         effective_data_reader.sqpoll_enabled()) << ",\n";
+    f << "    " << JBool("io_uring_iopoll_enabled",
+                         effective_data_reader.iopoll_enabled()) << ",\n";
+    f << "    " << JBool("io_uring_registered_files_enabled",
+                         effective_data_reader.registered_files_enabled()) << ",\n";
+    f << "    " << JBool("io_uring_registered_buffers_enabled",
+                         effective_data_reader.registered_buffers_enabled()) << ",\n";
+    f << "    " << JBool("fixed_vec_buffers_enabled",
+                         scheduler->fixed_vec_buffers_enabled()) << ",\n";
     f << "    " << JInt("fixed_vec_buffer_count",
                         cfg.fixed_vec_buffer_count) << ",\n";
     f << "    " << JInt("cluster_submit_reserve",
                         cfg.cluster_submit_reserve) << ",\n";
     f << "    " << JInt("submit_batch_size", cfg.submit_batch_size) << ",\n";
+    f << "    " << JBool("vec_span_coalescing_enabled",
+                         cfg.enable_vec_span_coalescing) << ",\n";
+    f << "    " << JInt("vec_span_tile_bytes",
+                         cfg.vec_span_tile_bytes) << ",\n";
+    f << "    " << JNum("vec_span_max_byte_amplification",
+                         cfg.vec_span_max_byte_amplification) << ",\n";
     f << "    " << JStr("submission_mode", submission_mode) << ",\n";
+    f << "    " << JStr("execution_mode",
+                        QueryExecutionModeName(cfg.execution_mode)) << ",\n";
+    f << "    " << JBool("serial_no_overlap",
+                         cfg.execution_mode == QueryExecutionMode::SerialNoOverlap) << ",\n";
+    f << "    " << JBool("async_candidate_data_overlap_enabled",
+                         cfg.execution_mode == QueryExecutionMode::Overlap) << ",\n";
     f << "    " << JBool("serial_data_drains",
                          cfg.serial_data_drains) << ",\n";
     f << "    " << JBool("enable_two_level_coarse_routing",
@@ -1752,18 +2496,42 @@ int main(int argc, char** argv) {
                         cfg.dynamic_safein_defer_max_candidates) << ",\n";
     f << "    " << JInt("non_safeout_candidate_budget",
                         cfg.non_safeout_candidate_budget) << ",\n";
+    f << "    " << JStr("materialization_mode",
+                        MaterializationModeName(cfg.materialization_mode)) << ",\n";
+    f << "    " << JBool("late_materialization_enabled",
+                         cfg.late_materialization_enabled()) << ",\n";
     f << "    " << JBool("safein_as_vec_only",
                          cfg.safein_as_vec_only) << ",\n";
-    f << "    " << JInt("safein_all_threshold_bytes",
-                        cfg.safein_all_threshold) << ",\n";
+    f << "    " << JInt("safein_threshold_bytes",
+                        cfg.safein_threshold_bytes) << ",\n";
     f << "    " << JInt("safein_prefetch_max_count",
                         cfg.safein_prefetch_max_count) << ",\n";
     f << "    " << JInt("safein_prefetch_max_bytes",
                         static_cast<int64_t>(cfg.safein_prefetch_max_bytes)) << ",\n";
     f << "    " << JInt("safein_prefetch_emit_quantum",
                         cfg.safein_prefetch_emit_quantum) << ",\n";
+    f << "    " << JStr("safein_prefetch_order",
+                        safein_prefetch_order) << ",\n";
+    f << "    " << JInt("safein_prefetch_rank_batch_size",
+                        cfg.safein_prefetch_rank_batch_size) << ",\n";
+    f << "    " << JInt("safein_prefetch_global_window",
+                        cfg.safein_prefetch_global_window) << ",\n";
+    f << "    " << JInt("safein_query_extra_bytes",
+                        static_cast<int64_t>(cfg.safein_query_extra_bytes)) << ",\n";
+    f << "    " << JInt("safein_max_full_payload_bytes",
+                        cfg.safein_max_full_payload_bytes) << ",\n";
+    f << "    " << JBool("safein_bextra_probe_budget",
+                         cfg.enable_safein_bextra_probe_budget) << ",\n";
+    f << "    " << JNum("safein_bextra_rho",
+                        cfg.safein_bextra_rho) << ",\n";
+    f << "    " << JNum("safein_bextra_bytes_per_ms",
+                        cfg.safein_bextra_bytes_per_ms) << ",\n";
     f << "    " << JInt("budgeted_prefetch_limit",
                         cfg.budgeted_prefetch_limit) << ",\n";
+    f << "    " << JInt("effective_budgeted_prefetch_limit",
+                        cfg.budgeted_prefetch_limit) << ",\n";
+    f << "    " << JStr("safein_confidence_primary_score",
+                        "normalized_slack_error") << ",\n";
     f << "    " << JNum("loaded_safeout_epsilon",
                         loaded_safeout_epsilon) << ",\n";
     f << "    " << JNum("runtime_safeout_epsilon",
@@ -1800,11 +2568,41 @@ int main(int argc, char** argv) {
     f << "    " << JNum("avg_all_read_requests", metrics.all_reads * inv_q) << ",\n";
     f << "    " << JNum("avg_payload_read_requests", metrics.payload_reads * inv_q) << ",\n";
     f << "    " << JNum("avg_vec_only_read_bytes", metrics.vec_only_read_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_read_requests",
+                        metrics.vec_span_read_requests * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_candidates",
+                        metrics.vec_span_candidates * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_read_bytes",
+                        metrics.vec_span_read_bytes * inv_q) << ",\n";
     f << "    " << JNum("avg_all_read_bytes", metrics.all_read_bytes * inv_q) << ",\n";
     f << "    " << JNum("avg_payload_read_bytes", metrics.payload_read_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_prefix_read_requests",
+                        metrics.safein_prefix_read_requests * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_full_read_requests",
+                        metrics.safein_full_read_requests * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_suffix_read_requests",
+                        metrics.safein_suffix_read_requests * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_prefix_read_bytes",
+                        metrics.safein_prefix_read_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_full_read_bytes",
+                        metrics.safein_full_read_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_suffix_read_bytes",
+                        metrics.safein_suffix_read_bytes * inv_q) << ",\n";
     f << "    " << JNum("avg_total_read_bytes",
                         (metrics.vec_only_read_bytes + metrics.all_read_bytes +
                          metrics.payload_read_bytes) * inv_q) << ",\n";
+    f << "    " << JNum("avg_serial_vector_read_requests",
+                        metrics.serial_vector_read_requests * inv_q) << ",\n";
+    f << "    " << JNum("avg_serial_full_record_read_requests",
+                        metrics.serial_full_record_read_requests * inv_q) << ",\n";
+    f << "    " << JNum("avg_serial_payload_read_requests",
+                        metrics.serial_payload_read_requests * inv_q) << ",\n";
+    f << "    " << JNum("avg_serial_vector_read_bytes",
+                        metrics.serial_vector_read_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_serial_full_record_read_bytes",
+                        metrics.serial_full_record_read_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_serial_payload_read_bytes",
+                        metrics.serial_payload_read_bytes * inv_q) << ",\n";
     f << "    " << JNum("avg_budgeted_prefetch_considered",
                         metrics.budgeted_prefetch_considered * inv_q) << ",\n";
     f << "    " << JNum("avg_budgeted_prefetch_scheduled",
@@ -1851,6 +2649,24 @@ int main(int argc, char** argv) {
                         metrics.safein_prefetch_skipped_byte_limit * inv_q) << ",\n";
     f << "    " << JNum("avg_safein_prefetch_scheduled_bytes",
                         metrics.safein_prefetch_scheduled_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_bextra_windows",
+                        metrics.bextra_windows * inv_q) << ",\n";
+    f << "    " << JNum("avg_bextra_eligible_candidates",
+                        metrics.bextra_eligible_candidates * inv_q) << ",\n";
+    f << "    " << JNum("avg_bextra_scheduled_candidates",
+                        metrics.bextra_scheduled_candidates * inv_q) << ",\n";
+    f << "    " << JNum("avg_bextra_predicted_service_bytes",
+                        metrics.bextra_predicted_service_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_bextra_predicted_extra_bytes",
+                        metrics.bextra_predicted_extra_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_bextra_eligible_extra_bytes",
+                        metrics.bextra_eligible_extra_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_bextra_scheduled_extra_bytes",
+                        metrics.bextra_scheduled_extra_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_bextra_completed_before_final_drain_bytes",
+                        metrics.bextra_completed_before_final_drain_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_bextra_spilled_to_final_drain_bytes",
+                        metrics.bextra_spilled_to_final_drain_bytes * inv_q) << ",\n";
     f << "    " << JNum("avg_dynamic_safein_clusters",
                         metrics.dynamic_safein_clusters * inv_q) << ",\n";
     f << "    " << JNum("avg_dynamic_safein_active_clusters",
@@ -1881,8 +2697,20 @@ int main(int argc, char** argv) {
                         metrics.total_submit_window_flushes * inv_q) << ",\n";
     f << "    " << JNum("avg_total_submit_window_requests",
                         metrics.total_submit_window_requests * inv_q) << ",\n";
+    f << "    " << JNum("avg_fixed_vec_buffer_hits",
+                        metrics.fixed_vec_buffer_hits * inv_q) << ",\n";
+    f << "    " << JNum("avg_fixed_vec_buffer_misses",
+                        metrics.fixed_vec_buffer_misses * inv_q) << ",\n";
     f << "    " << JNum("avg_separate_store_lookup_misses",
                         metrics.separate_store_lookup_misses * inv_q) << ",\n";
+    f << "    " << JNum("avg_inline_descriptor_read_requests",
+                        metrics.inline_descriptor_read_requests * inv_q) << ",\n";
+    f << "    " << JNum("avg_inline_descriptor_errors",
+                        metrics.inline_descriptor_errors * inv_q) << ",\n";
+    f << "    " << JNum("avg_inline_cold_payload_deferred",
+                        metrics.inline_cold_payload_deferred * inv_q) << ",\n";
+    f << "    " << JNum("avg_inline_payload_cache_hits",
+                        metrics.inline_payload_cache_hits * inv_q) << ",\n";
     f << "    " << JNum("avg_rabitq_active_bits_per_lane",
                         metrics.stage2_lanes_requested > 0
                             ? static_cast<double>(metrics.stage2_active_ex_bits_sum) /
@@ -1921,6 +2749,9 @@ int main(int argc, char** argv) {
     f << "    " << JNum("avg_collector_finalize_ms", metrics.collector_finalize_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_assemble_results_ms", metrics.assemble_results_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_search_unaccounted_ms", metrics.search_unaccounted_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_serial_vector_read_ms", metrics.serial_vector_read_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_serial_full_record_read_ms", metrics.serial_full_record_read_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_serial_payload_read_ms", metrics.serial_payload_read_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_stage2_lanes_requested", metrics.stage2_lanes_requested * inv_q) << ",\n";
     f << "    " << JNum("avg_stage2_decode_blocks", metrics.stage2_decode_blocks * inv_q) << ",\n";
     f << "    " << JNum("avg_stage2_decode_input_bytes", metrics.stage2_decode_input_bytes * inv_q) << ",\n";
@@ -1945,5 +2776,9 @@ int main(int argc, char** argv) {
     Log("  Output: %s\n", json_path.c_str());
     if (separate_payload_fd >= 0) ::close(separate_payload_fd);
     if (separate_vector_fd >= 0) ::close(separate_vector_fd);
+    if (inline_cold_payload_fd >= 0) ::close(inline_cold_payload_fd);
+    if (inline_buffered_hot_record_fd >= 0) {
+        ::close(inline_buffered_hot_record_fd);
+    }
     return 0;
 }

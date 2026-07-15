@@ -1,12 +1,14 @@
 #include "vdb/query/overlap_scheduler.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <unistd.h>
 
 #include "vdb/query/rerank_consumer.h"
 #include "vdb/rabitq/rabitq_estimator.h"
@@ -40,6 +42,35 @@ inline void CheckPrepRead(const Status& s, const char* context) {
                      context, s.ToString().c_str());
         std::abort();
     }
+}
+
+inline void CheckReadStatus(const Status& s, const char* context) {
+    if (!s.ok()) {
+        std::fprintf(stderr, "FATAL: synchronous read failed (%s): %s\n",
+                     context, s.ToString().c_str());
+        std::abort();
+    }
+}
+
+inline Status ReadExactFd(int fd, uint64_t offset, uint32_t length,
+                          uint8_t* out_buffer) {
+    if (fd < 0) {
+        return Status::InvalidArgument("ReadExactFd invalid fd");
+    }
+    uint32_t total_read = 0;
+    while (total_read < length) {
+        ssize_t n = ::pread(fd, out_buffer + total_read,
+                            length - total_read,
+                            static_cast<off_t>(offset + total_read));
+        if (n < 0) {
+            return Status::IOError("pread failed");
+        }
+        if (n == 0) {
+            return Status::IOError("unexpected EOF");
+        }
+        total_read += static_cast<uint32_t>(n);
+    }
+    return Status::OK();
 }
 
 inline uint8_t ResolveActiveExBits(const RaBitQConfig& rabitq_config,
@@ -172,8 +203,21 @@ void OverlapScheduler::SetFalseStatsTrueTopKRows(
     config_.false_stats_true_topk_rows = rows;
 }
 
+void OverlapScheduler::SetVectorReadTraceQueryIndex(uint32_t query_index) {
+    vector_read_trace_query_index_ = query_index;
+}
+
 bool OverlapScheduler::UseSeparateRecordStore() const {
+    return config_.separate_record_store.enabled &&
+           config_.separate_record_store.redirect_payload_reads;
+}
+
+bool OverlapScheduler::UseVectorSidecarStore() const {
     return config_.separate_record_store.enabled;
+}
+
+bool OverlapScheduler::UseInlineHotRecordStore() const {
+    return config_.inline_hot_record_store.enabled;
 }
 
 const SeparateRecordLocation& OverlapScheduler::LookupSeparateRecordOrAbort(
@@ -198,6 +242,223 @@ const SeparateRecordLocation& OverlapScheduler::LookupSeparateRecordOrAbort(
 uint64_t OverlapScheduler::SeparateVectorOffset(
     const SeparateRecordLocation& loc) const {
     return loc.row_id * static_cast<uint64_t>(vec_bytes_);
+}
+
+void OverlapScheduler::RecordVectorReadTrace(AddressEntry addr,
+                                             bool from_vec_all) {
+    if (config_.vector_read_trace == nullptr) return;
+    VectorReadTraceEntry entry;
+    entry.query_index = vector_read_trace_query_index_;
+    entry.request_index = vector_read_trace_request_index_++;
+    entry.combined_offset = addr.offset;
+    entry.read_length = vec_bytes_;
+    entry.request_type = from_vec_all ? 1 : 0;
+    config_.vector_read_trace->push_back(entry);
+}
+
+void OverlapScheduler::MarkSafeInConfidenceTraceSelectedTopK(
+    const std::vector<CollectorEntry>& results) {
+    auto* trace = config_.safein_confidence_trace;
+    if (trace == nullptr || safein_confidence_trace_query_start_ >= trace->size()) {
+        return;
+    }
+    std::unordered_set<uint64_t> selected_offsets;
+    selected_offsets.reserve(results.size() * 2u + 1u);
+    for (const auto& result : results) {
+        selected_offsets.insert(result.addr.offset);
+    }
+    for (size_t i = safein_confidence_trace_query_start_; i < trace->size(); ++i) {
+        (*trace)[i].selected_topk =
+            selected_offsets.count((*trace)[i].candidate_offset) != 0;
+    }
+}
+
+storage::HotPayloadDescriptor
+OverlapScheduler::ReadInlinePayloadDescriptorOrAbort(
+    SearchContext& ctx, AddressEntry addr) const {
+    const uint32_t descriptor_bytes =
+        config_.inline_hot_record_store.descriptor_bytes;
+    if (descriptor_bytes != sizeof(storage::HotPayloadDescriptor) ||
+        addr.size < vec_bytes_ + descriptor_bytes) {
+        ctx.stats().inline_descriptor_errors++;
+        std::fprintf(stderr,
+                     "FATAL: invalid inline hot-record descriptor config "
+                     "addr_offset=%llu addr_size=%u vec_bytes=%u desc_bytes=%u\n",
+                     static_cast<unsigned long long>(addr.offset), addr.size,
+                     vec_bytes_, descriptor_bytes);
+        std::abort();
+    }
+
+    uint8_t desc_buf[sizeof(storage::HotPayloadDescriptor)] = {};
+    const int descriptor_fd =
+        config_.inline_hot_record_store.buffered_hot_record_fd >= 0
+            ? config_.inline_hot_record_store.buffered_hot_record_fd
+            : index_.segment().data_reader().fd();
+    Status s = ReadExactFd(descriptor_fd,
+                           addr.offset + vec_bytes_, descriptor_bytes,
+                           desc_buf);
+    ctx.stats().inline_descriptor_read_requests++;
+    if (!s.ok()) {
+        ctx.stats().inline_descriptor_errors++;
+        std::fprintf(stderr,
+                     "FATAL: failed to read inline hot-record descriptor "
+                     "offset=%llu: %s\n",
+                     static_cast<unsigned long long>(addr.offset + vec_bytes_),
+                     s.ToString().c_str());
+        std::abort();
+    }
+
+    auto desc = storage::DecodeHotPayloadDescriptor(desc_buf);
+    s = storage::ValidateHotPayloadDescriptor(desc);
+    if (!s.ok()) {
+        ctx.stats().inline_descriptor_errors++;
+        std::fprintf(stderr,
+                     "FATAL: invalid inline hot-record descriptor "
+                     "addr_offset=%llu: %s\n",
+                     static_cast<unsigned long long>(addr.offset),
+                     s.ToString().c_str());
+        std::abort();
+    }
+    return desc;
+}
+
+OverlapScheduler::PayloadLocation
+OverlapScheduler::PayloadLocationFromDescriptorOrAbort(
+    SearchContext& ctx, AddressEntry addr,
+    const storage::HotPayloadDescriptor& desc) const {
+        Status s = storage::ValidateHotPayloadDescriptor(desc);
+        if (!s.ok()) {
+            ctx.stats().inline_descriptor_errors++;
+            std::fprintf(stderr,
+                         "FATAL: invalid inline hot-record descriptor "
+                         "addr_offset=%llu: %s\n",
+                         static_cast<unsigned long long>(addr.offset),
+                         s.ToString().c_str());
+            std::abort();
+        }
+        if (desc.payload_bytes > static_cast<uint64_t>(UINT32_MAX)) {
+            ctx.stats().inline_descriptor_errors++;
+            std::fprintf(stderr,
+                         "FATAL: inline hot-record payload too large "
+                         "addr_offset=%llu payload_bytes=%llu\n",
+                         static_cast<unsigned long long>(addr.offset),
+                         static_cast<unsigned long long>(desc.payload_bytes));
+            std::abort();
+        }
+
+        PayloadLocation loc;
+        loc.length = static_cast<uint32_t>(desc.payload_bytes);
+        if (desc.payload_storage_type ==
+            static_cast<uint8_t>(storage::HotPayloadStorageType::kInlinePayload)) {
+            loc.fd = config_.inline_hot_record_store.buffered_hot_record_fd >= 0
+                ? config_.inline_hot_record_store.buffered_hot_record_fd
+                : index_.segment().data_reader().fd();
+            loc.offset = addr.offset + vec_bytes_ +
+                config_.inline_hot_record_store.descriptor_bytes;
+            loc.from_inline_hot_record = true;
+            return loc;
+        }
+
+        if (desc.payload_storage_type == static_cast<uint8_t>(
+                storage::HotPayloadStorageType::kPrefixColdPointer)) {
+            loc.inline_prefix_length = desc.inline_bytes;
+            loc.inline_prefix_offset = addr.offset + vec_bytes_ +
+                config_.inline_hot_record_store.descriptor_bytes;
+            loc.inline_prefix_fd =
+                config_.inline_hot_record_store.buffered_hot_record_fd >= 0
+                    ? config_.inline_hot_record_store.buffered_hot_record_fd
+                    : index_.segment().data_reader().fd();
+        }
+
+        if (config_.inline_hot_record_store.cold_payload_fd < 0 &&
+            loc.length > 0) {
+            ctx.stats().inline_descriptor_errors++;
+            std::fprintf(stderr,
+                         "FATAL: inline hot-record cold payload requested "
+                         "without payload.cold.dat fd\n");
+            std::abort();
+        }
+        loc.fd = config_.inline_hot_record_store.cold_payload_fd;
+        loc.offset = desc.payload_offset;
+        loc.from_cold_payload = true;
+        return loc;
+}
+
+void OverlapScheduler::CacheInlinePayloadLocationFromRecord(
+    SearchContext& ctx, AddressEntry addr, const uint8_t* record,
+    uint32_t record_bytes) {
+    if (!UseInlineHotRecordStore() ||
+        payload_location_cache_.count(addr.offset) > 0) {
+        return;
+    }
+    const uint32_t descriptor_bytes =
+        config_.inline_hot_record_store.descriptor_bytes;
+    if (descriptor_bytes != sizeof(storage::HotPayloadDescriptor) ||
+        record_bytes < vec_bytes_ + descriptor_bytes) {
+        return;
+    }
+    const auto desc = storage::DecodeHotPayloadDescriptor(record + vec_bytes_);
+    payload_location_cache_.emplace(
+        addr.offset, PayloadLocationFromDescriptorOrAbort(ctx, addr, desc));
+}
+
+OverlapScheduler::PayloadLocation OverlapScheduler::LocatePayloadOrAbort(
+    SearchContext& ctx, AddressEntry addr) {
+    const auto cached = payload_location_cache_.find(addr.offset);
+    if (cached != payload_location_cache_.end()) {
+        return cached->second;
+    }
+
+    if (UseInlineHotRecordStore()) {
+        const auto* metadata = config_.inline_hot_record_store.payload_metadata;
+        if (metadata != nullptr) {
+            const auto found = metadata->find(addr.offset);
+            if (found == metadata->end()) {
+                ctx.stats().inline_descriptor_errors++;
+                std::fprintf(stderr,
+                             "FATAL: inline payload metadata missing for "
+                             "addr_offset=%llu\n",
+                             static_cast<unsigned long long>(addr.offset));
+                std::abort();
+            }
+            storage::HotPayloadDescriptor desc{};
+            desc.payload_storage_type = found->second.payload_storage_type;
+            desc.header_size = sizeof(storage::HotPayloadDescriptor);
+            desc.inline_bytes = found->second.inline_bytes;
+            desc.payload_offset = found->second.payload_offset;
+            desc.payload_bytes = found->second.payload_bytes;
+            PayloadLocation loc =
+                PayloadLocationFromDescriptorOrAbort(ctx, addr, desc);
+            payload_location_cache_.emplace(addr.offset, loc);
+            return loc;
+        }
+        const auto desc = ReadInlinePayloadDescriptorOrAbort(ctx, addr);
+        PayloadLocation loc =
+            PayloadLocationFromDescriptorOrAbort(ctx, addr, desc);
+        payload_location_cache_.emplace(addr.offset, loc);
+        return loc;
+    }
+
+    PayloadLocation loc;
+    if (UseSeparateRecordStore()) {
+        const SeparateRecordLocation& sep =
+            LookupSeparateRecordOrAbort(ctx, addr);
+        loc.length = sep.payload_bytes;
+        loc.offset = sep.payload_offset;
+        loc.fd = config_.separate_record_store.payload_fd;
+        payload_location_cache_.emplace(addr.offset, loc);
+        return loc;
+    }
+
+    if (addr.size <= vec_bytes_) {
+        payload_location_cache_.emplace(addr.offset, loc);
+        return loc;
+    }
+    loc.length = addr.size - vec_bytes_;
+    loc.offset = addr.offset + vec_bytes_;
+    loc.fd = index_.segment().data_reader().fd();
+    payload_location_cache_.emplace(addr.offset, loc);
+    return loc;
 }
 
 bool OverlapScheduler::AddSafeOutFrontierEstimate(
@@ -398,6 +659,11 @@ bool OverlapScheduler::ShouldDeferSafeInPlans() const {
 }
 
 bool OverlapScheduler::ShouldHoldDeferredSafeInPlans() {
+    if (config_.safein_prefetch_global_window > 0 &&
+        config_.safein_prefetch_order != SafeInPrefetchOrder::Arrival &&
+        !deferred_safein_plans_.empty()) {
+        return true;
+    }
     if (!use_dynamic_safein_) return false;
     if (deferred_safein_plans_.empty()) return false;
     if (config_.dynamic_safein_defer_initial_clusters > 0 &&
@@ -436,8 +702,17 @@ void OverlapScheduler::RecordSafeInPrefetchDecision(
     }
 }
 
-bool OverlapScheduler::ShouldScheduleSafeInFullPrefetch(
-    SearchContext& ctx, AddressEntry addr) {
+uint32_t OverlapScheduler::SafeInReadLength(AddressEntry addr) const {
+    if (UseInlineHotRecordStore()) {
+        return addr.size;
+    }
+    const uint32_t min_read = std::min(addr.size, vec_bytes_);
+    const uint32_t target = std::max(config_.safein_threshold_bytes, min_read);
+    return std::min(addr.size, target);
+}
+
+bool OverlapScheduler::ShouldScheduleSafeInPrefetch(
+    SearchContext& ctx, uint32_t read_length, uint32_t extra_bytes) {
     auto& stats = ctx.stats();
     stats.safein_prefetch_considered++;
 
@@ -448,16 +723,30 @@ bool OverlapScheduler::ShouldScheduleSafeInFullPrefetch(
     }
 
     const uint64_t next_bytes =
-        safein_prefetch_scheduled_bytes_ + static_cast<uint64_t>(addr.size);
+        safein_prefetch_scheduled_bytes_ + static_cast<uint64_t>(read_length);
     if (config_.safein_prefetch_max_bytes > 0 &&
         next_bytes > config_.safein_prefetch_max_bytes) {
         stats.safein_prefetch_skipped_byte_limit++;
         return false;
     }
 
+    const uint64_t next_extra_bytes = safein_prefetch_scheduled_extra_bytes_ +
+        static_cast<uint64_t>(extra_bytes);
+    if (config_.safein_query_extra_bytes > 0 &&
+        next_extra_bytes > config_.safein_query_extra_bytes) {
+        stats.safein_prefetch_skipped_byte_limit++;
+        return false;
+    }
+    if (config_.safein_max_full_payload_bytes > 0 &&
+        extra_bytes > config_.safein_max_full_payload_bytes) {
+        stats.safein_prefetch_skipped_byte_limit++;
+        return false;
+    }
+
     safein_prefetch_scheduled_count_++;
     safein_prefetch_scheduled_bytes_ = next_bytes;
-    stats.safein_prefetch_scheduled_bytes += addr.size;
+    safein_prefetch_scheduled_extra_bytes_ = next_extra_bytes;
+    stats.safein_prefetch_scheduled_bytes += read_length;
     return true;
 }
 
@@ -500,7 +789,8 @@ void OverlapScheduler::AddBudgetedReadPlan(SearchContext& ctx,
 void OverlapScheduler::MaybeScheduleBudgetedPrefetch(
     SearchContext& ctx, const ReadPlanEntry& plan) {
     if (!UseNonSafeOutCandidateBudget() ||
-        config_.budgeted_prefetch_limit == 0) {
+        config_.budgeted_prefetch_limit == 0 ||
+        config_.execution_mode == QueryExecutionMode::SerialNoOverlap) {
         return;
     }
     auto& stats = ctx.stats();
@@ -590,7 +880,9 @@ void OverlapScheduler::MaterializeBudgetedReadPlans(SearchContext& ctx,
             continue;
         }
         if (plan.type == PendingIO::Type::VEC_ALL &&
-            ShouldScheduleSafeInFullPrefetch(ctx, plan.addr)) {
+            ShouldScheduleSafeInPrefetch(
+                ctx, plan.read_length,
+                plan.read_length > vec_bytes_ ? plan.read_length - vec_bytes_ : 0)) {
             pending_all_plans_.push_back(plan);
             RecordSafeInPrefetchDecision(ctx, plan.has_truth,
                                          plan.is_true_topk);
@@ -609,25 +901,45 @@ void OverlapScheduler::FlushDeferredSafeInPlans(SearchContext& ctx,
     if (deferred_safein_plans_.empty()) return;
     if (!force && !std::isfinite(threshold)) return;
 
+    if (config_.safein_prefetch_order != SafeInPrefetchOrder::Arrival) {
+        const auto order = config_.safein_prefetch_order;
+        std::stable_sort(
+            deferred_safein_plans_.begin(), deferred_safein_plans_.end(),
+            [order](const DeferredSafeInPlan& a,
+                    const DeferredSafeInPlan& b) {
+                const float a_score = order == SafeInPrefetchOrder::ConfidencePerByte
+                    ? a.confidence / static_cast<float>(std::max(1u, a.extra_bytes))
+                    : a.confidence;
+                const float b_score = order == SafeInPrefetchOrder::ConfidencePerByte
+                    ? b.confidence / static_cast<float>(std::max(1u, b.extra_bytes))
+                    : b.confidence;
+                return a_score > b_score;
+            });
+    }
+
     const bool threshold_active = std::isfinite(threshold);
     for (const auto& plan : deferred_safein_plans_) {
         const bool would_use_vec_all =
             threshold_active &&
-            plan.addr.size <= config_.safein_all_threshold &&
             plan.safein_upper_bound < threshold;
         if (would_use_vec_all) {
             ctx.stats().dynamic_safein_deferred_safein++;
         }
-        if (would_use_vec_all && !config_.safein_as_vec_only) {
+        if (would_use_vec_all && !config_.late_materialization_enabled()) {
+            const uint32_t read_length = plan.read_length > 0
+                ? plan.read_length
+                : SafeInReadLength(plan.addr);
             ReadPlanEntry read;
             read.type = PendingIO::Type::VEC_ALL;
             read.addr = plan.addr;
-            read.read_length = plan.addr.size;
+            read.read_length = read_length;
             read.has_truth = plan.has_truth;
             read.is_true_topk = plan.is_true_topk;
             if (UseNonSafeOutCandidateBudget()) {
                 AddBudgetedReadPlan(ctx, read, plan.rank_key);
-            } else if (ShouldScheduleSafeInFullPrefetch(ctx, plan.addr)) {
+            } else if (ShouldScheduleSafeInPrefetch(
+                           ctx, read_length,
+                           read_length > vec_bytes_ ? read_length - vec_bytes_ : 0)) {
                 pending_all_plans_.push_back(read);
                 ctx.stats().total_submit_window_requests++;
                 RecordSafeInPrefetchDecision(ctx, plan.has_truth,
@@ -657,10 +969,14 @@ void OverlapScheduler::FlushDeferredSafeInPlans(SearchContext& ctx,
 
 SearchResults OverlapScheduler::Search(const float* query_vec) {
     // Reset per-query state
+    vector_read_trace_request_index_ = 0;
     submitted_candidate_offsets_.Clear();
     CleanupPendingSlots();
     pending_all_plans_.clear();
     pending_vec_only_plans_.clear();
+    candidate_order_by_offset_.clear();
+    payload_location_cache_.clear();
+    next_candidate_order_ = 0;
     pending_spec_vec_plans_.clear();
     deferred_safein_plans_.clear();
     budgeted_read_plan_heap_.clear();
@@ -680,6 +996,15 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
     dynamic_safein_current_threshold_ = std::numeric_limits<float>::infinity();
     safein_prefetch_scheduled_count_ = 0;
     safein_prefetch_scheduled_bytes_ = 0;
+    safein_prefetch_scheduled_extra_bytes_ = 0;
+    safein_confidence_trace_query_start_ =
+        config_.safein_confidence_trace != nullptr
+            ? config_.safein_confidence_trace->size()
+            : 0;
+    bextra_probe_cluster_ema_ms_ = 0.0;
+    bextra_inflight_bytes_ = 0;
+    bextra_window_index_ = 0;
+    bextra_before_final_drain_ = true;
 
     auto t_search_start = std::chrono::steady_clock::now();
     const float* effective_query_vec = query_vec;
@@ -718,7 +1043,8 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_rot0).count();
     }
-    RerankConsumer reranker(ctx, index_.logical_dim());
+    RerankConsumer reranker(ctx, index_.logical_dim(),
+                            &candidate_order_by_offset_);
 
     auto coarse_start = std::chrono::steady_clock::now();
     auto sorted_clusters = index_.FindNearestClusters(
@@ -738,13 +1064,15 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
 	    ctx.stats().coarse_select_ms = std::chrono::duration<double, std::milli>(
 	        std::chrono::steady_clock::now() - coarse_start).count();
 
-	    ProbeResidentClusters(ctx, reranker, sorted_clusters);
-	    {
-	        auto t0 = std::chrono::steady_clock::now();
-	        FinalDrain(ctx, reranker);
-	        ctx.stats().final_drain_ms = std::chrono::duration<double, std::milli>(
-	            std::chrono::steady_clock::now() - t0).count();
-	    }
+		    ProbeResidentClusters(ctx, reranker, sorted_clusters);
+		    if (config_.execution_mode == QueryExecutionMode::SerialNoOverlap) {
+		        ExecuteSerialDataReads(ctx, reranker);
+		    } else {
+		        auto t0 = std::chrono::steady_clock::now();
+		        FinalDrain(ctx, reranker);
+		        ctx.stats().final_drain_ms = std::chrono::duration<double, std::milli>(
+		            std::chrono::steady_clock::now() - t0).count();
+		    }
 	    FinalizeBudgetedPrefetchStats(ctx);
 	    {
 	        auto t0 = std::chrono::steady_clock::now();
@@ -756,21 +1084,26 @@ SearchResults OverlapScheduler::Search(const float* query_vec) {
 	    std::vector<CollectorEntry> results;
 	    {
 	        auto t0 = std::chrono::steady_clock::now();
-	        results = ctx.collector().Finalize();
+		        results = ctx.collector().Finalize();
 	        ctx.stats().collector_finalize_ms =
 	            std::chrono::duration<double, std::milli>(
 	                std::chrono::steady_clock::now() - t0).count();
 	    }
+	    MarkSafeInConfidenceTraceSelectedTopK(results);
 
 	    {
 	        auto tf0 = std::chrono::steady_clock::now();
-        FetchMissingPayloads(ctx, reranker, results);
+	        if (config_.execution_mode == QueryExecutionMode::SerialNoOverlap) {
+	            FetchMissingPayloadsSerial(ctx, reranker, results);
+	        } else {
+	            FetchMissingPayloads(ctx, reranker, results);
+	        }
         ctx.stats().fetch_missing_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - tf0).count();
 	        ctx.stats().remaining_payload_fetch_ms = ctx.stats().fetch_missing_ms;
 	    }
 	    auto ta0 = std::chrono::steady_clock::now();
-	    auto sr = AssembleResults(reranker, results);
+	    auto sr = AssembleResults(ctx, reranker, results);
 	    ctx.stats().assemble_results_ms = std::chrono::duration<double, std::milli>(
 	        std::chrono::steady_clock::now() - ta0).count();
 	    sr.stats() = ctx.stats();
@@ -792,6 +1125,126 @@ uint32_t OverlapScheduler::PendingDataRequestCount() const {
         (pending_vec_only_plans_.size() - pending_vec_only_head_));
 }
 
+void OverlapScheduler::ApplyBextraWindowBudget(
+    SearchContext& ctx, uint32_t clusters_processed,
+    uint32_t clusters_remaining) {
+    if (!config_.enable_safein_bextra_probe_budget ||
+        pending_all_plans_.empty()) {
+        return;
+    }
+
+    const double hide_time_ms =
+        bextra_probe_cluster_ema_ms_ * static_cast<double>(clusters_remaining);
+    const double service_double = std::max(
+        0.0, config_.safein_bextra_rho *
+                 config_.safein_bextra_bytes_per_ms * hide_time_ms);
+    const uint64_t predicted_service = static_cast<uint64_t>(
+        std::min(service_double,
+                 static_cast<double>(std::numeric_limits<uint64_t>::max())));
+
+    const uint64_t pending_count = static_cast<uint64_t>(
+        pending_all_plans_.size() +
+        (pending_vec_only_plans_.size() - pending_vec_only_head_) +
+        (pending_spec_vec_plans_.size() - pending_spec_vec_head_));
+    const uint64_t mandatory_pending = pending_count * vec_bytes_;
+    const double candidates_per_cluster = clusters_processed > 0
+        ? static_cast<double>(ctx.stats().unique_fetch_candidates) /
+              static_cast<double>(clusters_processed)
+        : 0.0;
+    const uint64_t mandatory_future = static_cast<uint64_t>(
+        candidates_per_cluster * static_cast<double>(clusters_remaining) *
+        static_cast<double>(vec_bytes_));
+    // Future candidate density changes sharply as the SafeOut frontier
+    // tightens. Reserve only work already pending or in flight; later windows
+    // account for future mandatory vectors when they actually materialize.
+    const uint64_t committed = bextra_inflight_bytes_ + mandatory_pending;
+    uint64_t extra_budget =
+        predicted_service > committed ? predicted_service - committed : 0;
+
+    BextraWindowTraceEntry trace;
+    trace.query_index = vector_read_trace_query_index_;
+    trace.window_index = bextra_window_index_++;
+    trace.clusters_processed = clusters_processed;
+    trace.clusters_remaining = clusters_remaining;
+    trace.rho = config_.safein_bextra_rho;
+    trace.probe_cluster_ema_ms = bextra_probe_cluster_ema_ms_;
+    trace.hide_time_ms = hide_time_ms;
+    trace.predicted_service_bytes = predicted_service;
+    trace.inflight_bytes = bextra_inflight_bytes_;
+    trace.mandatory_pending_bytes = mandatory_pending;
+    trace.mandatory_future_bytes = mandatory_future;
+    trace.predicted_extra_bytes = extra_budget;
+
+    for (const auto& plan : pending_all_plans_) {
+        trace.eligible_candidates++;
+        trace.eligible_extra_bytes +=
+            plan.read_length > vec_bytes_ ? plan.read_length - vec_bytes_ : 0;
+    }
+
+    size_t trace_index = std::numeric_limits<size_t>::max();
+    if (config_.bextra_window_trace != nullptr) {
+        trace_index = config_.bextra_window_trace->size();
+        config_.bextra_window_trace->push_back(trace);
+    }
+
+    std::deque<ReadPlanEntry> admitted;
+    while (!pending_all_plans_.empty()) {
+        ReadPlanEntry plan = pending_all_plans_.front();
+        pending_all_plans_.pop_front();
+        const uint64_t extra =
+            plan.read_length > vec_bytes_ ? plan.read_length - vec_bytes_ : 0;
+        if (extra <= extra_budget) {
+            extra_budget -= extra;
+            plan.bextra_extra_bytes = extra;
+            plan.bextra_trace_index = trace_index;
+            admitted.push_back(plan);
+            trace.scheduled_candidates++;
+            trace.scheduled_extra_bytes += extra;
+        } else {
+            pending_vec_only_plans_.push_back(VecOnlyReadPlan{plan.addr});
+        }
+    }
+    pending_all_plans_.swap(admitted);
+
+    if (trace_index != std::numeric_limits<size_t>::max()) {
+        (*config_.bextra_window_trace)[trace_index] = trace;
+    }
+    auto& stats = ctx.stats();
+    stats.bextra_windows++;
+    stats.bextra_eligible_candidates += trace.eligible_candidates;
+    stats.bextra_scheduled_candidates += trace.scheduled_candidates;
+    stats.bextra_predicted_service_bytes += trace.predicted_service_bytes;
+    stats.bextra_predicted_extra_bytes += trace.predicted_extra_bytes;
+    stats.bextra_eligible_extra_bytes += trace.eligible_extra_bytes;
+    stats.bextra_scheduled_extra_bytes += trace.scheduled_extra_bytes;
+}
+
+void OverlapScheduler::RecordBextraCompletion(const PendingIO& io,
+                                               SearchContext& ctx) {
+    if (!config_.enable_safein_bextra_probe_budget) return;
+    bextra_inflight_bytes_ = io.read_length >= bextra_inflight_bytes_
+        ? 0
+        : bextra_inflight_bytes_ - io.read_length;
+    if (io.bextra_extra_bytes == 0) return;
+
+    const bool hidden = bextra_before_final_drain_;
+    if (hidden) {
+        ctx.stats().bextra_completed_before_final_drain_bytes +=
+            io.bextra_extra_bytes;
+    } else {
+        ctx.stats().bextra_spilled_to_final_drain_bytes += io.bextra_extra_bytes;
+    }
+    if (config_.bextra_window_trace != nullptr &&
+        io.bextra_trace_index < config_.bextra_window_trace->size()) {
+        auto& trace = (*config_.bextra_window_trace)[io.bextra_trace_index];
+        if (hidden) {
+            trace.completed_before_final_drain_bytes += io.bextra_extra_bytes;
+        } else {
+            trace.spilled_to_final_drain_bytes += io.bextra_extra_bytes;
+        }
+    }
+}
+
 void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
                                                uint32_t max_count) {
     if (max_count == 0) return;
@@ -800,7 +1253,10 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
 
     const int dat_fd = index_.segment().data_reader().fd();
     const bool separate_store = UseSeparateRecordStore();
-    const int vec_fd = separate_store ? config_.separate_record_store.vector_fd : dat_fd;
+    const bool vector_sidecar = UseVectorSidecarStore();
+    const int vec_fd = vector_sidecar
+        ? config_.separate_record_store.vector_fd
+        : dat_fd;
     const int payload_fd = separate_store ? config_.separate_record_store.payload_fd : dat_fd;
     const bool detailed_timing = config_.enable_hotpath_detailed_timing;
 
@@ -811,6 +1267,11 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
             if (separate_store) {
                 const SeparateRecordLocation& loc =
                     LookupSeparateRecordOrAbort(ctx, plan.addr);
+                const uint32_t payload_prefix_len =
+                    plan.read_length > vec_bytes_
+                        ? std::min<uint32_t>(loc.payload_bytes,
+                                             plan.read_length - vec_bytes_)
+                        : 0;
                 uint8_t* vec_buf = nullptr;
                 uint16_t fixed_idx = 0;
                 const bool use_fixed_buffer =
@@ -827,6 +1288,7 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
                                      : PendingBufferCleanup::VecPool,
                     fixed_idx);
                 const uint64_t vec_off = SeparateVectorOffset(loc);
+                RecordVectorReadTrace(plan.addr, true);
                 if (use_fixed_buffer && fixed_buffer_reader_ != nullptr) {
                     CheckPrepRead(fixed_buffer_reader_->PrepReadRegisteredBufferTagged(
                                       vec_fd, vec_buf, fixed_idx, vec_bytes_,
@@ -841,21 +1303,31 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
                 ctx.stats().vec_only_read_requests++;
                 ctx.stats().vec_only_read_bytes += vec_bytes_;
 
-                if (loc.payload_bytes > 0) {
-                    uint8_t* payload_buf = buffer_pool_.Acquire(loc.payload_bytes);
+                if (payload_prefix_len > 0) {
+                    uint8_t* payload_buf = buffer_pool_.Acquire(payload_prefix_len);
                     PendingIO pio;
-                    pio.type = PendingIO::Type::PAYLOAD;
+                    pio.type = PendingIO::Type::PAYLOAD_PREFIX;
                     pio.addr = plan.addr;
                     pio.read_offset = loc.payload_offset;
-                    pio.read_length = loc.payload_bytes;
+                    pio.read_length = payload_prefix_len;
+                    pio.payload_total_length = loc.payload_bytes;
+                    pio.payload_prefix_length = payload_prefix_len;
                     uint32_t payload_slot_id = AllocatePendingSlot(
                         pio, payload_buf, PendingBufferCleanup::Pool);
                     CheckPrepRead(data_reader_.PrepReadTagged(
-                                      payload_fd, payload_buf, loc.payload_bytes,
+                                      payload_fd, payload_buf, payload_prefix_len,
                                       loc.payload_offset, payload_slot_id),
-                                  "scheduler NoCombine VEC_ALL payload");
+                                  "scheduler NoCombine SafeIn payload prefix");
                     ctx.stats().payload_read_requests++;
-                    ctx.stats().payload_read_bytes += loc.payload_bytes;
+                    ctx.stats().payload_read_bytes += payload_prefix_len;
+                }
+                const uint32_t scheduled_bytes = vec_bytes_ + payload_prefix_len;
+                if (payload_prefix_len >= loc.payload_bytes) {
+                    ctx.stats().safein_full_read_requests++;
+                    ctx.stats().safein_full_read_bytes += scheduled_bytes;
+                } else {
+                    ctx.stats().safein_prefix_read_requests++;
+                    ctx.stats().safein_prefix_read_bytes += scheduled_bytes;
                 }
                 pending_all_plans_.pop_front();
                 continue;
@@ -867,10 +1339,14 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
             pio.addr = plan.addr;
             pio.read_offset = plan.addr.offset;
             pio.read_length = plan.read_length;
+            pio.bextra_extra_bytes = plan.bextra_extra_bytes;
+            pio.bextra_trace_index = plan.bextra_trace_index;
+            RecordVectorReadTrace(plan.addr, true);
             uint32_t slot_id = 0;
             if (detailed_timing) {
                 auto alloc_start = std::chrono::steady_clock::now();
-                slot_id = AllocatePendingSlot(pio, buf, PendingBufferCleanup::Pool);
+                slot_id = AllocatePendingSlot(
+                    pio, buf, PendingBufferCleanup::Pool);
                 ctx.stats().probe_submit_pending_slot_alloc_ms +=
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - alloc_start).count();
@@ -884,7 +1360,8 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
                 ctx.stats().uring_prep_ms += prep_ms;
                 ctx.stats().probe_submit_prep_read_ms += prep_ms;
             } else {
-                slot_id = AllocatePendingSlot(pio, buf, PendingBufferCleanup::Pool);
+                slot_id = AllocatePendingSlot(
+                    pio, buf, PendingBufferCleanup::Pool);
                 CheckPrepRead(data_reader_.PrepReadTagged(
                                   dat_fd, buf, plan.read_length, plan.addr.offset,
                                   slot_id),
@@ -892,6 +1369,16 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
             }
             ctx.stats().all_read_requests++;
             ctx.stats().all_read_bytes += plan.read_length;
+            if (config_.enable_safein_bextra_probe_budget) {
+                bextra_inflight_bytes_ += plan.read_length;
+            }
+            if (plan.read_length >= plan.addr.size) {
+                ctx.stats().safein_full_read_requests++;
+                ctx.stats().safein_full_read_bytes += plan.read_length;
+            } else {
+                ctx.stats().safein_prefix_read_requests++;
+                ctx.stats().safein_prefix_read_bytes += plan.read_length;
+            }
             pending_all_plans_.pop_front();
         }
     };
@@ -904,14 +1391,14 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
                               bool speculative) {
         if (count == 0) return;
         auto emit_start = std::chrono::steady_clock::now();
-        for (uint32_t i = 0; i < count; ++i) {
-            const VecOnlyReadPlan& plan = plans[head];
+        auto emit_single = [&](const VecOnlyReadPlan& plan) {
             uint64_t read_offset = plan.addr.offset;
-            if (separate_store) {
+            if (vector_sidecar) {
                 const SeparateRecordLocation& loc =
                     LookupSeparateRecordOrAbort(ctx, plan.addr);
                 read_offset = SeparateVectorOffset(loc);
             }
+            RecordVectorReadTrace(plan.addr, false);
             uint8_t* buf = nullptr;
             uint16_t fixed_idx = 0;
             const bool use_fixed_buffer =
@@ -983,10 +1470,114 @@ void OverlapScheduler::EmitPendingDataRequests(SearchContext& ctx,
             }
             ctx.stats().vec_only_read_requests++;
             ctx.stats().vec_only_read_bytes += vec_bytes_;
+            if (config_.enable_safein_bextra_probe_budget) {
+                bextra_inflight_bytes_ += vec_bytes_;
+            }
             if (speculative) {
                 ctx.stats().budgeted_prefetch_read_bytes += vec_bytes_;
             }
-            ++head;
+        };
+
+        auto emit_span = [&](const std::vector<VecOnlyReadPlan>& group) {
+            if (group.size() < 2) {
+                emit_single(group.front());
+                return;
+            }
+            const uint64_t read_offset = group.front().addr.offset;
+            const uint64_t read_end = group.back().addr.offset + vec_bytes_;
+            const uint64_t span64 = read_end - read_offset;
+            if (span64 > UINT32_MAX) {
+                for (const auto& plan : group) emit_single(plan);
+                return;
+            }
+            const uint32_t span_bytes = static_cast<uint32_t>(span64);
+            uint8_t* buf = buffer_pool_.Acquire(span_bytes);
+            PendingIO pio;
+            pio.type = PendingIO::Type::VEC_SPAN;
+            pio.addr = group.front().addr;
+            pio.read_offset = read_offset;
+            pio.read_length = span_bytes;
+            pio.span_members.reserve(group.size());
+            for (const auto& plan : group) {
+                RecordVectorReadTrace(plan.addr, false);
+                pio.span_members.push_back(VecSpanMember{
+                    plan.addr,
+                    static_cast<uint32_t>(plan.addr.offset - read_offset)});
+            }
+            const uint32_t slot_id = AllocatePendingSlot(
+                std::move(pio), buf, PendingBufferCleanup::Pool);
+            CheckPrepRead(data_reader_.PrepReadTagged(
+                              dat_fd, buf, span_bytes, read_offset, slot_id),
+                          "scheduler VEC_SPAN");
+            ctx.stats().vec_only_read_requests++;
+            ctx.stats().vec_only_read_bytes += span_bytes;
+            ctx.stats().vec_span_read_requests++;
+            ctx.stats().vec_span_candidates +=
+                static_cast<uint32_t>(group.size());
+            ctx.stats().vec_span_read_bytes += span_bytes;
+        };
+
+        const bool can_coalesce =
+            io_type == PendingIO::Type::VEC_ONLY && !speculative &&
+            !vector_sidecar && config_.enable_vec_span_coalescing &&
+            config_.vec_span_tile_bytes >= vec_bytes_ &&
+            config_.vec_span_max_byte_amplification >= 1.0f;
+        if (!can_coalesce) {
+            for (uint32_t i = 0; i < count; ++i) {
+                emit_single(plans[head++]);
+            }
+        } else {
+            std::vector<VecOnlyReadPlan> selected(
+                plans.begin() + static_cast<std::ptrdiff_t>(head),
+                plans.begin() + static_cast<std::ptrdiff_t>(head + count));
+            head += count;
+            std::sort(selected.begin(), selected.end(),
+                      [](const VecOnlyReadPlan& lhs,
+                         const VecOnlyReadPlan& rhs) {
+                          return lhs.addr.offset < rhs.addr.offset;
+                      });
+
+            std::vector<VecOnlyReadPlan> group;
+            group.reserve(selected.size());
+            auto flush_group = [&]() {
+                if (group.empty()) return;
+                emit_span(group);
+                group.clear();
+            };
+            uint64_t group_tile = std::numeric_limits<uint64_t>::max();
+            for (const auto& plan : selected) {
+                const uint64_t tile =
+                    plan.addr.offset / config_.vec_span_tile_bytes;
+                const uint64_t vector_last = plan.addr.offset + vec_bytes_ - 1;
+                const bool crosses_tile =
+                    vector_last / config_.vec_span_tile_bytes != tile;
+                if (crosses_tile) {
+                    flush_group();
+                    emit_single(plan);
+                    group_tile = std::numeric_limits<uint64_t>::max();
+                    continue;
+                }
+                if (!group.empty() && tile != group_tile) {
+                    flush_group();
+                }
+                if (group.empty()) group_tile = tile;
+
+                const uint64_t proposed_span =
+                    plan.addr.offset + vec_bytes_ -
+                    (group.empty() ? plan.addr.offset
+                                   : group.front().addr.offset);
+                const double allowed =
+                    static_cast<double>(group.size() + 1) * vec_bytes_ *
+                    static_cast<double>(
+                        config_.vec_span_max_byte_amplification);
+                if (!group.empty() &&
+                    static_cast<double>(proposed_span) > allowed) {
+                    flush_group();
+                    group_tile = tile;
+                }
+                group.push_back(plan);
+            }
+            flush_group();
         }
         ctx.stats().probe_submit_vec_only_emit_ms +=
             std::chrono::duration<double, std::milli>(
@@ -1070,7 +1661,8 @@ void OverlapScheduler::ProbeResidentClusters(
             n = reader.Poll(comps.data(), static_cast<uint32_t>(comps.size()));
         }
         for (uint32_t j = 0; j < n; ++j) {
-            DispatchCompletion(comps[j].user_data, ctx, reranker);
+            DispatchCompletion(comps[j].user_data, comps[j].result,
+                               ctx, reranker);
         }
     };
     auto drain_reader_until_idle = [&](AsyncReader& reader) {
@@ -1090,10 +1682,25 @@ void OverlapScheduler::ProbeResidentClusters(
             std::abort();
         }
 
-        auto tp0 = std::chrono::steady_clock::now();
-        ProbeCluster(*cluster, cid, ctx, reranker);
-        (void)tp0;
-        ++clusters_since_submit;
+		        auto tp0 = std::chrono::steady_clock::now();
+		        ProbeCluster(*cluster, cid, ctx, reranker);
+		        const double cluster_probe_ms =
+		            std::chrono::duration<double, std::milli>(
+		                std::chrono::steady_clock::now() - tp0).count();
+		        if (bextra_probe_cluster_ema_ms_ == 0.0) {
+		            bextra_probe_cluster_ema_ms_ = cluster_probe_ms;
+		        } else {
+		            const double alpha = std::clamp<double>(
+		                config_.safein_bextra_ema_alpha, 0.0, 1.0);
+		            bextra_probe_cluster_ema_ms_ =
+		                alpha * cluster_probe_ms +
+		                (1.0 - alpha) * bextra_probe_cluster_ema_ms_;
+		        }
+		        ++clusters_since_submit;
+
+	        if (config_.execution_mode == QueryExecutionMode::SerialNoOverlap) {
+	            continue;
+	        }
 
         if (config_.serial_data_drains) {
             if (PendingDataRequestCount() > 0) {
@@ -1121,6 +1728,9 @@ void OverlapScheduler::ProbeResidentClusters(
                  (interval_hit && PendingDataRequestCount() >= emit_threshold) ||
                  final_cluster) &&
                 PendingDataRequestCount() > 0) {
+                ApplyBextraWindowBudget(
+                    ctx, static_cast<uint32_t>(i + 1),
+                    static_cast<uint32_t>(sorted_clusters.size() - i - 1));
                 EmitPendingDataRequests(ctx, PendingDataRequestCount());
                 ctx.stats().total_submit_window_flushes++;
                 if (final_cluster ||
@@ -1143,6 +1753,9 @@ void OverlapScheduler::ProbeResidentClusters(
                  (interval_hit && PendingDataRequestCount() >= emit_threshold) ||
                  final_cluster) &&
                 PendingDataRequestCount() > 0) {
+                ApplyBextraWindowBudget(
+                    ctx, static_cast<uint32_t>(i + 1),
+                    static_cast<uint32_t>(sorted_clusters.size() - i - 1));
                 EmitPendingDataRequests(ctx, PendingDataRequestCount());
                 ctx.stats().total_submit_window_flushes++;
                 if (final_cluster ||
@@ -1156,17 +1769,25 @@ void OverlapScheduler::ProbeResidentClusters(
         }
     }
 
-    FlushDeferredSafeInPlans(ctx, SafeInThresholdForProbe(), /*force=*/true);
-    MaterializeBudgetedReadPlans(ctx, reranker);
+	    FlushDeferredSafeInPlans(ctx, SafeInThresholdForProbe(), /*force=*/true);
+	    MaterializeBudgetedReadPlans(ctx, reranker);
+
+	    if (config_.execution_mode == QueryExecutionMode::SerialNoOverlap) {
+	        return;
+	    }
 
     if (isolated_submission_mode_) {
         if (PendingDataRequestCount() > 0) {
+            ApplyBextraWindowBudget(
+                ctx, static_cast<uint32_t>(sorted_clusters.size()), 0);
             EmitPendingDataRequests(ctx, PendingDataRequestCount());
             ctx.stats().total_submit_window_flushes++;
             ctx.stats().total_submit_window_tail_flushes++;
             record_submit(data_reader_);
         }
     } else if (PendingDataRequestCount() > 0) {
+        ApplyBextraWindowBudget(
+            ctx, static_cast<uint32_t>(sorted_clusters.size()), 0);
         EmitPendingDataRequests(ctx, PendingDataRequestCount());
         ctx.stats().total_submit_window_flushes++;
         ctx.stats().total_submit_window_tail_flushes++;
@@ -1398,7 +2019,7 @@ void OverlapScheduler::InitializeDataBufferSlab() {
 
     fixed_buffer_reader_ = uring_reader;
     fixed_vec_buffers_enabled_ = true;
-    data_fd_registered_index_ = UseSeparateRecordStore()
+    data_fd_registered_index_ = UseVectorSidecarStore()
         ? -1
         : uring_reader->RegisteredFileIndex(index_.segment().data_reader().fd());
 }
@@ -1413,7 +2034,8 @@ const ParsedCluster* OverlapScheduler::GetResidentParsedCluster(
 // ============================================================================
 
 void OverlapScheduler::DispatchCompletion(
-    uint64_t slot_token, SearchContext& ctx, RerankConsumer& reranker) {
+    uint64_t slot_token, int32_t result, SearchContext& ctx,
+    RerankConsumer& reranker) {
     PendingSlot* slot = GetPendingSlot(slot_token);
     if (slot == nullptr) return;
 
@@ -1421,6 +2043,18 @@ void OverlapScheduler::DispatchCompletion(
     uint8_t* buf = slot->buffer;
     PendingIO io = slot->io;
     bool release_slot = true;
+    if (result < 0 || static_cast<uint32_t>(result) != io.read_length) {
+        CleanupPendingSlot(*slot);
+        ReleasePendingSlot(slot_id);
+        std::fprintf(stderr,
+                     "FATAL: short or failed async read type=%u offset=%llu "
+                     "expected=%u result=%d\n",
+                     static_cast<unsigned>(io.type),
+                     static_cast<unsigned long long>(io.read_offset),
+                     io.read_length, result);
+        std::abort();
+    }
+    RecordBextraCompletion(io, ctx);
 
     switch (io.type) {
         case PendingIO::Type::VEC_ONLY: {
@@ -1441,17 +2075,49 @@ void OverlapScheduler::DispatchCompletion(
             release_slot = false;
             break;
         }
-        case PendingIO::Type::VEC_ALL: {
-            reranker.ConsumeAll(buf, io.addr);
+        case PendingIO::Type::VEC_SPAN: {
+            for (const auto& member : io.span_members) {
+                if (member.buffer_offset + vec_bytes_ > io.read_length) {
+                    std::fprintf(stderr,
+                                 "FATAL: invalid VEC_SPAN member offset=%u "
+                                 "vec_bytes=%u read_length=%u\n",
+                                 member.buffer_offset, vec_bytes_,
+                                 io.read_length);
+                    std::abort();
+                }
+                reranker.ConsumeVec(buf + member.buffer_offset, member.addr);
+            }
             CleanupPendingSlot(*slot);
             break;
         }
-        case PendingIO::Type::PAYLOAD:
-            reranker.ConsumePayload(buf, io.addr);
+        case PendingIO::Type::VEC_ALL: {
+            CacheInlinePayloadLocationFromRecord(
+                ctx, io.addr, buf, io.read_length);
+            reranker.ConsumeAll(buf, io.addr, io.read_length);
+            CleanupPendingSlot(*slot);
+            break;
+        }
+        case PendingIO::Type::PAYLOAD_PREFIX:
+            reranker.ConsumePayloadPrefix(buf, io.addr,
+                                          io.payload_prefix_length,
+                                          &buffer_pool_);
             slot->buffer = nullptr;
             slot->cleanup = PendingBufferCleanup::None;
-            // ConsumePayload takes ownership — don't release
             break;
+        case PendingIO::Type::PAYLOAD:
+            reranker.ConsumePayload(buf, io.addr, io.payload_total_length,
+                                    &buffer_pool_);
+            slot->buffer = nullptr;
+            slot->cleanup = PendingBufferCleanup::None;
+            // RerankConsumer returns this buffer to buffer_pool_ after parse.
+            break;
+        case PendingIO::Type::PAYLOAD_DESCRIPTOR: {
+            const auto desc = storage::DecodeHotPayloadDescriptor(buf);
+            payload_location_cache_[io.addr.offset] =
+                PayloadLocationFromDescriptorOrAbort(ctx, io.addr, desc);
+            CleanupPendingSlot(*slot);
+            break;
+        }
     }
     if (release_slot) {
         ReleasePendingSlot(slot_id);
@@ -1484,7 +2150,11 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
         scratch_.vec_only_count = 0;
 
         ScanAndPartitionBatch(batch);
-        if (sched_.ShouldDeferSafeInPlans()) {
+        if (sched_.config_.safein_prefetch_global_window > 0 &&
+            sched_.config_.safein_prefetch_order !=
+                SafeInPrefetchOrder::Arrival) {
+            BuildGlobalRankedPlans(batch);
+        } else if (sched_.ShouldDeferSafeInPlans()) {
             BuildDeferredPlans(batch);
         } else {
             BuildReadPlans(batch);
@@ -1569,6 +2239,8 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
 
             const uint32_t idx = scratch_.unique_count++;
             scratch_.unique_indices[idx] = i;
+            sched_.candidate_order_by_offset_.emplace(
+                addr.offset, sched_.next_candidate_order_++);
             if (!sched_.UseNonSafeOutCandidateBudget()) {
                 ctx_.stats().unique_fetch_candidates++;
             }
@@ -1583,10 +2255,42 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
                 ctx_.stats().safeout_frontier_buffer_ms += buffer_ms;
             }
 
+            if (batch.cls[i] == index::CandidateClass::SafeIn &&
+                sched_.config_.safein_confidence_trace != nullptr &&
+                std::isfinite(safein_prefetch_threshold_)) {
+                bool is_true_topk = false;
+                const bool has_truth =
+                    CandidateTruth(batch.global_idx[i], &is_true_topk);
+                SafeInConfidenceTraceEntry entry;
+                entry.query_index = sched_.vector_read_trace_query_index_;
+                entry.probe_index = sched_.dynamic_safein_probes_seen_;
+                entry.cluster_id = cluster_id_;
+                entry.cluster_local_index = batch.global_idx[i];
+                entry.candidate_offset = addr.offset;
+                entry.record_bytes = addr.size;
+                entry.classification_stage = batch.classification_stage[i];
+                entry.frontier_ready = sched_.dynamic_safein_ready_;
+                entry.has_gt_label = has_truth;
+                entry.gt_topk = is_true_topk;
+                entry.est_dist = batch.est_dist[i];
+                entry.est_error = batch.est_error[i];
+                entry.safein_upper_bound = batch.safein_upper_bound[i];
+                entry.safein_margin = std::max(
+                    0.0f, entry.safein_upper_bound - entry.est_dist);
+                entry.safein_threshold = safein_prefetch_threshold_;
+                entry.safein_frontier = sched_.dynamic_safein_current_frontier_;
+                entry.raw_slack =
+                    entry.safein_threshold - entry.safein_upper_bound;
+                entry.normalized_slack_error = entry.raw_slack /
+                    std::max(std::abs(entry.est_error), 1e-12f);
+                entry.normalized_slack_safein_margin = entry.raw_slack /
+                    std::max(entry.safein_margin, 1e-12f);
+                sched_.config_.safein_confidence_trace->push_back(entry);
+            }
+
             const bool use_vec_all =
                 batch.cls[i] == index::CandidateClass::SafeIn &&
-                addr.size <= sched_.config_.safein_all_threshold &&
-                !sched_.config_.safein_as_vec_only;
+                !sched_.config_.late_materialization_enabled();
             if (use_vec_all) {
                 scratch_.safein_all_indices[scratch_.safein_all_count++] = idx;
             } else {
@@ -1607,6 +2311,13 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
             plan.addr = batch.decoded_addr[batch_idx];
             plan.rank_key = batch.est_dist[batch_idx];
             plan.safein_upper_bound = batch.safein_upper_bound[batch_idx];
+            plan.confidence =
+                (safein_prefetch_threshold_ - plan.safein_upper_bound) /
+                std::max(std::abs(batch.est_error[batch_idx]), 1e-12f);
+            plan.read_length = sched_.SafeInReadLength(plan.addr);
+            plan.extra_bytes = plan.read_length > sched_.vec_bytes_
+                ? plan.read_length - sched_.vec_bytes_
+                : 0;
             plan.has_truth = has_truth;
             plan.is_true_topk = is_true_topk;
             sched_.deferred_safein_plans_.push_back(plan);
@@ -1614,35 +2325,7 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
         }
     }
 
-    void BuildReadPlans(const index::CandidateBatch& batch) {
-        auto all_start = std::chrono::steady_clock::now();
-        for (uint32_t pos = 0; pos < scratch_.safein_all_count; ++pos) {
-            const uint32_t unique_idx = scratch_.safein_all_indices[pos];
-            const uint32_t batch_idx = scratch_.unique_indices[unique_idx];
-            const AddressEntry& addr = batch.decoded_addr[batch_idx];
-            bool is_true_topk = false;
-            const bool has_truth =
-                CandidateTruth(batch.global_idx[batch_idx], &is_true_topk);
-            ReadPlanEntry plan;
-            plan.type = PendingIO::Type::VEC_ALL;
-            plan.addr = addr;
-            plan.read_length = addr.size;
-            plan.has_truth = has_truth;
-            plan.is_true_topk = is_true_topk;
-            if (sched_.UseNonSafeOutCandidateBudget()) {
-                sched_.AddBudgetedReadPlan(ctx_, plan, batch.est_dist[batch_idx]);
-            } else if (sched_.ShouldScheduleSafeInFullPrefetch(ctx_, addr)) {
-                sched_.pending_all_plans_.push_back(plan);
-                ctx_.stats().total_submit_window_requests++;
-                sched_.RecordSafeInPrefetchDecision(ctx_, has_truth,
-                                                    is_true_topk);
-            } else {
-                sched_.pending_vec_only_plans_.push_back(VecOnlyReadPlan{addr});
-                ctx_.stats().total_submit_window_requests++;
-            }
-        }
-        prepare_all_ms_ += std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - all_start).count();
+    void BuildVecOnlyPlans(const index::CandidateBatch& batch) {
         auto vec_start = std::chrono::steady_clock::now();
         for (uint32_t pos = 0; pos < scratch_.vec_only_count; ++pos) {
             const uint32_t unique_idx = scratch_.vec_only_indices[pos];
@@ -1665,6 +2348,116 @@ class OverlapScheduler::AsyncIOSink : public index::ProbeResultSink {
         }
         prepare_vec_only_ms_ += std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - vec_start).count();
+    }
+
+    void BuildGlobalRankedPlans(const index::CandidateBatch& batch) {
+        for (uint32_t pos = 0; pos < scratch_.safein_all_count; ++pos) {
+            const uint32_t unique_idx = scratch_.safein_all_indices[pos];
+            const uint32_t batch_idx = scratch_.unique_indices[unique_idx];
+            bool is_true_topk = false;
+            const bool has_truth =
+                CandidateTruth(batch.global_idx[batch_idx], &is_true_topk);
+            DeferredSafeInPlan plan;
+            plan.addr = batch.decoded_addr[batch_idx];
+            plan.rank_key = batch.est_dist[batch_idx];
+            plan.safein_upper_bound = batch.safein_upper_bound[batch_idx];
+            plan.confidence =
+                (safein_prefetch_threshold_ - plan.safein_upper_bound) /
+                std::max(std::abs(batch.est_error[batch_idx]), 1e-12f);
+            plan.read_length = sched_.SafeInReadLength(plan.addr);
+            plan.extra_bytes = plan.read_length > sched_.vec_bytes_
+                ? plan.read_length - sched_.vec_bytes_
+                : 0;
+            plan.has_truth = has_truth;
+            plan.is_true_topk = is_true_topk;
+            sched_.deferred_safein_plans_.push_back(plan);
+            ctx_.stats().dynamic_safein_deferred_candidates++;
+            if (sched_.deferred_safein_plans_.size() >=
+                sched_.config_.safein_prefetch_global_window) {
+                sched_.FlushDeferredSafeInPlans(
+                    ctx_, safein_prefetch_threshold_, /*force=*/true);
+            }
+        }
+        BuildVecOnlyPlans(batch);
+    }
+
+    void BuildReadPlans(const index::CandidateBatch& batch) {
+        auto all_start = std::chrono::steady_clock::now();
+        std::vector<uint32_t> safein_order(scratch_.safein_all_count);
+        for (uint32_t pos = 0; pos < scratch_.safein_all_count; ++pos) {
+            safein_order[pos] = pos;
+        }
+        const auto order = sched_.config_.safein_prefetch_order;
+        if (order != SafeInPrefetchOrder::Arrival) {
+            const uint32_t rank_batch = std::max(
+                1u, sched_.config_.safein_prefetch_rank_batch_size);
+            for (uint32_t begin = 0; begin < safein_order.size();
+                 begin += rank_batch) {
+                const uint32_t end = std::min<uint32_t>(
+                    static_cast<uint32_t>(safein_order.size()),
+                    begin + rank_batch);
+                std::stable_sort(
+                    safein_order.begin() + begin, safein_order.begin() + end,
+                    [&](uint32_t lhs_pos, uint32_t rhs_pos) {
+                        const uint32_t lhs_unique =
+                            scratch_.safein_all_indices[lhs_pos];
+                        const uint32_t rhs_unique =
+                            scratch_.safein_all_indices[rhs_pos];
+                        const uint32_t lhs = scratch_.unique_indices[lhs_unique];
+                        const uint32_t rhs = scratch_.unique_indices[rhs_unique];
+                        auto score = [&](uint32_t i) {
+                            const float confidence =
+                                (safein_prefetch_threshold_ -
+                                 batch.safein_upper_bound[i]) /
+                                std::max(std::abs(batch.est_error[i]), 1e-12f);
+                            if (order == SafeInPrefetchOrder::ConfidencePerByte) {
+                                const uint32_t read_length =
+                                    sched_.SafeInReadLength(batch.decoded_addr[i]);
+                                const uint32_t extra = read_length > sched_.vec_bytes_
+                                    ? read_length - sched_.vec_bytes_
+                                    : 0;
+                                return confidence /
+                                    static_cast<float>(std::max(1u, extra));
+                            }
+                            return confidence;
+                        };
+                        return score(lhs) > score(rhs);
+                    });
+            }
+        }
+        for (uint32_t ordered_pos : safein_order) {
+            const uint32_t pos = ordered_pos;
+            const uint32_t unique_idx = scratch_.safein_all_indices[pos];
+            const uint32_t batch_idx = scratch_.unique_indices[unique_idx];
+            const AddressEntry& addr = batch.decoded_addr[batch_idx];
+            bool is_true_topk = false;
+            const bool has_truth =
+                CandidateTruth(batch.global_idx[batch_idx], &is_true_topk);
+            ReadPlanEntry plan;
+            plan.type = PendingIO::Type::VEC_ALL;
+            plan.addr = addr;
+            plan.read_length = sched_.SafeInReadLength(addr);
+            plan.has_truth = has_truth;
+            plan.is_true_topk = is_true_topk;
+            if (sched_.UseNonSafeOutCandidateBudget()) {
+                sched_.AddBudgetedReadPlan(ctx_, plan, batch.est_dist[batch_idx]);
+            } else if (sched_.ShouldScheduleSafeInPrefetch(
+                           ctx_, plan.read_length,
+                           plan.read_length > sched_.vec_bytes_
+                               ? plan.read_length - sched_.vec_bytes_
+                               : 0)) {
+                sched_.pending_all_plans_.push_back(plan);
+                ctx_.stats().total_submit_window_requests++;
+                sched_.RecordSafeInPrefetchDecision(ctx_, has_truth,
+                                                    is_true_topk);
+            } else {
+                sched_.pending_vec_only_plans_.push_back(VecOnlyReadPlan{addr});
+                ctx_.stats().total_submit_window_requests++;
+            }
+        }
+        prepare_all_ms_ += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - all_start).count();
+        BuildVecOnlyPlans(batch);
     }
 
     OverlapScheduler& sched_;
@@ -1836,17 +2629,178 @@ void OverlapScheduler::ProbeCluster(
     ctx.stats().s1_false_safe_out += local_stats.s1_false_safeout;
     ctx.stats().s2_false_safe_in += local_stats.s2_false_safein;
     ctx.stats().s2_false_safe_out += local_stats.s2_false_safeout;
-    ctx.stats().total_uncertain +=
-        local_stats.s1_uncertain - local_stats.s2_safein - local_stats.s2_safeout;
+	    ctx.stats().total_uncertain +=
+	        local_stats.s1_uncertain - local_stats.s2_safein - local_stats.s2_safeout;
+	}
+
+void OverlapScheduler::ExecuteSerialDataReads(SearchContext& ctx,
+                                              RerankConsumer& reranker) {
+    if (cluster_reader_.prepped() > 0 || cluster_reader_.InFlight() > 0 ||
+        data_reader_.prepped() > 0 || data_reader_.InFlight() > 0) {
+        std::fprintf(stderr,
+                     "FATAL: serial-no-overlap entered read phase with async I/O pending\n");
+        std::abort();
+    }
+    if (pending_spec_vec_head_ < pending_spec_vec_plans_.size()) {
+        std::fprintf(stderr,
+                     "FATAL: serial-no-overlap must not emit SPEC_VEC_ONLY plans\n");
+        std::abort();
+    }
+
+    const bool separate_store = UseSeparateRecordStore();
+    const bool vector_sidecar = UseVectorSidecarStore();
+    const int vec_fd = vector_sidecar
+        ? config_.separate_record_store.vector_fd
+        : index_.segment().data_reader().fd();
+    const int payload_fd = separate_store
+        ? config_.separate_record_store.payload_fd
+        : index_.segment().data_reader().fd();
+
+    auto read_vec_only = [&](AddressEntry addr) {
+        uint64_t read_offset = addr.offset;
+        if (vector_sidecar) {
+            const SeparateRecordLocation& loc =
+                LookupSeparateRecordOrAbort(ctx, addr);
+            read_offset = SeparateVectorOffset(loc);
+        }
+        RecordVectorReadTrace(addr, false);
+        uint8_t* buf = AcquireVecOnlyBuffer();
+        auto t0 = std::chrono::steady_clock::now();
+        if (vector_sidecar) {
+            CheckReadStatus(ReadExactFd(vec_fd, read_offset, vec_bytes_, buf),
+                            "serial VEC_ONLY vector sidecar");
+        } else {
+            CheckReadStatus(index_.segment().data_reader().ReadRaw(
+                                read_offset, vec_bytes_, buf),
+                            "serial VEC_ONLY");
+        }
+        ctx.stats().serial_vector_read_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        ctx.stats().vec_only_read_requests++;
+        ctx.stats().vec_only_read_bytes += vec_bytes_;
+        ctx.stats().serial_vector_read_requests++;
+        ctx.stats().serial_vector_read_bytes += vec_bytes_;
+        reranker.ConsumeVec(buf, addr);
+        ReleaseVecOnlyBuffer(buf);
+    };
+
+    while (!pending_all_plans_.empty()) {
+        const ReadPlanEntry plan = pending_all_plans_.front();
+        pending_all_plans_.pop_front();
+        if (separate_store) {
+            const SeparateRecordLocation& loc =
+                LookupSeparateRecordOrAbort(ctx, plan.addr);
+            const uint32_t payload_prefix_len =
+                plan.read_length > vec_bytes_
+                    ? std::min<uint32_t>(loc.payload_bytes,
+                                         plan.read_length - vec_bytes_)
+                    : 0;
+            uint8_t* vec_buf = AcquireVecOnlyBuffer();
+            const uint64_t vec_off = SeparateVectorOffset(loc);
+            RecordVectorReadTrace(plan.addr, true);
+            auto tv0 = std::chrono::steady_clock::now();
+            CheckReadStatus(ReadExactFd(vec_fd, vec_off, vec_bytes_, vec_buf),
+                            "serial VEC_ALL separate vector");
+            ctx.stats().serial_vector_read_ms +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tv0).count();
+            ctx.stats().vec_only_read_requests++;
+            ctx.stats().vec_only_read_bytes += vec_bytes_;
+            ctx.stats().serial_vector_read_requests++;
+            ctx.stats().serial_vector_read_bytes += vec_bytes_;
+            reranker.ConsumeVec(vec_buf, plan.addr);
+            ReleaseVecOnlyBuffer(vec_buf);
+
+                if (payload_prefix_len > 0) {
+                uint8_t* payload_buf = buffer_pool_.Acquire(payload_prefix_len);
+                auto tp0 = std::chrono::steady_clock::now();
+                CheckReadStatus(ReadExactFd(payload_fd, loc.payload_offset,
+                                            payload_prefix_len, payload_buf),
+                                "serial SafeIn separate payload prefix");
+                ctx.stats().serial_payload_read_ms +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - tp0).count();
+                ctx.stats().payload_read_requests++;
+                ctx.stats().payload_read_bytes += payload_prefix_len;
+                ctx.stats().serial_payload_read_requests++;
+                ctx.stats().serial_payload_read_bytes += payload_prefix_len;
+                reranker.ConsumePayloadPrefix(payload_buf, plan.addr,
+                                              payload_prefix_len,
+                                              &buffer_pool_);
+            }
+            const uint32_t scheduled_bytes = vec_bytes_ + payload_prefix_len;
+            if (payload_prefix_len >= loc.payload_bytes) {
+                ctx.stats().safein_full_read_requests++;
+                ctx.stats().safein_full_read_bytes += scheduled_bytes;
+            } else {
+                ctx.stats().safein_prefix_read_requests++;
+                ctx.stats().safein_prefix_read_bytes += scheduled_bytes;
+            }
+            continue;
+        }
+
+        uint8_t* buf = buffer_pool_.Acquire(plan.read_length);
+        RecordVectorReadTrace(plan.addr, true);
+        auto t0 = std::chrono::steady_clock::now();
+        CheckReadStatus(index_.segment().data_reader().ReadRaw(
+                            plan.addr.offset, plan.read_length, buf),
+                        "serial VEC_ALL");
+        ctx.stats().serial_full_record_read_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        ctx.stats().all_read_requests++;
+        ctx.stats().all_read_bytes += plan.read_length;
+        ctx.stats().serial_full_record_read_requests++;
+        ctx.stats().serial_full_record_read_bytes += plan.read_length;
+        if (plan.read_length >= plan.addr.size) {
+            ctx.stats().safein_full_read_requests++;
+            ctx.stats().safein_full_read_bytes += plan.read_length;
+        } else {
+            ctx.stats().safein_prefix_read_requests++;
+            ctx.stats().safein_prefix_read_bytes += plan.read_length;
+        }
+        CacheInlinePayloadLocationFromRecord(
+            ctx, plan.addr, buf, plan.read_length);
+        reranker.ConsumeAll(buf, plan.addr, plan.read_length);
+        buffer_pool_.Release(buf);
+    }
+
+    while (pending_vec_only_head_ < pending_vec_only_plans_.size()) {
+        read_vec_only(pending_vec_only_plans_[pending_vec_only_head_].addr);
+        ++pending_vec_only_head_;
+    }
+    pending_vec_only_plans_.clear();
+    pending_vec_only_head_ = 0;
+    pending_spec_vec_plans_.clear();
+    pending_spec_vec_head_ = 0;
 }
 
-// ============================================================================
-// FinalDrain
-// ============================================================================
+	// ============================================================================
+	// FinalDrain
+	// ============================================================================
 
 void OverlapScheduler::FinalDrain(SearchContext& ctx,
                                    RerankConsumer& reranker) {
     std::vector<IoCompletion> comps(128);
+    if (config_.enable_safein_bextra_probe_budget) {
+        auto poll_ready = [&](AsyncReader& reader) {
+            for (;;) {
+                const uint32_t n = reader.Poll(
+                    comps.data(), static_cast<uint32_t>(comps.size()));
+                if (n == 0) break;
+                for (uint32_t i = 0; i < n; ++i) {
+                    DispatchCompletion(comps[i].user_data, comps[i].result,
+                                       ctx, reranker);
+                }
+            }
+        };
+        poll_ready(cluster_reader_);
+        if (isolated_submission_mode_) {
+            poll_ready(data_reader_);
+        }
+        bextra_before_final_drain_ = false;
+    }
     auto drain_reader = [&](AsyncReader& reader) {
         while (reader.InFlight() > 0) {
             auto tw0 = std::chrono::steady_clock::now();
@@ -1855,7 +2809,8 @@ void OverlapScheduler::FinalDrain(SearchContext& ctx,
             ctx.stats().io_wait_time_ms += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - tw0).count();
             for (uint32_t j = 0; j < n; ++j) {
-                DispatchCompletion(comps[j].user_data, ctx, reranker);
+                DispatchCompletion(comps[j].user_data, comps[j].result,
+                                   ctx, reranker);
             }
         }
         for (;;) {
@@ -1863,7 +2818,8 @@ void OverlapScheduler::FinalDrain(SearchContext& ctx,
                 comps.data(), static_cast<uint32_t>(comps.size()));
             if (n == 0) break;
             for (uint32_t j = 0; j < n; ++j) {
-                DispatchCompletion(comps[j].user_data, ctx, reranker);
+                DispatchCompletion(comps[j].user_data, comps[j].result,
+                                   ctx, reranker);
             }
         }
     };
@@ -1879,43 +2835,162 @@ void OverlapScheduler::FinalDrain(SearchContext& ctx,
 // FetchMissingPayloads
 // ============================================================================
 
+void OverlapScheduler::ResolvePayloadLocations(
+    SearchContext& ctx, RerankConsumer& reranker,
+    const std::vector<CollectorEntry>& results) {
+    (void)reranker;
+    if (!UseInlineHotRecordStore()) {
+        for (const auto& entry : results) {
+            (void)LocatePayloadOrAbort(ctx, entry.addr);
+        }
+        return;
+    }
+
+    if (config_.inline_hot_record_store.payload_metadata != nullptr) {
+        for (const auto& entry : results) {
+            (void)LocatePayloadOrAbort(ctx, entry.addr);
+        }
+        return;
+    }
+
+    const uint32_t descriptor_bytes =
+        config_.inline_hot_record_store.descriptor_bytes;
+    const int descriptor_fd =
+        config_.inline_hot_record_store.buffered_hot_record_fd;
+
+    // A tiny unaligned descriptor read cannot use the O_DIRECT data fd. Keep
+    // the existing synchronous fallback when no buffered descriptor fd exists.
+    if (descriptor_fd < 0) {
+        for (const auto& entry : results) {
+            (void)LocatePayloadOrAbort(ctx, entry.addr);
+        }
+        return;
+    }
+
+    uint32_t pending_descriptors = 0;
+    for (const auto& entry : results) {
+        if (payload_location_cache_.count(entry.addr.offset) > 0) continue;
+        if (descriptor_bytes != sizeof(storage::HotPayloadDescriptor) ||
+            entry.addr.size < vec_bytes_ + descriptor_bytes) {
+            (void)LocatePayloadOrAbort(ctx, entry.addr);
+            continue;
+        }
+
+        uint8_t* buf = buffer_pool_.Acquire(descriptor_bytes);
+        PendingIO pio;
+        pio.type = PendingIO::Type::PAYLOAD_DESCRIPTOR;
+        pio.addr = entry.addr;
+        pio.read_offset = entry.addr.offset + vec_bytes_;
+        pio.read_length = descriptor_bytes;
+        const uint32_t slot_id = AllocatePendingSlot(
+            std::move(pio), buf, PendingBufferCleanup::Pool);
+        CheckPrepRead(data_reader_.PrepReadTagged(
+                          descriptor_fd, buf, descriptor_bytes,
+                          entry.addr.offset + vec_bytes_, slot_id),
+                      "inline payload descriptor batch");
+        ctx.stats().inline_descriptor_read_requests++;
+        ++pending_descriptors;
+    }
+
+    if (pending_descriptors == 0) return;
+
+    const auto submit_start = std::chrono::steady_clock::now();
+    const uint32_t submitted = data_reader_.Submit();
+    ctx.stats().uring_submit_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - submit_start).count();
+    ctx.stats().total_io_submitted += submitted;
+    if (submitted > 0) {
+        ctx.stats().total_submit_calls++;
+    }
+
+    std::vector<IoCompletion> comps(
+        std::max<uint32_t>(128u, pending_descriptors));
+    while (data_reader_.InFlight() > 0) {
+        const auto wait_start = std::chrono::steady_clock::now();
+        const uint32_t n = data_reader_.WaitAndPoll(
+            comps.data(), static_cast<uint32_t>(comps.size()));
+        ctx.stats().io_wait_time_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - wait_start).count();
+        for (uint32_t i = 0; i < n; ++i) {
+            DispatchCompletion(comps[i].user_data, comps[i].result,
+                               ctx, reranker);
+        }
+    }
+    for (;;) {
+        const uint32_t n = data_reader_.Poll(
+            comps.data(), static_cast<uint32_t>(comps.size()));
+        if (n == 0) break;
+        for (uint32_t i = 0; i < n; ++i) {
+            DispatchCompletion(comps[i].user_data, comps[i].result,
+                               ctx, reranker);
+        }
+    }
+}
+
 void OverlapScheduler::FetchMissingPayloads(
     SearchContext& ctx, RerankConsumer& reranker,
     const std::vector<CollectorEntry>& results) {
-    int fd = index_.segment().data_reader().fd();
-    const bool separate_store = UseSeparateRecordStore();
-    if (separate_store) {
-        fd = config_.separate_record_store.payload_fd;
-    }
-
+    ResolvePayloadLocations(ctx, reranker, results);
     for (const auto& entry : results) {
-        if (reranker.HasPayload(entry.addr.offset)) continue;
-        uint32_t payload_len = 0;
-        uint64_t payload_off = 0;
-        if (separate_store) {
-            const SeparateRecordLocation& loc =
-                LookupSeparateRecordOrAbort(ctx, entry.addr);
-            payload_len = loc.payload_bytes;
-            payload_off = loc.payload_offset;
-        } else {
-            if (entry.addr.size <= vec_bytes_) continue;  // No payload data
-            payload_len = entry.addr.size - vec_bytes_;
-            payload_off = entry.addr.offset + vec_bytes_;
+        const PayloadLocation payload =
+            LocatePayloadOrAbort(ctx, entry.addr);
+        if (payload.length == 0) continue;
+        const uint32_t cached_prefix =
+            std::min(reranker.CachedPayloadBytes(entry.addr.offset),
+                     payload.length);
+        if (cached_prefix >= payload.length) {
+            ctx.stats().inline_payload_cache_hits +=
+                payload.from_inline_hot_record ? 1u : 0u;
+            continue;
         }
-        if (payload_len == 0) continue;
-        uint8_t* buf = buffer_pool_.Acquire(payload_len);
+        uint8_t* buf = buffer_pool_.Acquire(payload.length);
+        if (cached_prefix > 0) {
+            const uint8_t* cached = reranker.CachedPayloadData(entry.addr.offset);
+            if (cached != nullptr) {
+                std::memcpy(buf, cached, cached_prefix);
+            }
+        }
+        uint32_t ready_prefix = cached_prefix;
+        if (ready_prefix < payload.inline_prefix_length) {
+            const uint32_t hot_prefix_bytes =
+                payload.inline_prefix_length - ready_prefix;
+            CheckReadStatus(
+                ReadExactFd(payload.inline_prefix_fd,
+                            payload.inline_prefix_offset + ready_prefix,
+                            hot_prefix_bytes, buf + ready_prefix),
+                "inline hot payload prefix");
+            ctx.stats().payload_read_requests++;
+            ctx.stats().payload_read_bytes += hot_prefix_bytes;
+            ready_prefix = payload.inline_prefix_length;
+        }
+        const uint32_t backing_skip = ready_prefix > payload.inline_prefix_length
+            ? ready_prefix - payload.inline_prefix_length
+            : (payload.inline_prefix_length == 0 ? ready_prefix : 0u);
+        const uint32_t suffix_len = payload.length - ready_prefix;
+        if (suffix_len == 0) {
+            reranker.ConsumePayload(buf, entry.addr, payload.length);
+            continue;
+        }
         PendingIO pio;
         pio.type = PendingIO::Type::PAYLOAD;
         pio.addr = entry.addr;
-        pio.read_offset = payload_off;
-        pio.read_length = payload_len;
+        pio.read_offset = payload.offset + backing_skip;
+        pio.read_length = suffix_len;
+        pio.payload_total_length = payload.length;
+        pio.payload_prefix_length = ready_prefix;
         uint32_t slot_id = AllocatePendingSlot(std::move(pio), buf,
                                                PendingBufferCleanup::Pool);
         CheckPrepRead(data_reader_.PrepReadTagged(
-                          fd, buf, payload_len, payload_off, slot_id),
+                          payload.fd, buf + ready_prefix, suffix_len,
+                          payload.offset + backing_skip, slot_id),
                       "payload");
         ctx.stats().payload_read_requests++;
-        ctx.stats().payload_read_bytes += payload_len;
+        ctx.stats().payload_read_bytes += suffix_len;
+        if (ready_prefix > 0) {
+            ctx.stats().safein_suffix_read_requests++;
+            ctx.stats().safein_suffix_read_bytes += suffix_len;
+        }
     }
 
     if (data_reader_.prepped() > 0 || data_reader_.InFlight() > 0) {
@@ -1937,7 +3012,8 @@ void OverlapScheduler::FetchMissingPayloads(
             ctx.stats().io_wait_time_ms += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - tw0).count();
             for (uint32_t i = 0; i < n; ++i) {
-                DispatchCompletion(comps[i].user_data, ctx, reranker);
+                DispatchCompletion(comps[i].user_data, comps[i].result,
+                                   ctx, reranker);
             }
         }
         // Drain sync completions (pread path)
@@ -1946,9 +3022,80 @@ void OverlapScheduler::FetchMissingPayloads(
                 comps.data(), static_cast<uint32_t>(comps.size()));
             if (n == 0) break;
             for (uint32_t i = 0; i < n; ++i) {
-                DispatchCompletion(comps[i].user_data, ctx, reranker);
+                DispatchCompletion(comps[i].user_data, comps[i].result,
+                                   ctx, reranker);
             }
         }
+    }
+}
+
+void OverlapScheduler::FetchMissingPayloadsSerial(
+    SearchContext& ctx, RerankConsumer& reranker,
+    const std::vector<CollectorEntry>& results) {
+    for (const auto& entry : results) {
+        const PayloadLocation payload =
+            LocatePayloadOrAbort(ctx, entry.addr);
+        if (payload.length == 0) continue;
+        const uint32_t cached_prefix =
+            std::min(reranker.CachedPayloadBytes(entry.addr.offset),
+                     payload.length);
+        if (cached_prefix >= payload.length) {
+            ctx.stats().inline_payload_cache_hits +=
+                payload.from_inline_hot_record ? 1u : 0u;
+            continue;
+        }
+
+        uint8_t* buf = buffer_pool_.Acquire(payload.length);
+        if (cached_prefix > 0) {
+            const uint8_t* cached = reranker.CachedPayloadData(entry.addr.offset);
+            if (cached != nullptr) {
+                std::memcpy(buf, cached, cached_prefix);
+            }
+        }
+        uint32_t ready_prefix = cached_prefix;
+        if (ready_prefix < payload.inline_prefix_length) {
+            const uint32_t hot_prefix_bytes =
+                payload.inline_prefix_length - ready_prefix;
+            auto hot_t0 = std::chrono::steady_clock::now();
+            CheckReadStatus(
+                ReadExactFd(payload.inline_prefix_fd,
+                            payload.inline_prefix_offset + ready_prefix,
+                            hot_prefix_bytes, buf + ready_prefix),
+                "serial inline hot payload prefix");
+            ctx.stats().serial_payload_read_ms +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - hot_t0).count();
+            ctx.stats().payload_read_requests++;
+            ctx.stats().payload_read_bytes += hot_prefix_bytes;
+            ctx.stats().serial_payload_read_requests++;
+            ctx.stats().serial_payload_read_bytes += hot_prefix_bytes;
+            ready_prefix = payload.inline_prefix_length;
+        }
+        const uint32_t backing_skip = ready_prefix > payload.inline_prefix_length
+            ? ready_prefix - payload.inline_prefix_length
+            : (payload.inline_prefix_length == 0 ? ready_prefix : 0u);
+        const uint32_t suffix_len = payload.length - ready_prefix;
+        auto t0 = std::chrono::steady_clock::now();
+        if (suffix_len > 0) {
+            CheckReadStatus(ReadExactFd(payload.fd,
+                                        payload.offset + backing_skip,
+                                        suffix_len, buf + ready_prefix),
+                            "serial final payload");
+            ctx.stats().serial_payload_read_ms +=
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count();
+            ctx.stats().payload_read_requests++;
+            ctx.stats().payload_read_bytes += suffix_len;
+            ctx.stats().serial_payload_read_requests++;
+            ctx.stats().serial_payload_read_bytes += suffix_len;
+        }
+        if (ready_prefix > 0) {
+            ctx.stats().safein_suffix_read_requests++;
+            ctx.stats().safein_suffix_read_bytes += suffix_len;
+        }
+        ctx.stats().total_payload_fetched++;
+        reranker.ConsumePayload(buf, entry.addr, payload.length,
+                                &buffer_pool_);
     }
 }
 
@@ -1957,7 +3104,7 @@ void OverlapScheduler::FetchMissingPayloads(
 // ============================================================================
 
 SearchResults OverlapScheduler::AssembleResults(
-    RerankConsumer& reranker,
+    SearchContext& ctx, RerankConsumer& reranker,
     const std::vector<CollectorEntry>& results) {
     SearchResults sr;
     sr.results().reserve(results.size());
@@ -1970,11 +3117,21 @@ SearchResults OverlapScheduler::AssembleResults(
         result.distance = entry.distance;
 
         if (has_payload) {
-            auto payload_buf = reranker.TakePayload(entry.addr.offset);
-            if (payload_buf && entry.addr.size > vec_bytes_) {
-                uint32_t payload_len = entry.addr.size - vec_bytes_;
-                index_.segment().data_reader().ParsePayload(
-                    payload_buf.get(), payload_len, 0, result.payload);
+            const uint8_t* payload_buf =
+                reranker.CachedPayloadData(entry.addr.offset);
+            if (payload_buf != nullptr) {
+                const PayloadLocation payload =
+                    LocatePayloadOrAbort(ctx, entry.addr);
+                if (payload.length == 0) {
+                    reranker.ReleasePayload(entry.addr.offset);
+                    sr.results().push_back(std::move(result));
+                    continue;
+                }
+                CheckReadStatus(
+                    index_.segment().data_reader().ParsePayload(
+                        payload_buf, payload.length, 0, result.payload),
+                    "final payload parse");
+                reranker.ReleasePayload(entry.addr.offset);
             }
         }
 

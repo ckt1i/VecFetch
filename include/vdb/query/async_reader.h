@@ -141,6 +141,7 @@ class IoUringReader : public AsyncReader {
     bool defer_taskrun_enabled() const { return defer_taskrun_enabled_; }
     bool iopoll_enabled() const { return iopoll_enabled_; }
     bool sqpoll_enabled() const { return sqpoll_enabled_; }
+    bool registered_files_enabled() const { return registered_files_enabled_; }
     bool registered_buffers_enabled() const { return registered_buffers_enabled_; }
 
  private:
@@ -153,6 +154,7 @@ class IoUringReader : public AsyncReader {
     bool defer_taskrun_enabled_ = false;
     bool iopoll_enabled_ = false;
     bool sqpoll_enabled_ = false;
+    bool registered_files_enabled_ = false;
     bool registered_buffers_enabled_ = false;
 };
 

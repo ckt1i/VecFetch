@@ -295,6 +295,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
             batch.est_error[batch.count] = safeout_margin_s1;
             batch.estimate_lower_bound[batch.count] = est_dist_s1 - safeout_margin_s1;
             batch.safein_upper_bound[batch.count] = est_dist_s1 + safein_margin_s1;
+            batch.classification_stage[batch.count] = 1;
             batch.cls[batch.count] = (rc_final == ResultClass::SafeIn) ? CandidateClass::SafeIn
                                                                        : CandidateClass::Uncertain;
             batch.count++;
@@ -735,6 +736,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
                         batch.est_error[batch.count] = safeout_margin_s2;
                         batch.estimate_lower_bound[batch.count] = est_dist_s2 - safeout_margin_s2;
                         batch.safein_upper_bound[batch.count] = est_dist_s2 + safein_margin_s2;
+                        batch.classification_stage[batch.count] = 2;
                         batch.cls[batch.count] = ((classify_masks.safein >> lane) & 1u) != 0
                                                      ? CandidateClass::SafeIn
                                                      : CandidateClass::Uncertain;
@@ -787,6 +789,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
                         batch.est_error[batch.count] = safeout_margin_s2;
                         batch.estimate_lower_bound[batch.count] = est_dist_s2 - safeout_margin_s2;
                         batch.safein_upper_bound[batch.count] = est_dist_s2 + safein_margin_s2;
+                        batch.classification_stage[batch.count] = 2;
                         batch.cls[batch.count] = (rc_s2 == ResultClass::SafeIn)
                                                      ? CandidateClass::SafeIn
                                                      : CandidateClass::Uncertain;

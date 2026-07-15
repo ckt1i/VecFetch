@@ -130,6 +130,7 @@ Status IoUringReader::RegisterFiles(const int* fds, uint32_t count) {
     }
     impl_->num_registered = count;
     impl_->files_registered = true;
+    registered_files_enabled_ = true;
     return Status::OK();
 }
 

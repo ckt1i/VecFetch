@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -14,12 +15,17 @@
 #include "vdb/common/status.h"
 #include "vdb/common/types.h"
 #include "vdb/index/ivf_index.h"
+#include "vdb/storage/hot_record.h"
 
 namespace fs = std::filesystem;
 
 using vdb::AddressEntry;
 using vdb::Status;
 using vdb::index::IvfIndex;
+using vdb::storage::DecodeHotPayloadDescriptor;
+using vdb::storage::HotPayloadDescriptor;
+using vdb::storage::HotPayloadStorageType;
+using vdb::storage::ValidateHotPayloadDescriptor;
 
 struct SeparateStoreMapHeader {
     char magic[8];
@@ -43,6 +49,40 @@ static_assert(sizeof(SeparateStoreMapHeader) == 32,
 static_assert(sizeof(SeparateStoreMapRecord) == 32,
               "Unexpected SeparateStoreMapRecord layout");
 
+enum class MaterializedLayout {
+    NoCombineFlatStor,
+    HotColdRecordStore,
+};
+
+struct LayoutPaths {
+    const char* layout_name;
+    const char* vector_file;
+    const char* payload_file;
+    const char* map_file;
+    char magic[8];
+};
+
+static LayoutPaths PathsForLayout(MaterializedLayout layout) {
+    if (layout == MaterializedLayout::HotColdRecordStore) {
+        LayoutPaths paths{};
+        paths.layout_name = "hotcold_record_store";
+        paths.vector_file = "hotvec.dat";
+        paths.payload_file = "payload.cold.dat";
+        paths.map_file = "hotcold_map.bin";
+        const char magic[8] = {'R', 'G', 'H', 'C', 'M', 'A', 'P', '1'};
+        std::memcpy(paths.magic, magic, sizeof(magic));
+        return paths;
+    }
+    LayoutPaths paths{};
+    paths.layout_name = "no_combine_flatstor";
+    paths.vector_file = "vector.dat";
+    paths.payload_file = "payload.dat";
+    paths.map_file = "address_map.bin";
+    const char magic[8] = {'N', 'C', 'M', 'B', 'M', 'A', 'P', '1'};
+    std::memcpy(paths.magic, magic, sizeof(magic));
+    return paths;
+}
+
 static bool HasFlag(int argc, char** argv, const char* flag) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], flag) == 0) return true;
@@ -61,14 +101,19 @@ static std::string GetStringArg(int argc, char** argv, const char* key,
 static int Usage() {
     std::fprintf(stderr,
                  "Usage: bench_materialize_no_combine_store "
-                 "--index-dir DIR --output DIR [--direct-io]\n"
+                 "--index-dir DIR --output DIR [--layout no-combine|hotcold] "
+                 "[--source-inline-hot-record-store] "
+                 "[--direct-io]\n"
                  "\n"
-                 "Materializes a benchmark-only No Combine store from an "
+                 "Materializes a benchmark-only sidecar store from an "
                  "existing combined index:\n"
-                 "  vector.dat       dense raw-vector rows\n"
-                 "  payload.dat      concatenated original payload bytes\n"
-                 "  address_map.bin  combined data.dat offset -> vector row + "
-                 "payload slice\n");
+                 "  no-combine: vector.dat / payload.dat / address_map.bin\n"
+                 "  hotcold:    hotvec.dat / payload.cold.dat / hotcold_map.bin\n"
+                 "For an inline hot-record index, --source-inline-hot-record-store "
+                 "reconstructs complete payloads from descriptors and "
+                 "payload.cold.dat.\n"
+                 "The hotcold mode keeps the same cluster-addressed lookup key "
+                 "but uses a distinct map magic and layout manifest.\n");
     return 2;
 }
 
@@ -97,17 +142,50 @@ static Status PWriteAll(int fd, const void* data, size_t len, uint64_t offset) {
     return Status::OK();
 }
 
+static Status PReadAll(int fd, void* data, size_t len, uint64_t offset) {
+    auto* p = static_cast<uint8_t*>(data);
+    size_t read_bytes = 0;
+    while (read_bytes < len) {
+        ssize_t n = ::pread(fd, p + read_bytes, len - read_bytes,
+                            static_cast<off_t>(offset + read_bytes));
+        if (n < 0) return Status::IOError("pread failed");
+        if (n == 0) return Status::IOError("short pread");
+        read_bytes += static_cast<size_t>(n);
+    }
+    return Status::OK();
+}
+
 static SeparateStoreMapHeader MakeMapHeader(uint64_t count,
-                                            uint32_t vec_bytes) {
+                                            uint32_t vec_bytes,
+                                            const char magic[8]) {
     SeparateStoreMapHeader hdr{};
-    const char magic[8] = {'N', 'C', 'M', 'B', 'M', 'A', 'P', '1'};
-    std::memcpy(hdr.magic, magic, sizeof(magic));
+    std::memcpy(hdr.magic, magic, sizeof(hdr.magic));
     hdr.version = 1;
     hdr.record_size = sizeof(SeparateStoreMapRecord);
     hdr.count = count;
     hdr.vec_bytes = vec_bytes;
     hdr.reserved = 0;
     return hdr;
+}
+
+static std::string Basename(const char* path) {
+    return fs::path(path == nullptr ? "" : path).filename().string();
+}
+
+static MaterializedLayout ResolveLayout(int argc, char** argv) {
+    std::string layout = GetStringArg(argc, argv, "--layout", "");
+    if (layout.empty() && HasFlag(argc, argv, "--hotcold")) {
+        layout = "hotcold";
+    }
+    if (layout.empty() &&
+        Basename(argv[0]).find("hotcold") != std::string::npos) {
+        layout = "hotcold";
+    }
+    if (layout == "hotcold" || layout == "hot-cold" ||
+        layout == "hotcold_record_store") {
+        return MaterializedLayout::HotColdRecordStore;
+    }
+    return MaterializedLayout::NoCombineFlatStor;
 }
 
 int main(int argc, char** argv) {
@@ -117,6 +195,10 @@ int main(int argc, char** argv) {
     const std::string index_dir = GetStringArg(argc, argv, "--index-dir", "");
     const std::string output_dir = GetStringArg(argc, argv, "--output", "");
     const bool direct_io = HasFlag(argc, argv, "--direct-io");
+    const bool source_inline_hot_record_store =
+        HasFlag(argc, argv, "--source-inline-hot-record-store");
+    const MaterializedLayout layout = ResolveLayout(argc, argv);
+    const LayoutPaths paths = PathsForLayout(layout);
     if (index_dir.empty() || output_dir.empty()) return Usage();
 
     const auto start = std::chrono::steady_clock::now();
@@ -129,9 +211,9 @@ int main(int argc, char** argv) {
 
     const uint32_t vec_bytes = index.logical_dim() * sizeof(float);
     fs::create_directories(output_dir);
-    const std::string vector_path = output_dir + "/vector.dat";
-    const std::string payload_path = output_dir + "/payload.dat";
-    const std::string map_path = output_dir + "/address_map.bin";
+    const std::string vector_path = output_dir + "/" + paths.vector_file;
+    const std::string payload_path = output_dir + "/" + paths.payload_file;
+    const std::string map_path = output_dir + "/" + paths.map_file;
 
     int vector_fd = ::open(vector_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY,
                            0644);
@@ -153,8 +235,20 @@ int main(int argc, char** argv) {
         ::close(vector_fd);
         return 1;
     }
+    int cold_fd = -1;
+    if (source_inline_hot_record_store) {
+        const std::string cold_path = index_dir + "/payload.cold.dat";
+        cold_fd = ::open(cold_path.c_str(), O_RDONLY);
+        if (cold_fd < 0) {
+            std::perror(cold_path.c_str());
+            ::close(map_fd);
+            ::close(payload_fd);
+            ::close(vector_fd);
+            return 1;
+        }
+    }
 
-    SeparateStoreMapHeader placeholder = MakeMapHeader(0, vec_bytes);
+    SeparateStoreMapHeader placeholder = MakeMapHeader(0, vec_bytes, paths.magic);
     s = WriteAll(map_fd, &placeholder, sizeof(placeholder));
     if (!s.ok()) {
         std::fprintf(stderr, "Write map header failed: %s\n",
@@ -168,14 +262,18 @@ int main(int argc, char** argv) {
     seen_offsets.reserve(static_cast<size_t>(total_cluster_records));
 
     std::vector<uint8_t> record_buf;
+    std::vector<uint8_t> cold_buf;
     uint64_t unique_records = 0;
     uint64_t duplicate_refs = 0;
     uint64_t payload_offset = 0;
     uint64_t cluster_records_seen = 0;
 
-    std::printf("=== Materialize No Combine Store ===\n");
+    std::printf("=== Materialize Record Sidecar Store ===\n");
+    std::printf("Layout: %s\n", paths.layout_name);
     std::printf("Index: %s\n", index_dir.c_str());
     std::printf("Output: %s\n", output_dir.c_str());
+    std::printf("Files: vector=%s payload=%s map=%s\n",
+                paths.vector_file, paths.payload_file, paths.map_file);
     std::printf("Clusters: %zu total_cluster_records=%llu vec_bytes=%u\n",
                 cluster_ids.size(),
                 static_cast<unsigned long long>(total_cluster_records),
@@ -228,16 +326,84 @@ int main(int argc, char** argv) {
                 return 1;
             }
 
-            const uint32_t payload_bytes = addr.size - vec_bytes;
-            if (payload_bytes > 0) {
+            uint64_t logical_payload_bytes = addr.size - vec_bytes;
+            if (source_inline_hot_record_store) {
+                if (addr.size < vec_bytes + sizeof(HotPayloadDescriptor)) {
+                    std::fprintf(stderr,
+                                 "Hot record too small for descriptor: offset=%llu size=%u\n",
+                                 static_cast<unsigned long long>(addr.offset),
+                                 addr.size);
+                    return 1;
+                }
+                const auto desc = DecodeHotPayloadDescriptor(
+                    record_buf.data() + vec_bytes);
+                s = ValidateHotPayloadDescriptor(desc);
+                if (!s.ok()) {
+                    std::fprintf(stderr,
+                                 "Invalid hot payload descriptor at offset=%llu: %s\n",
+                                 static_cast<unsigned long long>(addr.offset),
+                                 s.ToString().c_str());
+                    return 1;
+                }
+                logical_payload_bytes = desc.payload_bytes;
+                const uint64_t inline_end =
+                    static_cast<uint64_t>(vec_bytes) + sizeof(desc) +
+                    desc.inline_bytes;
+                if (inline_end > record_buf.size()) {
+                    std::fprintf(stderr,
+                                 "Hot record inline payload exceeds record: offset=%llu\n",
+                                 static_cast<unsigned long long>(addr.offset));
+                    return 1;
+                }
+                if (desc.inline_bytes > 0) {
+                    s = WriteAll(payload_fd,
+                                 record_buf.data() + vec_bytes + sizeof(desc),
+                                 desc.inline_bytes);
+                    if (!s.ok()) {
+                        std::fprintf(stderr, "Write inline payload failed: %s\n",
+                                     s.ToString().c_str());
+                        return 1;
+                    }
+                }
+                const uint64_t cold_bytes =
+                    desc.payload_bytes - desc.inline_bytes;
+                if (cold_bytes > 0) {
+                    cold_buf.resize(static_cast<size_t>(cold_bytes));
+                    s = PReadAll(cold_fd, cold_buf.data(), cold_buf.size(),
+                                 desc.payload_offset);
+                    if (!s.ok()) {
+                        std::fprintf(stderr,
+                                     "Read cold payload failed at offset=%llu: %s\n",
+                                     static_cast<unsigned long long>(desc.payload_offset),
+                                     s.ToString().c_str());
+                        return 1;
+                    }
+                    s = WriteAll(payload_fd, cold_buf.data(), cold_buf.size());
+                    if (!s.ok()) {
+                        std::fprintf(stderr, "Write cold payload failed: %s\n",
+                                     s.ToString().c_str());
+                        return 1;
+                    }
+                }
+            } else if (logical_payload_bytes > 0) {
                 s = WriteAll(payload_fd, record_buf.data() + vec_bytes,
-                             payload_bytes);
+                             static_cast<size_t>(logical_payload_bytes));
                 if (!s.ok()) {
                     std::fprintf(stderr, "Write payload failed: %s\n",
                                  s.ToString().c_str());
                     return 1;
                 }
             }
+
+            if (logical_payload_bytes > UINT32_MAX) {
+                std::fprintf(stderr,
+                             "Payload exceeds no-combine map limit: offset=%llu bytes=%llu\n",
+                             static_cast<unsigned long long>(addr.offset),
+                             static_cast<unsigned long long>(logical_payload_bytes));
+                return 1;
+            }
+            const uint32_t payload_bytes =
+                static_cast<uint32_t>(logical_payload_bytes);
 
             SeparateStoreMapRecord map_rec{};
             map_rec.combined_offset = addr.offset;
@@ -268,7 +434,7 @@ int main(int argc, char** argv) {
     }
 
     const SeparateStoreMapHeader final_hdr =
-        MakeMapHeader(unique_records, vec_bytes);
+        MakeMapHeader(unique_records, vec_bytes, paths.magic);
     s = PWriteAll(map_fd, &final_hdr, sizeof(final_hdr), 0);
     if (!s.ok()) {
         std::fprintf(stderr, "Patch map header failed: %s\n",
@@ -281,9 +447,32 @@ int main(int argc, char** argv) {
     ::close(map_fd);
     ::close(payload_fd);
     ::close(vector_fd);
+    if (cold_fd >= 0) ::close(cold_fd);
 
     const double wall_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
+    std::ofstream manifest(output_dir + "/manifest.json",
+                           std::ios::binary | std::ios::trunc);
+    if (manifest.good()) {
+        manifest << "{\n";
+        manifest << "  \"layout\": \"" << paths.layout_name << "\",\n";
+        manifest << "  \"source_inline_hot_record_store\": "
+                 << (source_inline_hot_record_store ? "true" : "false")
+                 << ",\n";
+        manifest << "  \"index_dir\": \"" << index_dir << "\",\n";
+        manifest << "  \"vector_file\": \"" << paths.vector_file << "\",\n";
+        manifest << "  \"payload_file\": \"" << paths.payload_file << "\",\n";
+        manifest << "  \"map_file\": \"" << paths.map_file << "\",\n";
+        manifest << "  \"unique_records\": " << unique_records << ",\n";
+        manifest << "  \"duplicate_refs\": " << duplicate_refs << ",\n";
+        manifest << "  \"cluster_records_seen\": " << cluster_records_seen << ",\n";
+        manifest << "  \"vec_bytes\": " << vec_bytes << ",\n";
+        manifest << "  \"vector_bytes\": "
+                 << (unique_records * static_cast<uint64_t>(vec_bytes)) << ",\n";
+        manifest << "  \"payload_bytes\": " << payload_offset << ",\n";
+        manifest << "  \"wall_ms\": " << wall_ms << "\n";
+        manifest << "}\n";
+    }
     std::printf("Done: unique=%llu duplicate_refs=%llu payload_bytes=%llu wall_ms=%.3f\n",
                 static_cast<unsigned long long>(unique_records),
                 static_cast<unsigned long long>(duplicate_refs),

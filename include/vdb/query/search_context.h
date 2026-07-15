@@ -22,6 +22,22 @@ enum class DynamicSafeInMode : uint8_t {
     Frontier = 1,
 };
 
+enum class QueryExecutionMode : uint8_t {
+    Overlap = 0,
+    SerialNoOverlap = 1,
+};
+
+enum class MaterializationMode : uint8_t {
+    EagerSafeIn = 0,
+    Late = 1,
+};
+
+enum class SafeInPrefetchOrder : uint8_t {
+    Arrival = 0,
+    Confidence = 1,
+    ConfidencePerByte = 2,
+};
+
 struct SeparateRecordLocation {
     uint64_t row_id = 0;
     uint64_t payload_offset = 0;
@@ -32,9 +48,85 @@ using SeparateRecordMap = std::unordered_map<uint64_t, SeparateRecordLocation>;
 
 struct SeparateRecordStoreConfig {
     bool enabled = false;
+    // Shadow-vector experiments keep payload reads on the combined data.dat
+    // while redirecting only raw-vector verification to vector_fd.
+    bool redirect_payload_reads = true;
     int vector_fd = -1;
     int payload_fd = -1;
     const SeparateRecordMap* address_map = nullptr;
+};
+
+struct VectorReadTraceEntry {
+    uint32_t query_index = 0;
+    uint32_t request_index = 0;
+    uint64_t combined_offset = 0;
+    uint32_t read_length = 0;
+    uint8_t request_type = 0;  // 0=VEC_ONLY, 1=VEC_ALL vector component.
+};
+
+struct SafeInConfidenceTraceEntry {
+    uint32_t query_index = 0;
+    uint32_t probe_index = 0;
+    uint32_t cluster_id = 0;
+    uint32_t cluster_local_index = 0;
+    uint64_t candidate_offset = 0;
+    uint32_t record_bytes = 0;
+    uint8_t classification_stage = 0;
+    bool frontier_ready = false;
+    bool has_gt_label = false;
+    bool gt_topk = false;
+    bool selected_topk = false;
+    float est_dist = 0.0f;
+    float est_error = 0.0f;
+    float safein_margin = 0.0f;
+    float safein_upper_bound = 0.0f;
+    float safein_threshold = 0.0f;
+    float safein_frontier = 0.0f;
+    float raw_slack = 0.0f;
+    float normalized_slack_error = 0.0f;
+    float normalized_slack_safein_margin = 0.0f;
+};
+
+struct BextraWindowTraceEntry {
+    uint32_t query_index = 0;
+    uint32_t window_index = 0;
+    uint32_t clusters_processed = 0;
+    uint32_t clusters_remaining = 0;
+    uint32_t eligible_candidates = 0;
+    uint32_t scheduled_candidates = 0;
+    double rho = 0.0;
+    double probe_cluster_ema_ms = 0.0;
+    double hide_time_ms = 0.0;
+    uint64_t predicted_service_bytes = 0;
+    uint64_t inflight_bytes = 0;
+    uint64_t mandatory_pending_bytes = 0;
+    uint64_t mandatory_future_bytes = 0;
+    uint64_t eligible_extra_bytes = 0;
+    uint64_t predicted_extra_bytes = 0;
+    uint64_t scheduled_extra_bytes = 0;
+    uint64_t completed_before_final_drain_bytes = 0;
+    uint64_t spilled_to_final_drain_bytes = 0;
+};
+
+struct InlineHotRecordStoreConfig {
+    bool enabled = false;
+    int cold_payload_fd = -1;
+    // Buffered descriptor/prefix reads remain valid when the main data reader
+    // opens data.dat with O_DIRECT.
+    int buffered_hot_record_fd = -1;
+    uint32_t descriptor_bytes = 0;
+    uint32_t inline_payload_threshold = 0;
+    struct PayloadMetadata {
+        uint64_t payload_offset = 0;
+        uint64_t payload_bytes = 0;
+        uint32_t inline_bytes = 0;
+        uint8_t payload_storage_type = 0;
+    };
+    using PayloadMetadataMap =
+        std::unordered_map<uint64_t, PayloadMetadata>;
+    // Optional resident metadata plane keyed by combined record offset. This
+    // is the inline-layout counterpart of NoCombine's resident address map.
+    const PayloadMetadataMap* payload_metadata = nullptr;
 };
 
 struct SearchConfig {
@@ -44,7 +136,11 @@ struct SearchConfig {
     uint32_t cluster_atomic_threshold = 1024;
     uint32_t io_queue_depth = 64;
     uint32_t cq_entries = 4096;
-    uint32_t safein_all_threshold = 256 * 1024;  // 256KB
+    // SafeIn eager materialization reads at most this many bytes from the
+    // beginning of each combined record. The scheduler always reads enough
+    // bytes to cover the raw vector; large records fetch the remaining payload
+    // suffix only if they survive into the final top-k.
+    uint32_t safein_threshold_bytes = 256 * 1024;  // 256KB
     uint32_t cluster_submit_reserve = 8;
     bool use_sqpoll = false;
     SubmissionMode submission_mode = SubmissionMode::Shared;
@@ -67,11 +163,18 @@ struct SearchConfig {
     uint32_t dynamic_safein_defer_initial_clusters = 0;
     bool dynamic_safein_defer_until_ready = false;
     uint32_t dynamic_safein_defer_max_candidates = 0;
-    // Ablation mode: keep SafeIn classification/frontier statistics, but force
-    // candidates that would normally issue full-record VEC_ALL prefetches to
-    // use VEC_ONLY verification instead. Final top-k payload materialization is
-    // unchanged.
+    // EagerSafeIn allows high-confidence SafeIn candidates to issue early
+    // full-record VEC_ALL reads. Late keeps SafeIn classification/frontier
+    // statistics but verifies raw vectors first and materializes payloads only
+    // after final top-k ranking.
+    MaterializationMode materialization_mode = MaterializationMode::EagerSafeIn;
+    // Backward-compatible ablation alias. Prefer materialization_mode=Late for
+    // new code and experiments.
     bool safein_as_vec_only = false;
+    bool late_materialization_enabled() const {
+        return materialization_mode == MaterializationMode::Late ||
+               safein_as_vec_only;
+    }
 
     // Optional query-level guardrails for SafeIn full-record prefetch.
     // 0 keeps the legacy unlimited behavior. When either limit is exceeded,
@@ -83,16 +186,38 @@ struct SearchConfig {
     // full-record reads before giving VEC_ONLY reads a chance. Remaining
     // full-record reads are still emitted in the same flush if capacity remains.
     uint32_t safein_prefetch_emit_quantum = 0;
+    // Static, query-level SafeIn scheduler. The legacy max-bytes limit counts
+    // submitted bytes; query_extra_bytes counts bytes beyond raw-vector
+    // verification and is therefore comparable across record layouts.
+    SafeInPrefetchOrder safein_prefetch_order = SafeInPrefetchOrder::Arrival;
+    uint32_t safein_prefetch_rank_batch_size = 32;
+    // Non-zero enables a rolling cross-batch SafeIn admission window. Plans
+    // are ranked together once the window fills; the tail flushes at drain.
+    uint32_t safein_prefetch_global_window = 0;
+    uint64_t safein_query_extra_bytes = 0;
+    uint32_t safein_max_full_payload_bytes = 0;
+
+    bool enable_safein_bextra_probe_budget = false;
+    double safein_bextra_rho = 0.0;
+    double safein_bextra_bytes_per_ms = 0.0;
+    float safein_bextra_ema_alpha = 0.25f;
 
     // Submit batching: submit when pending vec requests reach N.
     // `0` preserves the legacy "submit on pressure/final drain" behavior.
     uint32_t submit_batch_size = 32;
+    // Merge nearby VEC_ONLY candidates within a logical tile into one minimal
+    // contiguous span. The span is admitted only when its bytes stay within
+    // max_byte_amplification of issuing the vectors separately.
+    bool enable_vec_span_coalescing = false;
+    uint32_t vec_span_tile_bytes = 4096;
+    float vec_span_max_byte_amplification = 1.10f;
     bool enable_online_submit_tuning = false;
     float submit_ema_alpha = 0.25f;
     uint32_t submit_batch_min = 16;
     uint32_t submit_batch_max = 48;
     uint32_t fixed_vec_buffer_count = 0;
     bool serial_data_drains = false;  // Benchmark-only: disable probe/I/O overlap.
+    QueryExecutionMode execution_mode = QueryExecutionMode::Overlap;
 
     bool enable_address_decode_simd = true;
     bool enable_rerank_batched_distance_simd = true;
@@ -126,6 +251,16 @@ struct SearchConfig {
     // codes still use the source index, but raw-vector reads and payload reads
     // are redirected through a separated row-id address map.
     SeparateRecordStoreConfig separate_record_store;
+    InlineHotRecordStoreConfig inline_hot_record_store;
+
+    // Optional benchmark-only trace sink. Disabled in timed runs unless the
+    // caller explicitly supplies a vector.
+    std::vector<VectorReadTraceEntry>* vector_read_trace = nullptr;
+    // Optional benchmark-only first-decision SafeIn trace. Each query/candidate
+    // is recorded once at the first point where a speculative read could be
+    // issued; selected_topk is filled after exact reranking finalizes.
+    std::vector<SafeInConfidenceTraceEntry>* safein_confidence_trace = nullptr;
+    std::vector<BextraWindowTraceEntry>* bextra_window_trace = nullptr;
 
     // Optional benchmark-only truth metadata for per-stage false classification
     // counters. cluster_members maps cluster-local vector offsets to original
@@ -153,9 +288,28 @@ struct SearchStats {
     uint32_t all_read_requests = 0;
     uint32_t payload_read_requests = 0;
     uint32_t separate_store_lookup_misses = 0;
+    uint32_t inline_descriptor_read_requests = 0;
+    uint32_t inline_descriptor_errors = 0;
+    uint32_t inline_cold_payload_deferred = 0;
+    uint32_t inline_payload_cache_hits = 0;
     uint64_t vec_only_read_bytes = 0;
+    uint32_t vec_span_read_requests = 0;
+    uint32_t vec_span_candidates = 0;
+    uint64_t vec_span_read_bytes = 0;
     uint64_t all_read_bytes = 0;
     uint64_t payload_read_bytes = 0;
+    uint32_t safein_prefix_read_requests = 0;
+    uint32_t safein_full_read_requests = 0;
+    uint32_t safein_suffix_read_requests = 0;
+    uint64_t safein_prefix_read_bytes = 0;
+    uint64_t safein_full_read_bytes = 0;
+    uint64_t safein_suffix_read_bytes = 0;
+    uint32_t serial_vector_read_requests = 0;
+    uint32_t serial_full_record_read_requests = 0;
+    uint32_t serial_payload_read_requests = 0;
+    uint64_t serial_vector_read_bytes = 0;
+    uint64_t serial_full_record_read_bytes = 0;
+    uint64_t serial_payload_read_bytes = 0;
     uint32_t fixed_vec_buffer_hits = 0;
     uint32_t fixed_vec_buffer_misses = 0;
     uint32_t total_candidate_batches = 0;
@@ -184,6 +338,15 @@ struct SearchStats {
     uint32_t safein_prefetch_skipped_count_limit = 0;
     uint32_t safein_prefetch_skipped_byte_limit = 0;
     uint64_t safein_prefetch_scheduled_bytes = 0;
+    uint32_t bextra_windows = 0;
+    uint32_t bextra_eligible_candidates = 0;
+    uint32_t bextra_scheduled_candidates = 0;
+    uint64_t bextra_predicted_service_bytes = 0;
+    uint64_t bextra_predicted_extra_bytes = 0;
+    uint64_t bextra_eligible_extra_bytes = 0;
+    uint64_t bextra_scheduled_extra_bytes = 0;
+    uint64_t bextra_completed_before_final_drain_bytes = 0;
+    uint64_t bextra_spilled_to_final_drain_bytes = 0;
     uint32_t total_stage2_block_lookups = 0;
     uint32_t total_stage2_block_reuses = 0;
     uint32_t duplicate_candidates = 0;
@@ -285,6 +448,9 @@ struct SearchStats {
 	    double assemble_results_ms = 0;         // Materialize SearchResults rows
 	    double search_unaccounted_ms = 0;       // Search total minus coarse/probe/tail fields
 	    double remaining_payload_fetch_ms = 0;  // Final missing payload fetch
+	    double serial_vector_read_ms = 0;       // Serial VEC_ONLY raw-vector reads
+	    double serial_full_record_read_ms = 0;  // Serial VEC_ALL full-record reads
+	    double serial_payload_read_ms = 0;      // Serial final or separate payload reads
     double safeout_frontier_buffer_ms = 0;  // Time spent buffering dynamic SafeOut estimates
     double safeout_frontier_merge_ms = 0;   // Time spent updating kth upper-bound frontier
 };

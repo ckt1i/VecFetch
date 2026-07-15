@@ -387,7 +387,7 @@ struct AddressEntry {
 /// I/O task type for query pipeline read classification
 enum class ReadTaskType : uint8_t {
   VEC_ONLY = 0,    // Read only vector part (dim * sizeof(float) bytes)
-  ALL = 1,         // Read entire record (vec + payload, for SafeIn ≤256KB)
+  ALL = 1,         // Read SafeIn record prefix/full record (vec + payload prefix)
   PAYLOAD = 2,     // Read only payload part (from offset + dim*4)
 };
 

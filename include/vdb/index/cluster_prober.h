@@ -34,6 +34,7 @@ struct CandidateBatch {
     float est_error[kMaxCandidates] = {};
     float estimate_lower_bound[kMaxCandidates] = {};
     float safein_upper_bound[kMaxCandidates] = {};
+    uint8_t classification_stage[kMaxCandidates] = {};  // 1=Stage1, 2=Stage2
     CandidateClass cls[kMaxCandidates] = {};
     AddressEntry decoded_addr[kMaxCandidates] = {};
 };

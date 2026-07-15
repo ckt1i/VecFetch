@@ -25,6 +25,21 @@ add_executable(bench_materialize_no_combine_store bench_materialize_no_combine_s
 target_link_libraries(bench_materialize_no_combine_store PRIVATE vdb_index vdb_io)
 vdb_enable_target_avx512(bench_materialize_no_combine_store)
 
+# ----- Hot/Cold Record Store Materializer -----
+add_executable(bench_materialize_hotcold_store bench_materialize_no_combine_store.cpp)
+target_link_libraries(bench_materialize_hotcold_store PRIVATE vdb_index vdb_io)
+vdb_enable_target_avx512(bench_materialize_hotcold_store)
+
+# ----- Inline Hot Record Store Materializer -----
+add_executable(bench_materialize_inline_hot_record_store bench_materialize_inline_hot_record_store.cpp)
+target_link_libraries(bench_materialize_inline_hot_record_store PRIVATE vdb_index vdb_io vdb_storage)
+vdb_enable_target_avx512(bench_materialize_inline_hot_record_store)
+
+# ----- Inline Hot Record Store Verifier -----
+add_executable(bench_verify_inline_hot_record_store bench_verify_inline_hot_record_store.cpp)
+target_link_libraries(bench_verify_inline_hot_record_store PRIVATE vdb_index vdb_io vdb_storage)
+vdb_enable_target_avx512(bench_verify_inline_hot_record_store)
+
 # ----- Offline SafeIn d_k samples generator -----
 add_executable(bench_safein_dk_samples bench_safein_dk_samples.cpp rabitq_bench_calibration.cpp)
 target_link_libraries(bench_safein_dk_samples PRIVATE vdb_index vdb_io)
@@ -78,6 +93,11 @@ vdb_enable_target_avx512(bench_rabitq_diagnostic)
 # ----- SafeIn Replay Benchmark -----
 add_executable(bench_safein_replay bench_safein_replay.cpp)
 vdb_enable_target_avx512(bench_safein_replay)
+
+# ----- Sparse-vs-dense raw-vector I/O replay -----
+add_executable(bench_layout_io_replay bench_layout_io_replay.cpp)
+target_link_libraries(bench_layout_io_replay PRIVATE vdb_query)
+vdb_enable_target_avx512(bench_layout_io_replay)
 
 # ----- d_k Distance Distribution Analysis Benchmark -----
 add_executable(bench_dk_distance_analysis bench_dk_distance_analysis.cpp)

@@ -10,20 +10,32 @@
 
 #include "vdb/common/distance.h"
 #include "vdb/simd/rerank_distance.h"
+#include "vdb/storage/hot_record.h"
 
 namespace vdb {
 namespace query {
 
-RerankConsumer::RerankConsumer(SearchContext& ctx, Dim raw_dim)
+RerankConsumer::RerankConsumer(
+    SearchContext& ctx, Dim raw_dim,
+    const std::unordered_map<uint64_t, uint64_t>* candidate_order)
     : ctx_(ctx),
       dim_(raw_dim),
       vec_bytes_(raw_dim * sizeof(float)),
-      aligned_vec_bytes_((vec_bytes_ + 4095u) & ~4095u) {
+      aligned_vec_bytes_((vec_bytes_ + 4095u) & ~4095u),
+      candidate_order_(candidate_order) {
     buffered_candidates_.reserve(1024);
     GrowVectorChunk(aligned_vec_bytes_ * 1024u);
 }
 
-RerankConsumer::~RerankConsumer() = default;
+uint64_t RerankConsumer::CandidateOrder(AddressEntry addr) const {
+    if (candidate_order_ == nullptr) return addr.offset;
+    const auto found = candidate_order_->find(addr.offset);
+    return found == candidate_order_->end() ? addr.offset : found->second;
+}
+
+RerankConsumer::~RerankConsumer() {
+    ClearPayloadCache();
+}
 
 bool RerankConsumer::GrowVectorChunk(uint32_t min_capacity) {
     const uint32_t chunk_capacity = std::max(aligned_vec_bytes_ * 1024u, min_capacity);
@@ -77,35 +89,95 @@ void RerankConsumer::ResetVectorChunks() {
 
 void RerankConsumer::ConsumeVec(uint8_t* buf, AddressEntry addr) {
     buffered_candidates_.push_back(
-        BufferedCandidate{addr, AllocateVectorCopy(buf)});
+        BufferedCandidate{addr, AllocateVectorCopy(buf), CandidateOrder(addr)});
     ctx_.stats().buffered_candidates++;
 }
 
 void RerankConsumer::ConsumeOwnedVec(AlignedBufPtr buf, AddressEntry addr) {
     const float* vec = reinterpret_cast<const float*>(buf.get());
     owned_vector_buffers_.push_back(std::move(buf));
-    buffered_candidates_.push_back(BufferedCandidate{addr, vec});
+    buffered_candidates_.push_back(
+        BufferedCandidate{addr, vec, CandidateOrder(addr)});
     ctx_.stats().buffered_candidates++;
 }
 
-void RerankConsumer::ConsumeAll(uint8_t* buf, AddressEntry addr) {
+void RerankConsumer::ConsumeAll(uint8_t* buf, AddressEntry addr,
+                                uint32_t record_bytes_read) {
     buffered_candidates_.push_back(
-        BufferedCandidate{addr, AllocateVectorCopy(buf)});
+        BufferedCandidate{addr, AllocateVectorCopy(buf), CandidateOrder(addr)});
     ctx_.stats().buffered_candidates++;
 
-    if (addr.size > vec_bytes_) {
-        // Copy payload portion to cache (aligned for consistency)
-        uint32_t payload_len = addr.size - vec_bytes_;
-        uint32_t alloc_len = (payload_len + 4095u) & ~4095u;
-        uint8_t* pbuf = static_cast<uint8_t*>(std::aligned_alloc(4096, alloc_len));
-        std::memcpy(pbuf, buf + vec_bytes_, payload_len);
-        payload_cache_[addr.offset] = AlignedBufPtr(pbuf);
+    if (ctx_.config().inline_hot_record_store.enabled) {
+        const uint32_t desc_bytes =
+            ctx_.config().inline_hot_record_store.descriptor_bytes;
+        if (desc_bytes != sizeof(storage::HotPayloadDescriptor) ||
+            record_bytes_read < vec_bytes_ + desc_bytes) {
+            ctx_.stats().inline_descriptor_errors++;
+            return;
+        }
+        const auto desc = storage::DecodeHotPayloadDescriptor(buf + vec_bytes_);
+        Status s = storage::ValidateHotPayloadDescriptor(desc);
+        if (!s.ok()) {
+            ctx_.stats().inline_descriptor_errors++;
+            return;
+        }
+        if (desc.payload_storage_type ==
+            static_cast<uint8_t>(storage::HotPayloadStorageType::kColdPointer)) {
+            ctx_.stats().inline_cold_payload_deferred++;
+            return;
+        }
+        if (desc.inline_bytes == 0) {
+            return;
+        }
+        const uint32_t payload_offset = vec_bytes_ + desc_bytes;
+        if (record_bytes_read < payload_offset + desc.inline_bytes) {
+            ctx_.stats().inline_descriptor_errors++;
+            return;
+        }
+        const uint32_t alloc_len = (desc.inline_bytes + 4095u) & ~4095u;
+        uint8_t* pbuf =
+            static_cast<uint8_t*>(std::aligned_alloc(4096, alloc_len));
+        if (pbuf == nullptr) {
+            std::fprintf(stderr,
+                         "FATAL: aligned_alloc failed for inline payload (%u bytes)\n",
+                         alloc_len);
+            std::abort();
+        }
+        std::memcpy(pbuf, buf + payload_offset, desc.inline_bytes);
+        StorePayload(addr.offset, pbuf, desc.inline_bytes, nullptr);
+        ctx_.stats().total_safein_payload_prefetched++;
+        return;
+    }
+
+    const uint32_t covered = std::min(record_bytes_read, addr.size);
+    if (covered > vec_bytes_) {
+        const uint32_t payload_prefix_len = covered - vec_bytes_;
+        const uint32_t alloc_len = (payload_prefix_len + 4095u) & ~4095u;
+        uint8_t* pbuf =
+            static_cast<uint8_t*>(std::aligned_alloc(4096, alloc_len));
+        if (pbuf == nullptr) {
+            std::fprintf(stderr,
+                         "FATAL: aligned_alloc failed for payload prefix (%u bytes)\n",
+                         alloc_len);
+            std::abort();
+        }
+        std::memcpy(pbuf, buf + vec_bytes_, payload_prefix_len);
+        StorePayload(addr.offset, pbuf, payload_prefix_len, nullptr);
         ctx_.stats().total_safein_payload_prefetched++;
     }
 }
 
-void RerankConsumer::ConsumePayload(uint8_t* buf, AddressEntry addr) {
-    payload_cache_[addr.offset] = AlignedBufPtr(buf);
+void RerankConsumer::ConsumePayloadPrefix(uint8_t* buf, AddressEntry addr,
+                                          uint32_t prefix_len,
+                                          BufferPool* pool_owner) {
+    StorePayload(addr.offset, buf, prefix_len, pool_owner);
+    ctx_.stats().total_safein_payload_prefetched++;
+}
+
+void RerankConsumer::ConsumePayload(uint8_t* buf, AddressEntry addr,
+                                    uint32_t payload_len,
+                                    BufferPool* pool_owner) {
+    StorePayload(addr.offset, buf, payload_len, pool_owner);
     ctx_.stats().total_payload_prefetched++;
 }
 
@@ -113,16 +185,83 @@ bool RerankConsumer::HasPayload(uint64_t offset) const {
     return payload_cache_.count(offset) > 0;
 }
 
+uint32_t RerankConsumer::CachedPayloadBytes(uint64_t offset) const {
+    auto it = payload_cache_.find(offset);
+    if (it == payload_cache_.end()) return 0;
+    return it->second.bytes;
+}
+
+const uint8_t* RerankConsumer::CachedPayloadData(uint64_t offset) const {
+    auto it = payload_cache_.find(offset);
+    if (it == payload_cache_.end()) return nullptr;
+    return it->second.storage;
+}
+
 AlignedBufPtr RerankConsumer::TakePayload(uint64_t offset) {
     auto it = payload_cache_.find(offset);
     if (it == payload_cache_.end()) return nullptr;
-    auto buf = std::move(it->second);
+    PayloadCacheEntry entry = it->second;
     payload_cache_.erase(it);
-    return buf;
+    if (entry.pool_owner == nullptr) {
+        return AlignedBufPtr(entry.storage);
+    }
+
+    const uint32_t alloc_len = (std::max(entry.bytes, 1u) + 4095u) & ~4095u;
+    uint8_t* copy = static_cast<uint8_t*>(std::aligned_alloc(4096, alloc_len));
+    if (copy == nullptr) {
+        std::fprintf(stderr,
+                     "FATAL: aligned_alloc failed while detaching pooled payload "
+                     "(%u bytes)\n",
+                     alloc_len);
+        std::abort();
+    }
+    if (entry.bytes > 0) {
+        std::memcpy(copy, entry.storage, entry.bytes);
+    }
+    entry.pool_owner->Release(entry.storage);
+    return AlignedBufPtr(copy);
+}
+
+void RerankConsumer::ReleasePayload(uint64_t offset) {
+    auto it = payload_cache_.find(offset);
+    if (it == payload_cache_.end()) return;
+    ReleasePayloadEntry(&it->second);
+    payload_cache_.erase(it);
 }
 
 void RerankConsumer::CachePayload(uint64_t offset, AlignedBufPtr buf) {
-    payload_cache_[offset] = std::move(buf);
+    StorePayload(offset, buf.release(), 0, nullptr);
+}
+
+void RerankConsumer::StorePayload(uint64_t offset, uint8_t* storage,
+                                  uint32_t bytes, BufferPool* pool_owner) {
+    auto found = payload_cache_.find(offset);
+    if (found != payload_cache_.end()) {
+        ReleasePayloadEntry(&found->second);
+        found->second = PayloadCacheEntry{storage, bytes, pool_owner};
+        return;
+    }
+    payload_cache_.emplace(
+        offset, PayloadCacheEntry{storage, bytes, pool_owner});
+}
+
+void RerankConsumer::ReleasePayloadEntry(PayloadCacheEntry* entry) {
+    if (entry == nullptr || entry->storage == nullptr) return;
+    if (entry->pool_owner != nullptr) {
+        entry->pool_owner->Release(entry->storage);
+    } else {
+        std::free(entry->storage);
+    }
+    entry->storage = nullptr;
+    entry->bytes = 0;
+    entry->pool_owner = nullptr;
+}
+
+void RerankConsumer::ClearPayloadCache() {
+    for (auto& item : payload_cache_) {
+        ReleasePayloadEntry(&item.second);
+    }
+    payload_cache_.clear();
 }
 
 void RerankConsumer::CleanupUnusedCache(
@@ -133,6 +272,7 @@ void RerankConsumer::CleanupUnusedCache(
     }
     for (auto it = payload_cache_.begin(); it != payload_cache_.end();) {
         if (needed.count(it->first) == 0) {
+            ReleasePayloadEntry(&it->second);
             it = payload_cache_.erase(it);
         } else {
             ++it;
@@ -144,6 +284,9 @@ void RerankConsumer::ExecuteBuffered() {
     auto collect_start = std::chrono::steady_clock::now();
     std::sort(buffered_candidates_.begin(), buffered_candidates_.end(),
               [](const BufferedCandidate& a, const BufferedCandidate& b) {
+                  if (a.candidate_order != b.candidate_order) {
+                      return a.candidate_order < b.candidate_order;
+                  }
                   return a.addr.offset < b.addr.offset;
               });
     ctx_.stats().candidate_collect_ms += std::chrono::duration<double, std::milli>(

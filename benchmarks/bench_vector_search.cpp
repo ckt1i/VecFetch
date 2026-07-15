@@ -188,8 +188,10 @@ int main(int argc, char* argv[]) {
         GetIntArg(argc, argv, "--dynamic-safein-defer-until-ready", 0) != 0;
     uint32_t dynamic_safein_defer_max_candidates = static_cast<uint32_t>(
         GetIntArg(argc, argv, "--dynamic-safein-defer-max-candidates", 0));
-    int safein_all_threshold_bytes =
-        GetIntArg(argc, argv, "--safein-all-threshold-bytes", 256 * 1024);
+    int safein_threshold_bytes =
+        GetIntArg(argc, argv, "--safein-threshold-bytes",
+                  GetIntArg(argc, argv, "--safein-all-threshold-bytes",
+                            256 * 1024));
     bool skip_false_stats =
         GetIntArg(argc, argv, "--skip-false-stats", 0) != 0;
     uint64_t seed    = static_cast<uint64_t>(GetIntArg(argc, argv, "--seed", 42));
@@ -258,17 +260,17 @@ int main(int argc, char* argv[]) {
             "[--safein-dk-samples-input path] "
             "[--safein-dk-samples-output path] "
             "[--dynamic-safein static|off|frontier] "
-            "[--safein-all-threshold-bytes N] "
+            "[--safein-threshold-bytes N] "
             "[--per-query-stats-output path] "
             "[--enable-stage1-safein 0|1] "
             "[--index-dir <path>] [--tmp-dir <path>] [--keep-index]\n");
         return 1;
     }
-    if (safein_all_threshold_bytes < 0) {
+    if (safein_threshold_bytes < 0) {
         std::fprintf(stderr,
-                     "Invalid --safein-all-threshold-bytes: %d "
+                     "Invalid --safein-threshold-bytes: %d "
                      "(expected >= 0)\n",
-                     safein_all_threshold_bytes);
+                     safein_threshold_bytes);
         return 1;
     }
 
@@ -796,8 +798,8 @@ int main(int argc, char* argv[]) {
         dynamic_safein_defer_until_ready;
     search_cfg.dynamic_safein_defer_max_candidates =
         dynamic_safein_defer_max_candidates;
-    search_cfg.safein_all_threshold =
-        static_cast<uint32_t>(safein_all_threshold_bytes);
+    search_cfg.safein_threshold_bytes =
+        static_cast<uint32_t>(safein_threshold_bytes);
     search_cfg.io_queue_depth = 64;
     search_cfg.enable_stage1_safein = enable_stage1_safein;
     if (safein_epsilon_percentile >= 0.0f) {
@@ -1199,8 +1201,8 @@ int main(int argc, char* argv[]) {
            << (search_cfg.dynamic_safein_defer_until_ready ? "true" : "false") << ",\n";
         jf << "  \"dynamic_safein_defer_max_candidates\": "
            << search_cfg.dynamic_safein_defer_max_candidates << ",\n";
-        jf << "  \"safein_all_threshold_bytes\": "
-           << search_cfg.safein_all_threshold << ",\n";
+        jf << "  \"safein_threshold_bytes\": "
+           << search_cfg.safein_threshold_bytes << ",\n";
         jf << "  \"safein_dk_percentile\": " << safein_dk_percentile << ",\n";
         jf << "  \"safein_dk_space\": \""
            << SafeInDkSpaceName(requested_safein_dk_space) << "\",\n";
