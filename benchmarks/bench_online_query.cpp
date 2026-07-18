@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cctype>
@@ -48,6 +50,7 @@ using vdb::query::QueryExecutionMode;
 using vdb::query::SeparateRecordMap;
 using vdb::query::SeparateRecordLocation;
 using vdb::query::SearchConfig;
+using vdb::query::SpanPlannerMode;
 using vdb::query::SearchResults;
 using vdb::query::SafeInPrefetchOrder;
 using vdb::query::SubmissionMode;
@@ -79,12 +82,49 @@ static bool HasFlag(int argc, char** argv, const char* flag) {
     return false;
 }
 
+static bool RejectDeletedBudgetedPrefetchFlags(int argc, char** argv) {
+    static constexpr const char* kDeletedFlags[] = {
+        "--safein-optional-io-early-submit-max-requests",
+        "--non-safeout-candidate-budget",
+        "--budgeted-prefetch-limit",
+    };
+    for (const char* flag : kDeletedFlags) {
+        if (HasFlag(argc, argv, flag)) {
+            std::fprintf(stderr,
+                         "Unsupported removed scheduling option %s; remove "
+                         "it from the command line.\n",
+                         flag);
+            return true;
+        }
+    }
+    return false;
+}
+
 static std::string GetStringArg(int argc, char** argv, const char* key,
                                 const std::string& def = "") {
-    for (int i = 1; i + 1 < argc; ++i) {
-        if (std::strcmp(argv[i], key) == 0) return argv[i + 1];
+    const size_t key_len = std::strlen(key);
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], key) == 0) {
+            return i + 1 < argc ? argv[i + 1] : "";
+        }
+        if (std::strncmp(argv[i], key, key_len) == 0 &&
+            argv[i][key_len] == '=') {
+            return argv[i] + key_len + 1;
+        }
     }
     return def;
+}
+
+static bool HasArgKey(int argc, char** argv, const char* key) {
+    const size_t key_len = std::strlen(key);
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], key) == 0 ||
+            (std::strncmp(argv[i], key, key_len) == 0 &&
+             argv[i][key_len] == '=')) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static int GetIntArg(int argc, char** argv, const char* key, int def = 0) {
@@ -105,6 +145,90 @@ static double GetDoubleArg(int argc, char** argv, const char* key,
     std::string v = GetStringArg(argc, argv, key, "");
     if (v.empty()) return def;
     return std::atof(v.c_str());
+}
+
+
+static bool ParseUint32Strict(const std::string& value, uint32_t* out) {
+    if (value.empty() || out == nullptr) return false;
+    uint64_t parsed = 0;
+    for (char ch : value) {
+        if (ch < '0' || ch > '9') return false;
+        const uint64_t digit = static_cast<uint64_t>(ch - '0');
+        if (parsed > (UINT32_MAX - digit) / 10) return false;
+        parsed = parsed * 10 + digit;
+    }
+    *out = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+static bool ParseExactFraction(const std::string& value, uint32_t* num,
+                               uint32_t* den) {
+    const size_t slash = value.find('/');
+    if (slash == std::string::npos || slash == 0 ||
+        slash == value.size() - 1 ||
+        value.find('/', slash + 1) != std::string::npos) {
+        return false;
+    }
+    uint32_t n = 0;
+    uint32_t d = 0;
+    if (!ParseUint32Strict(value.substr(0, slash), &n) ||
+        !ParseUint32Strict(value.substr(slash + 1), &d) || d == 0) {
+        return false;
+    }
+    const uint32_t divisor = std::gcd(n, d);
+    *num = n / divisor;
+    *den = d / divisor;
+    return true;
+}
+
+static bool ParseExactDecimal(const std::string& value, uint32_t* num,
+                              uint32_t* den) {
+    if (value.empty() || num == nullptr || den == nullptr) return false;
+    const size_t dot = value.find('.');
+    if (dot == 0 || dot == value.size() - 1 ||
+        (dot != std::string::npos &&
+         value.find('.', dot + 1) != std::string::npos)) {
+        return false;
+    }
+    uint64_t n = 0;
+    uint64_t d = 1;
+    for (size_t i = 0; i < value.size(); ++i) {
+        const char ch = value[i];
+        if (ch == '.') continue;
+        if (ch < '0' || ch > '9') return false;
+        const uint64_t digit = static_cast<uint64_t>(ch - '0');
+        if (n > (UINT32_MAX - digit) / 10) return false;
+        n = n * 10 + digit;
+        if (dot != std::string::npos && i > dot) {
+            if (d > UINT32_MAX / 10) return false;
+            d *= 10;
+        }
+    }
+    const uint32_t divisor = std::gcd(static_cast<uint32_t>(n),
+                                      static_cast<uint32_t>(d));
+    *num = static_cast<uint32_t>(n) / divisor;
+    *den = static_cast<uint32_t>(d) / divisor;
+    return true;
+}
+
+static bool ParseSpanPlannerModeArg(const std::string& value,
+                                    SpanPlannerMode* out) {
+    if (value == "GV" || value == "gv") *out = SpanPlannerMode::GV;
+    else if (value == "SV" || value == "sv") *out = SpanPlannerMode::SV;
+    else if (value == "GE" || value == "ge") *out = SpanPlannerMode::GE;
+    else if (value == "SE" || value == "se") *out = SpanPlannerMode::SE;
+    else return false;
+    return true;
+}
+
+static const char* SpanPlannerModeName(SpanPlannerMode mode) {
+    switch (mode) {
+        case SpanPlannerMode::GV: return "GV";
+        case SpanPlannerMode::SV: return "SV";
+        case SpanPlannerMode::GE: return "GE";
+        case SpanPlannerMode::SE: return "SE";
+    }
+    return "unknown";
 }
 
 static std::string JsonEscape(const std::string& s) {
@@ -166,6 +290,114 @@ static uint64_t ReadJsonUint64Field(const std::string& path,
     const uint64_t value =
         std::strtoull(content.c_str() + pos, &end, 10);
     return end == content.c_str() + pos ? fallback : value;
+}
+
+struct PcveRuntimeProfile {
+    uint64_t schema_version = 0;
+    std::string dataset_dir;
+    std::string index_dir;
+    std::string estimator_mode;
+    std::string code_layout;
+    std::string method;
+    uint64_t stored_bits = 0;
+    uint64_t active_bits = 0;
+    uint64_t resident_bits = 0;
+    uint64_t nprobe = 0;
+    uint64_t topk = 0;
+    double stage1_epsilon_lower = 0.0;
+    double stage1_epsilon_upper = 0.0;
+    double stage2_epsilon_lower = 0.0;
+    double stage2_epsilon_upper = 0.0;
+};
+
+static bool ReadJsonScalar(const std::string& content, const std::string& key,
+                           std::string* value, bool quoted) {
+    const std::string needle = "\"" + key + "\"";
+    const size_t key_pos = content.find(needle);
+    if (key_pos == std::string::npos) return false;
+    const size_t colon = content.find(':', key_pos + needle.size());
+    if (colon == std::string::npos) return false;
+    size_t begin = colon + 1;
+    while (begin < content.size() &&
+           std::isspace(static_cast<unsigned char>(content[begin]))) ++begin;
+    if (quoted) {
+        if (begin >= content.size() || content[begin] != '"') return false;
+        const size_t end = content.find('"', begin + 1);
+        if (end == std::string::npos) return false;
+        *value = content.substr(begin + 1, end - begin - 1);
+        return true;
+    }
+    size_t end = begin;
+    while (end < content.size() && content[end] != ',' && content[end] != '}' &&
+           !std::isspace(static_cast<unsigned char>(content[end]))) ++end;
+    if (end == begin) return false;
+    *value = content.substr(begin, end - begin);
+    return true;
+}
+
+static bool LoadPcveRuntimeProfile(const std::string& path,
+                                   PcveRuntimeProfile* profile,
+                                   std::string* error) {
+    std::ifstream f(path);
+    if (!f.is_open()) { *error = "cannot open profile"; return false; }
+    const std::string c((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+    auto str = [&](const char* key, std::string* out) {
+        if (!ReadJsonScalar(c, key, out, true)) {
+            *error = std::string("missing string field: ") + key;
+            return false;
+        }
+        return true;
+    };
+    auto u64 = [&](const char* key, uint64_t* out) {
+        std::string raw;
+        if (!ReadJsonScalar(c, key, &raw, false)) {
+            *error = std::string("missing integer field: ") + key;
+            return false;
+        }
+        char* end = nullptr;
+        *out = std::strtoull(raw.c_str(), &end, 10);
+        if (end == raw.c_str() || *end != 0) {
+            *error = std::string("invalid integer field: ") + key;
+            return false;
+        }
+        return true;
+    };
+    auto dbl = [&](const char* key, double* out) {
+        std::string raw;
+        if (!ReadJsonScalar(c, key, &raw, false)) {
+            *error = std::string("missing numeric field: ") + key;
+            return false;
+        }
+        char* end = nullptr;
+        *out = std::strtod(raw.c_str(), &end);
+        if (end == raw.c_str() || *end != 0 || !std::isfinite(*out) || *out < 0.0) {
+            *error = std::string("invalid non-negative field: ") + key;
+            return false;
+        }
+        return true;
+    };
+    if (!u64("schema_version", &profile->schema_version) ||
+        !str("dataset_dir", &profile->dataset_dir) ||
+        !str("index_dir", &profile->index_dir) ||
+        !str("estimator_mode", &profile->estimator_mode) ||
+        !str("code_layout", &profile->code_layout) ||
+        !str("method", &profile->method) ||
+        !u64("stored_bits", &profile->stored_bits) ||
+        !u64("active_bits", &profile->active_bits) ||
+        !u64("resident_bits", &profile->resident_bits) ||
+        !u64("nprobe", &profile->nprobe) ||
+        !u64("topk", &profile->topk) ||
+        !dbl("stage1_epsilon_lower", &profile->stage1_epsilon_lower) ||
+        !dbl("stage1_epsilon_upper", &profile->stage1_epsilon_upper) ||
+        !dbl("stage2_epsilon_lower", &profile->stage2_epsilon_lower) ||
+        !dbl("stage2_epsilon_upper", &profile->stage2_epsilon_upper)) return false;
+    if (profile->schema_version != 2 ||
+        (profile->method != "pcve" && profile->method != "a_pcve")) {
+        *error = "unsupported schema_version or method";
+        return false;
+    }
+    return true;
 }
 
 static const char* QueryExecutionModeName(QueryExecutionMode mode) {
@@ -818,6 +1050,27 @@ static double Percentile(std::vector<double> values, double p) {
     return values[lo] * (1.0 - frac) + values[hi] * frac;
 }
 
+static double OptionalLatencyHistogramQuantileUs(
+    const std::array<uint64_t,
+                     vdb::query::kSafeInOptionalLatencyBucketCount>& histogram,
+    double p) {
+    static constexpr std::array<double,
+        vdb::query::kSafeInOptionalLatencyBucketCount> kUpperUs = {
+            10.0, 20.0, 50.0, 100.0, 200.0, 500.0,
+            1000.0, 2000.0, 5000.0, 10000.0, 50000.0, -1.0};
+    const uint64_t total = std::accumulate(
+        histogram.begin(), histogram.end(), uint64_t{0});
+    if (total == 0) return 0.0;
+    const uint64_t target = std::max<uint64_t>(
+        1, static_cast<uint64_t>(std::ceil(p * static_cast<double>(total))));
+    uint64_t cumulative = 0;
+    for (size_t i = 0; i < histogram.size(); ++i) {
+        cumulative += histogram[i];
+        if (cumulative >= target) return kUpperUs[i];
+    }
+    return -1.0;
+}
+
 static double ComputeRecallAtK(const std::vector<int64_t>& predicted,
                                const std::vector<int64_t>& gt,
                                uint32_t k) {
@@ -863,6 +1116,30 @@ struct QueryMetrics {
     uint64_t vec_span_read_requests = 0;
     uint64_t vec_span_candidates = 0;
     uint64_t vec_span_read_bytes = 0;
+    uint64_t vec_span_payload_views = 0;
+    uint64_t vec_span_payload_view_bytes = 0;
+    uint64_t vec_span_payload_retained_bytes = 0;
+    uint64_t vec_span_payload_reuse_hits = 0;
+    uint64_t vec_span_payload_reuse_bytes = 0;
+    uint64_t vec_span_payload_requests_avoided = 0;
+    uint64_t vec_span_safein_tails_extended = 0;
+    uint64_t vec_span_safein_tail_extra_bytes = 0;
+    uint64_t vec_span_planner_calls = 0;
+    uint64_t vec_span_planner_runs = 0;
+    uint64_t vec_span_planner_candidates = 0;
+    uint64_t vec_span_planner_groups = 0;
+    uint64_t vec_span_planner_max_run = 0;
+    uint64_t vec_span_planned_physical_bytes = 0;
+    uint64_t vec_span_planned_vector_bytes = 0;
+    uint64_t vec_span_planner_credit_bytes = 0;
+    uint64_t vec_span_planner_admission_checks = 0;
+    uint64_t vec_span_planner_fenwick_queries = 0;
+    uint64_t vec_span_planner_fenwick_updates = 0;
+    uint64_t vec_span_planner_workspace_growths = 0;
+    uint64_t vec_span_planner_plan_hash = 0;
+    uint64_t vec_span_planner_fallbacks = 0;
+    double vec_span_planner_ms = 0.0;
+    double vec_span_sort_ms = 0.0;
     uint64_t all_read_bytes = 0;
     uint64_t payload_read_bytes = 0;
     uint64_t safein_prefix_read_requests = 0;
@@ -877,16 +1154,6 @@ struct QueryMetrics {
     uint64_t serial_vector_read_bytes = 0;
     uint64_t serial_full_record_read_bytes = 0;
     uint64_t serial_payload_read_bytes = 0;
-    uint64_t budgeted_prefetch_considered = 0;
-    uint64_t budgeted_prefetch_scheduled = 0;
-    uint64_t budgeted_prefetch_duplicates = 0;
-    uint64_t budgeted_prefetch_skipped_limit = 0;
-    uint64_t budgeted_prefetch_completed = 0;
-    uint64_t budgeted_prefetch_cache_hits = 0;
-    uint64_t budgeted_prefetch_inflight_uses = 0;
-    uint64_t budgeted_prefetch_used = 0;
-    uint64_t budgeted_prefetch_wasted = 0;
-    uint64_t budgeted_prefetch_read_bytes = 0;
     uint64_t safein_prefetch_considered = 0;
     uint64_t safein_prefetch_candidates = 0;
     uint64_t safein_prefetch_true_topk = 0;
@@ -895,6 +1162,53 @@ struct QueryMetrics {
     uint64_t safein_prefetch_skipped_count_limit = 0;
     uint64_t safein_prefetch_skipped_byte_limit = 0;
     uint64_t safein_prefetch_scheduled_bytes = 0;
+    uint64_t safein_cold_prefetch_requests = 0;
+    uint64_t safein_cold_prefetch_full_payloads = 0;
+    uint64_t safein_cold_prefetch_bytes = 0;
+    uint64_t safein_cold_prefetch_used_bytes = 0;
+    uint64_t safein_cold_prefetch_wasted_bytes = 0;
+    uint64_t safein_optional_io_queued = 0;
+    uint64_t safein_optional_io_submitted = 0;
+    uint64_t safein_optional_io_completed = 0;
+    uint64_t safein_optional_io_dropped_late = 0;
+    uint64_t safein_optional_io_submitted_bytes = 0;
+    uint64_t safein_optional_io_completed_bytes = 0;
+    uint64_t safein_optional_io_submit_calls = 0;
+    uint64_t safein_optional_io_nonblocking_poll_calls = 0;
+    uint64_t safein_optional_io_empty_polls = 0;
+    uint64_t safein_optional_io_poll_completions = 0;
+    uint64_t safein_optional_io_get_events_calls = 0;
+    uint64_t safein_optional_io_completed_before_probe_end = 0;
+    uint64_t safein_optional_io_completed_bytes_before_probe_end = 0;
+    uint64_t safein_optional_io_completed_in_final_drain = 0;
+    uint64_t safein_optional_io_completed_bytes_in_final_drain = 0;
+    uint64_t safein_optional_io_completed_in_optional_drain = 0;
+    uint64_t safein_optional_io_completed_bytes_in_optional_drain = 0;
+    uint64_t safein_optional_io_timeline_queries = 0;
+    uint64_t safein_optional_io_timeline_submit_queries = 0;
+    uint64_t safein_optional_io_timeline_completion_queries = 0;
+    uint64_t safein_optional_io_first_submit_probes_remaining = 0;
+    uint64_t safein_optional_io_first_submit_clusters_processed = 0;
+    uint64_t safein_optional_io_inflight_at_probe_end = 0;
+    uint64_t safein_optional_io_prepped_at_probe_end = 0;
+    uint64_t safein_optional_io_pending_at_probe_end = 0;
+    uint64_t safein_optional_io_inflight_at_final_drain_start = 0;
+    uint64_t safein_optional_io_inflight_at_optional_drain_start = 0;
+    uint64_t safein_optional_io_blocked_mandatory_calls = 0;
+    uint64_t safein_optional_io_blocked_max_inflight_calls = 0;
+    uint64_t safein_optional_io_blocked_short_window_calls = 0;
+    double safein_optional_io_first_queue_offset_us = 0.0;
+    double safein_optional_io_first_submit_offset_us = 0.0;
+    double safein_optional_io_last_submit_offset_us = 0.0;
+    double safein_optional_io_queue_to_submit_us = 0.0;
+    double safein_optional_io_probe_end_offset_us = 0.0;
+    double safein_optional_io_first_submit_to_probe_end_us = 0.0;
+    double safein_optional_io_first_completion_offset_us = 0.0;
+    std::array<uint64_t,
+               vdb::query::kSafeInOptionalLatencyBucketCount>
+        safein_optional_io_submit_to_cqe_histogram{};
+    uint64_t safein_payload_buffer_reuses = 0;
+    uint64_t safein_payload_prefix_copy_bytes_avoided = 0;
     uint64_t bextra_windows = 0;
     uint64_t bextra_eligible_candidates = 0;
     uint64_t bextra_scheduled_candidates = 0;
@@ -911,9 +1225,6 @@ struct QueryMetrics {
     uint64_t dynamic_safein_deferred_candidates = 0;
     uint64_t dynamic_safein_deferred_flushes = 0;
     uint64_t dynamic_safein_deferred_safein = 0;
-    uint64_t candidate_budget_seen = 0;
-    uint64_t candidate_budget_selected = 0;
-    uint64_t candidate_budget_dropped = 0;
     uint64_t unique_fetch_candidates = 0;
     uint64_t total_io_submitted = 0;
     uint64_t total_submit_calls = 0;
@@ -932,7 +1243,39 @@ struct QueryMetrics {
     uint64_t stage2_decode_output_bytes = 0;
     uint64_t stage2_active_ex_bits_sum = 0;
     uint64_t stage2_stored_ex_bits_sum = 0;
+    uint64_t mandatory_io_prepared = 0;
+    uint64_t mandatory_io_prepared_bytes = 0;
+    uint64_t mandatory_io_explicit_submitted = 0;
+    uint64_t mandatory_io_submit_calls = 0;
+    uint64_t mandatory_io_nonblocking_poll_calls = 0;
+    uint64_t mandatory_io_wait_poll_calls = 0;
+    uint64_t mandatory_io_empty_polls = 0;
+    uint64_t mandatory_io_poll_completions = 0;
+    uint64_t mandatory_io_get_events_calls = 0;
+    uint64_t mandatory_io_completed = 0;
+    uint64_t mandatory_io_completed_bytes = 0;
+    uint64_t mandatory_io_completed_before_probe_end = 0;
+    uint64_t mandatory_io_completed_bytes_before_probe_end = 0;
+    uint64_t mandatory_io_completed_in_final_drain = 0;
+    uint64_t mandatory_io_completed_bytes_in_final_drain = 0;
+    uint64_t mandatory_io_inflight_at_probe_end = 0;
+    uint64_t mandatory_io_prepped_at_probe_end = 0;
+    uint64_t mandatory_io_pending_at_probe_end = 0;
+    uint64_t final_payload_io_prepared = 0;
+    uint64_t final_payload_io_prepared_bytes = 0;
+    uint64_t final_payload_io_explicit_submitted = 0;
+    uint64_t final_payload_io_submit_calls = 0;
+    uint64_t final_payload_io_wait_poll_calls = 0;
+    uint64_t final_payload_io_nonblocking_poll_calls = 0;
+    uint64_t final_payload_io_completions = 0;
     double probe_ms = 0.0;
+    double probe_loop_wall_ms = 0.0;
+    double probe_cluster_wall_ms = 0.0;
+    double probe_loop_scheduler_ms = 0.0;
+    double mandatory_io_first_submit_offset_us = 0.0;
+    double mandatory_io_last_submit_offset_us = 0.0;
+    double mandatory_io_first_completion_offset_us = 0.0;
+    double mandatory_io_probe_end_offset_us = 0.0;
     double coarse_select_ms = 0.0;
     double coarse_score_ms = 0.0;
     double coarse_topn_ms = 0.0;
@@ -948,8 +1291,37 @@ struct QueryMetrics {
     double stage2_ms = 0.0;
     double stage2_decode_ms = 0.0;
     double submit_ms = 0.0;
+    double submit_prepare_vec_only_ms = 0.0;
+    double submit_prepare_all_ms = 0.0;
+    double submit_emit_ms = 0.0;
+    double submit_vec_only_emit_ms = 0.0;
+    double submit_pending_slot_alloc_ms = 0.0;
+    double submit_prep_read_ms = 0.0;
     double rerank_compute_ms = 0.0;
     double fetch_missing_ms = 0.0;
+    double safein_optional_io_prepare_ms = 0.0;
+    double safein_optional_io_submit_ms = 0.0;
+    double safein_optional_io_completion_cpu_ms = 0.0;
+    double safein_optional_io_wait_ms = 0.0;
+    double safein_optional_io_nonblocking_poll_ms = 0.0;
+    double safein_optional_io_get_events_ms = 0.0;
+    double safein_optional_io_final_drain_poll_ms = 0.0;
+    double safein_optional_io_drain_ms = 0.0;
+    double mandatory_io_submit_ms = 0.0;
+    double mandatory_io_nonblocking_poll_ms = 0.0;
+    double mandatory_io_get_events_ms = 0.0;
+    double mandatory_io_wait_ms = 0.0;
+    double mandatory_io_completion_cpu_ms = 0.0;
+    double mandatory_io_final_drain_wait_ms = 0.0;
+    double mandatory_io_final_drain_poll_ms = 0.0;
+    double mandatory_io_final_drain_completion_cpu_ms = 0.0;
+    double final_payload_resolve_ms = 0.0;
+    double final_payload_plan_ms = 0.0;
+    double final_payload_sync_prefix_ms = 0.0;
+    double final_payload_submit_ms = 0.0;
+    double final_payload_wait_ms = 0.0;
+    double final_payload_nonblocking_poll_ms = 0.0;
+    double final_payload_completion_cpu_ms = 0.0;
     double io_wait_ms = 0.0;
     double final_drain_ms = 0.0;
     double execute_buffered_ms = 0.0;
@@ -980,6 +1352,39 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.vec_span_read_requests += st.vec_span_read_requests;
     m.vec_span_candidates += st.vec_span_candidates;
     m.vec_span_read_bytes += st.vec_span_read_bytes;
+    m.vec_span_payload_views += st.vec_span_payload_views;
+    m.vec_span_payload_view_bytes += st.vec_span_payload_view_bytes;
+    m.vec_span_payload_retained_bytes +=
+        st.vec_span_payload_retained_bytes;
+    m.vec_span_payload_reuse_hits += st.vec_span_payload_reuse_hits;
+    m.vec_span_payload_reuse_bytes += st.vec_span_payload_reuse_bytes;
+    m.vec_span_payload_requests_avoided +=
+        st.vec_span_payload_requests_avoided;
+    m.vec_span_safein_tails_extended +=
+        st.vec_span_safein_tails_extended;
+    m.vec_span_safein_tail_extra_bytes +=
+        st.vec_span_safein_tail_extra_bytes;
+    m.vec_span_planner_calls += st.vec_span_planner_calls;
+    m.vec_span_planner_runs += st.vec_span_planner_runs;
+    m.vec_span_planner_candidates += st.vec_span_planner_candidates;
+    m.vec_span_planner_groups += st.vec_span_planner_groups;
+    m.vec_span_planner_max_run = std::max(
+        m.vec_span_planner_max_run, st.vec_span_planner_max_run);
+    m.vec_span_planned_physical_bytes += st.vec_span_planned_physical_bytes;
+    m.vec_span_planned_vector_bytes += st.vec_span_planned_vector_bytes;
+    m.vec_span_planner_credit_bytes += st.vec_span_planner_credit_bytes;
+    m.vec_span_planner_admission_checks +=
+        st.vec_span_planner_admission_checks;
+    m.vec_span_planner_fenwick_queries +=
+        st.vec_span_planner_fenwick_queries;
+    m.vec_span_planner_fenwick_updates +=
+        st.vec_span_planner_fenwick_updates;
+    m.vec_span_planner_workspace_growths +=
+        st.vec_span_planner_workspace_growths;
+    m.vec_span_planner_plan_hash ^= st.vec_span_planner_plan_hash;
+    m.vec_span_planner_fallbacks += st.vec_span_planner_fallbacks;
+    m.vec_span_planner_ms += st.vec_span_planner_ms;
+    m.vec_span_sort_ms += st.vec_span_sort_ms;
     m.all_read_bytes += st.all_read_bytes;
     m.payload_read_bytes += st.payload_read_bytes;
     m.safein_prefix_read_requests += st.safein_prefix_read_requests;
@@ -994,16 +1399,6 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.serial_vector_read_bytes += st.serial_vector_read_bytes;
     m.serial_full_record_read_bytes += st.serial_full_record_read_bytes;
     m.serial_payload_read_bytes += st.serial_payload_read_bytes;
-    m.budgeted_prefetch_considered += st.budgeted_prefetch_considered;
-    m.budgeted_prefetch_scheduled += st.budgeted_prefetch_scheduled;
-    m.budgeted_prefetch_duplicates += st.budgeted_prefetch_duplicates;
-    m.budgeted_prefetch_skipped_limit += st.budgeted_prefetch_skipped_limit;
-    m.budgeted_prefetch_completed += st.budgeted_prefetch_completed;
-    m.budgeted_prefetch_cache_hits += st.budgeted_prefetch_cache_hits;
-    m.budgeted_prefetch_inflight_uses += st.budgeted_prefetch_inflight_uses;
-    m.budgeted_prefetch_used += st.budgeted_prefetch_used;
-    m.budgeted_prefetch_wasted += st.budgeted_prefetch_wasted;
-    m.budgeted_prefetch_read_bytes += st.budgeted_prefetch_read_bytes;
     m.safein_prefetch_considered += st.safein_prefetch_considered;
     m.safein_prefetch_candidates += st.safein_prefetch_candidates;
     m.safein_prefetch_true_topk += st.safein_prefetch_true_topk;
@@ -1014,6 +1409,90 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.safein_prefetch_skipped_byte_limit +=
         st.safein_prefetch_skipped_byte_limit;
     m.safein_prefetch_scheduled_bytes += st.safein_prefetch_scheduled_bytes;
+    m.safein_cold_prefetch_requests += st.safein_cold_prefetch_requests;
+    m.safein_cold_prefetch_full_payloads +=
+        st.safein_cold_prefetch_full_payloads;
+    m.safein_cold_prefetch_bytes += st.safein_cold_prefetch_bytes;
+    m.safein_cold_prefetch_used_bytes += st.safein_cold_prefetch_used_bytes;
+    m.safein_cold_prefetch_wasted_bytes += st.safein_cold_prefetch_wasted_bytes;
+    m.safein_optional_io_queued += st.safein_optional_io_queued;
+    m.safein_optional_io_submitted += st.safein_optional_io_submitted;
+    m.safein_optional_io_completed += st.safein_optional_io_completed;
+    m.safein_optional_io_dropped_late += st.safein_optional_io_dropped_late;
+    m.safein_optional_io_submitted_bytes +=
+        st.safein_optional_io_submitted_bytes;
+    m.safein_optional_io_completed_bytes +=
+        st.safein_optional_io_completed_bytes;
+    m.safein_optional_io_submit_calls +=
+        st.safein_optional_io_submit_calls;
+    m.safein_optional_io_nonblocking_poll_calls +=
+        st.safein_optional_io_nonblocking_poll_calls;
+    m.safein_optional_io_empty_polls +=
+        st.safein_optional_io_empty_polls;
+    m.safein_optional_io_poll_completions +=
+        st.safein_optional_io_poll_completions;
+    m.safein_optional_io_get_events_calls +=
+        st.safein_optional_io_get_events_calls;
+    m.safein_optional_io_completed_before_probe_end +=
+        st.safein_optional_io_completed_before_probe_end;
+    m.safein_optional_io_completed_bytes_before_probe_end +=
+        st.safein_optional_io_completed_bytes_before_probe_end;
+    m.safein_optional_io_completed_in_final_drain +=
+        st.safein_optional_io_completed_in_final_drain;
+    m.safein_optional_io_completed_bytes_in_final_drain +=
+        st.safein_optional_io_completed_bytes_in_final_drain;
+    m.safein_optional_io_completed_in_optional_drain +=
+        st.safein_optional_io_completed_in_optional_drain;
+    m.safein_optional_io_completed_bytes_in_optional_drain +=
+        st.safein_optional_io_completed_bytes_in_optional_drain;
+    m.safein_optional_io_timeline_queries +=
+        st.safein_optional_io_timeline_queries;
+    m.safein_optional_io_timeline_submit_queries +=
+        st.safein_optional_io_timeline_submit_queries;
+    m.safein_optional_io_timeline_completion_queries +=
+        st.safein_optional_io_timeline_completion_queries;
+    m.safein_optional_io_first_submit_probes_remaining +=
+        st.safein_optional_io_first_submit_probes_remaining;
+    m.safein_optional_io_first_submit_clusters_processed +=
+        st.safein_optional_io_first_submit_clusters_processed;
+    m.safein_optional_io_inflight_at_probe_end +=
+        st.safein_optional_io_inflight_at_probe_end;
+    m.safein_optional_io_prepped_at_probe_end +=
+        st.safein_optional_io_prepped_at_probe_end;
+    m.safein_optional_io_pending_at_probe_end +=
+        st.safein_optional_io_pending_at_probe_end;
+    m.safein_optional_io_inflight_at_final_drain_start +=
+        st.safein_optional_io_inflight_at_final_drain_start;
+    m.safein_optional_io_inflight_at_optional_drain_start +=
+        st.safein_optional_io_inflight_at_optional_drain_start;
+    m.safein_optional_io_blocked_mandatory_calls +=
+        st.safein_optional_io_blocked_mandatory_calls;
+    m.safein_optional_io_blocked_max_inflight_calls +=
+        st.safein_optional_io_blocked_max_inflight_calls;
+    m.safein_optional_io_blocked_short_window_calls +=
+        st.safein_optional_io_blocked_short_window_calls;
+    m.safein_optional_io_first_queue_offset_us +=
+        st.safein_optional_io_first_queue_offset_us;
+    m.safein_optional_io_first_submit_offset_us +=
+        st.safein_optional_io_first_submit_offset_us;
+    m.safein_optional_io_last_submit_offset_us +=
+        st.safein_optional_io_last_submit_offset_us;
+    m.safein_optional_io_queue_to_submit_us +=
+        st.safein_optional_io_queue_to_submit_us;
+    m.safein_optional_io_probe_end_offset_us +=
+        st.safein_optional_io_probe_end_offset_us;
+    m.safein_optional_io_first_submit_to_probe_end_us +=
+        st.safein_optional_io_first_submit_to_probe_end_us;
+    m.safein_optional_io_first_completion_offset_us +=
+        st.safein_optional_io_first_completion_offset_us;
+    for (size_t i = 0;
+         i < vdb::query::kSafeInOptionalLatencyBucketCount; ++i) {
+        m.safein_optional_io_submit_to_cqe_histogram[i] +=
+            st.safein_optional_io_submit_to_cqe_histogram[i];
+    }
+    m.safein_payload_buffer_reuses += st.safein_payload_buffer_reuses;
+    m.safein_payload_prefix_copy_bytes_avoided +=
+        st.safein_payload_prefix_copy_bytes_avoided;
     m.bextra_windows += st.bextra_windows;
     m.bextra_eligible_candidates += st.bextra_eligible_candidates;
     m.bextra_scheduled_candidates += st.bextra_scheduled_candidates;
@@ -1032,9 +1511,6 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.dynamic_safein_deferred_candidates += st.dynamic_safein_deferred_candidates;
     m.dynamic_safein_deferred_flushes += st.dynamic_safein_deferred_flushes;
     m.dynamic_safein_deferred_safein += st.dynamic_safein_deferred_safein;
-    m.candidate_budget_seen += st.candidate_budget_seen;
-    m.candidate_budget_selected += st.candidate_budget_selected;
-    m.candidate_budget_dropped += st.candidate_budget_dropped;
     m.unique_fetch_candidates += st.unique_fetch_candidates;
     m.total_io_submitted += st.total_io_submitted;
     m.total_submit_calls += st.total_submit_calls;
@@ -1053,7 +1529,55 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.stage2_decode_output_bytes += st.stage2_decode_output_bytes;
     m.stage2_active_ex_bits_sum += st.stage2_active_ex_bits_sum;
     m.stage2_stored_ex_bits_sum += st.stage2_stored_ex_bits_sum;
+    m.mandatory_io_prepared += st.mandatory_io_prepared;
+    m.mandatory_io_prepared_bytes += st.mandatory_io_prepared_bytes;
+    m.mandatory_io_explicit_submitted +=
+        st.mandatory_io_explicit_submitted;
+    m.mandatory_io_submit_calls += st.mandatory_io_submit_calls;
+    m.mandatory_io_nonblocking_poll_calls +=
+        st.mandatory_io_nonblocking_poll_calls;
+    m.mandatory_io_wait_poll_calls += st.mandatory_io_wait_poll_calls;
+    m.mandatory_io_empty_polls += st.mandatory_io_empty_polls;
+    m.mandatory_io_poll_completions += st.mandatory_io_poll_completions;
+    m.mandatory_io_get_events_calls += st.mandatory_io_get_events_calls;
+    m.mandatory_io_completed += st.mandatory_io_completed;
+    m.mandatory_io_completed_bytes += st.mandatory_io_completed_bytes;
+    m.mandatory_io_completed_before_probe_end +=
+        st.mandatory_io_completed_before_probe_end;
+    m.mandatory_io_completed_bytes_before_probe_end +=
+        st.mandatory_io_completed_bytes_before_probe_end;
+    m.mandatory_io_completed_in_final_drain +=
+        st.mandatory_io_completed_in_final_drain;
+    m.mandatory_io_completed_bytes_in_final_drain +=
+        st.mandatory_io_completed_bytes_in_final_drain;
+    m.mandatory_io_inflight_at_probe_end +=
+        st.mandatory_io_inflight_at_probe_end;
+    m.mandatory_io_prepped_at_probe_end +=
+        st.mandatory_io_prepped_at_probe_end;
+    m.mandatory_io_pending_at_probe_end +=
+        st.mandatory_io_pending_at_probe_end;
+    m.final_payload_io_prepared += st.final_payload_io_prepared;
+    m.final_payload_io_prepared_bytes += st.final_payload_io_prepared_bytes;
+    m.final_payload_io_explicit_submitted +=
+        st.final_payload_io_explicit_submitted;
+    m.final_payload_io_submit_calls += st.final_payload_io_submit_calls;
+    m.final_payload_io_wait_poll_calls +=
+        st.final_payload_io_wait_poll_calls;
+    m.final_payload_io_nonblocking_poll_calls +=
+        st.final_payload_io_nonblocking_poll_calls;
+    m.final_payload_io_completions += st.final_payload_io_completions;
     m.probe_ms += st.probe_time_ms;
+    m.probe_loop_wall_ms += st.probe_loop_wall_ms;
+    m.probe_cluster_wall_ms += st.probe_cluster_wall_ms;
+    m.probe_loop_scheduler_ms += st.probe_loop_scheduler_ms;
+    m.mandatory_io_first_submit_offset_us +=
+        st.mandatory_io_first_submit_offset_us;
+    m.mandatory_io_last_submit_offset_us +=
+        st.mandatory_io_last_submit_offset_us;
+    m.mandatory_io_first_completion_offset_us +=
+        st.mandatory_io_first_completion_offset_us;
+    m.mandatory_io_probe_end_offset_us +=
+        st.mandatory_io_probe_end_offset_us;
     m.coarse_select_ms += st.coarse_select_ms;
     m.coarse_score_ms += st.coarse_score_ms;
     m.coarse_topn_ms += st.coarse_topn_ms;
@@ -1069,8 +1593,49 @@ static void Accumulate(QueryMetrics& m, const SearchResults& results,
     m.stage2_ms += st.probe_stage2_ms;
     m.stage2_decode_ms += st.probe_stage2_decode_ms;
     m.submit_ms += st.probe_submit_ms;
+    m.submit_prepare_vec_only_ms += st.probe_submit_prepare_vec_only_ms;
+    m.submit_prepare_all_ms += st.probe_submit_prepare_all_ms;
+    m.submit_emit_ms += st.probe_submit_emit_ms;
+    m.submit_vec_only_emit_ms += st.probe_submit_vec_only_emit_ms;
+    m.submit_pending_slot_alloc_ms += st.probe_submit_pending_slot_alloc_ms;
+    m.submit_prep_read_ms += st.probe_submit_prep_read_ms;
     m.rerank_compute_ms += st.rerank_compute_ms;
     m.fetch_missing_ms += st.fetch_missing_ms;
+    m.safein_optional_io_prepare_ms += st.safein_optional_io_prepare_ms;
+    m.safein_optional_io_submit_ms += st.safein_optional_io_submit_ms;
+    m.safein_optional_io_completion_cpu_ms +=
+        st.safein_optional_io_completion_cpu_ms;
+    m.safein_optional_io_wait_ms += st.safein_optional_io_wait_ms;
+    m.safein_optional_io_nonblocking_poll_ms +=
+        st.safein_optional_io_nonblocking_poll_ms;
+    m.safein_optional_io_get_events_ms +=
+        st.safein_optional_io_get_events_ms;
+    m.safein_optional_io_final_drain_poll_ms +=
+        st.safein_optional_io_final_drain_poll_ms;
+    m.safein_optional_io_drain_ms +=
+        st.safein_optional_io_drain_ms;
+    m.mandatory_io_submit_ms += st.mandatory_io_submit_ms;
+    m.mandatory_io_nonblocking_poll_ms +=
+        st.mandatory_io_nonblocking_poll_ms;
+    m.mandatory_io_get_events_ms += st.mandatory_io_get_events_ms;
+    m.mandatory_io_wait_ms += st.mandatory_io_wait_ms;
+    m.mandatory_io_completion_cpu_ms +=
+        st.mandatory_io_completion_cpu_ms;
+    m.mandatory_io_final_drain_wait_ms +=
+        st.mandatory_io_final_drain_wait_ms;
+    m.mandatory_io_final_drain_poll_ms +=
+        st.mandatory_io_final_drain_poll_ms;
+    m.mandatory_io_final_drain_completion_cpu_ms +=
+        st.mandatory_io_final_drain_completion_cpu_ms;
+    m.final_payload_resolve_ms += st.final_payload_resolve_ms;
+    m.final_payload_plan_ms += st.final_payload_plan_ms;
+    m.final_payload_sync_prefix_ms += st.final_payload_sync_prefix_ms;
+    m.final_payload_submit_ms += st.final_payload_submit_ms;
+    m.final_payload_wait_ms += st.final_payload_wait_ms;
+    m.final_payload_nonblocking_poll_ms +=
+        st.final_payload_nonblocking_poll_ms;
+    m.final_payload_completion_cpu_ms +=
+        st.final_payload_completion_cpu_ms;
     m.io_wait_ms += st.io_wait_time_ms;
     m.final_drain_ms += st.final_drain_ms;
     m.execute_buffered_ms += st.execute_buffered_ms;
@@ -1126,6 +1691,8 @@ static int Usage() {
         "  --shadow-vector-store-dir DIR Read VEC_ONLY rerank vectors from a hot/cold or no-combine sidecar while payloads remain in combined data.dat\n"
         "  --inline-hot-record-store-dir DIR Inline hot-record index dir with data.dat/payload.cold.dat\n"
         "  --vector-read-trace FILE    Write scheduled raw-vector reads as CSV (profiling only)\n"
+        "  --vec-span-payload-compact 0|1 Compact reusable inline payloads and release the larger vector span early (default: 0)\n"
+        "  --vec-span-safein-tail-count N Extend up to N SafeIn span tails through the hot record (default: 0)\n"
         "  --safein-confidence-trace FILE  Write first-decision SafeIn snapshots as CSV\n"
         "  --dynamic-safein static|frontier (default: static)\n"
         "  --materialization-mode eager|late SafeIn full-record reads eagerly or only final top-k payloads (default: eager)\n"
@@ -1134,11 +1701,29 @@ static int Usage() {
         "  --safein-prefetch-max-count N Query-level SafeIn VEC_ALL count cap (default: 0 = unlimited)\n"
         "  --safein-prefetch-max-bytes N Query-level SafeIn VEC_ALL byte cap (default: 0 = unlimited)\n"
         "  --safein-prefetch-emit-quantum N Emit at most N SafeIn full reads before VEC_ONLY in each flush (default: 0 = legacy all-first)\n"
-        "  --safein-prefetch-order arrival|confidence|confidence-per-byte (default: arrival)\n"
+        "  --safein-prefetch-emit-reserve N Reserve N front-of-submit SQEs for decoupled payload prefixes (default: 0)\n"
+        "  --safein-prefetch-order arrival|confidence|confidence-per-byte|oracle (default: arrival)\n"
+        "  --oracle-prefetch-label-only 0|1 Run oracle admission without payload reads (diagnostic control)\n"
         "  --safein-prefetch-rank-batch-size N Confidence ranking batch (default: 32)\n"
         "  --safein-prefetch-global-window N Cross-batch rolling admission window (default: 0)\n"
         "  --safein-query-extra-bytes N Query-level bytes beyond vector verification (default: 0 = unlimited)\n"
         "  --safein-max-full-payload-bytes N Per-candidate extra-byte cap (default: 0 = unlimited)\n"
+        "  --safein-cold-payload-prefetch 0|1 Prefetch a bounded external payload prefix for SafeIn (default: 0)\n"
+        "  --safein-cold-payload-prefix-bytes N Per-candidate external payload prefix cap (default: 0)\n"
+        "  --safein-optional-io-isolation 0|1 Use a guarded dedicated ring for optional payload reads (default: 0)\n"
+        "  --safein-optional-io-detailed-timing 0|1 Time backend get_events calls (default: 0)\n"
+        "  --safein-optional-io-timeline 0|1 Record optional-I/O phase offsets (default: 0)\n"
+        "  --safein-optional-io-defer-taskrun 0|1 Defer optional-ring task work to poll calls (default: 1)\n"
+        "  --safein-optional-io-force-async 0|1 Force optional payload SQEs through io-wq (default: 0)\n"
+        "  --safein-optional-io-refill-only-polling 0|1 Poll only to unlock optional refill (default: 0)\n"
+        "  --safein-optional-io-queue-depth N Dedicated optional ring depth (default: 8)\n"
+        "  --safein-optional-io-max-inflight N Optional request cap (default: 4)\n"
+        "  --safein-optional-io-mandatory-low-watermark N Mandatory in-flight guard (default: 8)\n"
+        "  --safein-optional-io-min-remaining-probes N Minimum overlap window (default: 4)\n"
+        "  --safein-reusable-payload-buffer 0|1 Append final suffix into the prefetched buffer (default: 0)\n"
+        "  --safein-reusable-payload-buffer-max-bytes N Final-sized speculative buffer cap (default: 4MiB, 0 = unlimited)\n"
+        "  --payload-cache-mode default|drop-before-queries|drop-record-files-before-queries\n"
+        "                              Drop payload-only or all record/vector files before the timed query batch\n"
         "  --safein-bextra-probe-budget 0|1 Enable benchmark probe-overlap byte budget\n"
         "  --safein-bextra-rho R       Budget safety multiplier\n"
         "  --safein-bextra-bytes-per-ms B Tune-split calibrated service rate\n"
@@ -1156,23 +1741,29 @@ static int Usage() {
         "  --epsilon-samples N         Calibration samples per cluster (default: 100)\n"
         "  --epsilon-sampling-mode legacy_per_cluster|global_pair (default: legacy_per_cluster)\n"
         "  --safeout-epsilon-cache FILE Cache calibrated runtime SafeOut epsilon\n"
-        "  --non-safeout-candidate-budget N (default: 0)\n"
-        "  --budgeted-prefetch-limit N Speculative raw-vector prefetch cap for budgeted queries (default: 0)\n"
         "  --fixed-vec-buffer-count N  Fixed vector buffers (default: 0)\n"
         "  --vec-span-coalescing 0|1  Merge nearby VEC_ONLY reads (default: 0)\n"
         "  --vec-span-tile-bytes N    Tile boundary for span grouping (default: 4096)\n"
-        "  --vec-span-max-byte-amplification R  Span admission cap (default: 1.10)\n"
+        "  --vec-span-planner-mode GV|SV|GE|SE Planner variant (default: GV)\n"
+        "  --vec-span-alpha NUM/DEN Exact byte-amplification bound (default: 3/2)\n"
+        "  --vec-span-safein-rho 0|NUM/DEN|1 SafeIn credit multiplier in [0,1] (default: 1)\n"
+        "  --vec-span-max-byte-amplification R  Legacy exact-decimal alias for --vec-span-alpha\n"
+        "  --vec-span-payload-reuse 0|1 Retain covered inline payloads for final materialization (default: 0)\n"
         "  --serial-data-drain 0|1    Drain data I/O after each cluster (default: 0)\n"
         "  --two-level-coarse-routing 0|1 Enable two-level coarse routing (default: 0)\n"
         "  --two-level-coarse-budget-factor N Candidate budget = nprobe*N (default: 8)\n"
         "  --two-level-coarse-budget-cap N Cap two-level child candidates (default: 0 = no cap)\n"
         "  --fine-grained-timing 0|1   Enable detailed stage timing (default: 0)\n"
         "  --hotpath-detailed-timing 0|1 (default: 0)\n"
+        "  --pipeline-io-detailed-timing 0|1 Attribute probe, mandatory I/O, and final payload phases (default: 0)\n"
         "  --direct-io                 Open index files with direct I/O\n");
     return 2;
 }
 
 int main(int argc, char** argv) {
+    if (RejectDeletedBudgetedPrefetchFlags(argc, argv)) {
+        return 1;
+    }
     if (HasFlag(argc, argv, "--help") || HasFlag(argc, argv, "-h")) {
         return Usage();
     }
@@ -1189,12 +1780,30 @@ int main(int argc, char** argv) {
     const std::string output_dir =
         GetStringArg(argc, argv, "--output", "bench_online_query_out");
     const std::string dataset_dir = GetStringArg(argc, argv, "--dataset", "");
+    const std::string pcve_profile_path =
+        GetStringArg(argc, argv, "--rabitq-pcve-profile", "");
+    const std::string pcve_fallback =
+        GetStringArg(argc, argv, "--rabitq-pcve-fallback", "verify-all");
+    if (pcve_fallback != "verify-all" && pcve_fallback != "fail") {
+        std::fprintf(stderr, "Invalid --rabitq-pcve-fallback: %s\n",
+                     pcve_fallback.c_str());
+        return 1;
+    }
     const std::string assignments_file =
         GetStringArg(argc, argv, "--assignments", "");
     const std::string false_stats_cluster_members_cache =
         GetStringArg(argc, argv, "--false-stats-cluster-members-cache", "");
     const bool skip_false_stats =
         GetIntArg(argc, argv, "--skip-false-stats", 0) != 0;
+    const std::string payload_cache_mode =
+        GetStringArg(argc, argv, "--payload-cache-mode", "default");
+    if (payload_cache_mode != "default" &&
+        payload_cache_mode != "drop-before-queries" &&
+        payload_cache_mode != "drop-record-files-before-queries") {
+        std::fprintf(stderr, "Invalid --payload-cache-mode: %s\n",
+                     payload_cache_mode.c_str());
+        return 1;
+    }
     const std::string separate_store_dir =
         GetStringArg(argc, argv, "--separate-store-dir", "");
     const std::string hotcold_store_dir =
@@ -1273,6 +1882,11 @@ int main(int argc, char** argv) {
     const int seed = GetIntArg(argc, argv, "--seed", 42);
     const std::string safeout_epsilon_cache =
         GetStringArg(argc, argv, "--safeout-epsilon-cache", "");
+    if (!pcve_profile_path.empty() && safeout_epsilon_percentile >= 0.0) {
+        std::fprintf(stderr,
+                     "--rabitq-pcve-profile conflicts with runtime epsilon calibration\n");
+        return 1;
+    }
     if (HasFlag(argc, argv, "--safeout-epsilon-override")) {
         std::fprintf(stderr,
                      "--safeout-epsilon-override is disabled for online runner; "
@@ -1696,6 +2310,65 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    PcveRuntimeProfile pcve_profile;
+    bool pcve_profile_valid = false;
+    bool pcve_verify_all_fallback = false;
+    std::string pcve_profile_error;
+    if (!pcve_profile_path.empty()) {
+        pcve_profile_valid = LoadPcveRuntimeProfile(
+            pcve_profile_path, &pcve_profile, &pcve_profile_error);
+        const uint64_t expected_stored_bits = stored_ex_bits + 1u;
+        const uint64_t expected_active_bits = active_ex_bits_arg >= 0
+            ? static_cast<uint64_t>(active_ex_bits_arg + 1)
+            : expected_stored_bits;
+        const uint64_t expected_resident_bits = resident_ex_bits_arg >= 0
+            ? static_cast<uint64_t>(resident_ex_bits_arg + 1)
+            : expected_stored_bits;
+        auto mismatch = [&](const std::string& reason) {
+            if (pcve_profile_valid) pcve_profile_error = reason;
+            pcve_profile_valid = false;
+        };
+        if (pcve_profile_valid &&
+            fs::weakly_canonical(pcve_profile.dataset_dir) !=
+                fs::weakly_canonical(dataset_dir)) mismatch("dataset_dir mismatch");
+        if (pcve_profile_valid &&
+            fs::weakly_canonical(pcve_profile.index_dir) !=
+                fs::weakly_canonical(index_dir)) mismatch("index_dir mismatch");
+        if (pcve_profile_valid && pcve_profile.stored_bits != expected_stored_bits)
+            mismatch("stored_bits mismatch");
+        if (pcve_profile_valid && pcve_profile.active_bits != expected_active_bits)
+            mismatch("active_bits mismatch");
+        if (pcve_profile_valid && pcve_profile.resident_bits != expected_resident_bits)
+            mismatch("resident_bits mismatch");
+        if (pcve_profile_valid && pcve_profile.nprobe != nprobe)
+            mismatch("nprobe mismatch");
+        if (pcve_profile_valid && pcve_profile.topk != topk)
+            mismatch("topk mismatch");
+        if (pcve_profile_valid && pcve_profile.estimator_mode !=
+                std::string(RaBitQEstimatorModeName(preload_rabitq_cfg.estimator_mode)))
+            mismatch("estimator_mode mismatch");
+        if (pcve_profile_valid && pcve_profile.code_layout !=
+                std::string(vdb::RaBitQExDataLayoutName(active_layout)))
+            mismatch("code_layout mismatch");
+        if (!pcve_profile_valid) {
+            if (pcve_fallback == "fail") {
+                std::fprintf(stderr, "A-PCVE profile rejected: %s\n",
+                             pcve_profile_error.c_str());
+                return 1;
+            }
+            pcve_verify_all_fallback = true;
+            Log("  A-PCVE profile rejected; verify-all fallback: %s\n",
+                pcve_profile_error.c_str());
+        } else {
+            Log("  A-PCVE profile accepted: %s s1=[%.6f,%.6f] s2=[%.6f,%.6f]\n",
+                pcve_profile_path.c_str(),
+                pcve_profile.stage1_epsilon_lower,
+                pcve_profile.stage1_epsilon_upper,
+                pcve_profile.stage2_epsilon_lower,
+                pcve_profile.stage2_epsilon_upper);
+        }
+    }
+
     float runtime_safeout_epsilon = index.conann().epsilon();
     const float loaded_safeout_epsilon = index.conann().epsilon();
     bool runtime_safeout_epsilon_overridden = false;
@@ -1892,7 +2565,8 @@ int main(int argc, char** argv) {
         : SubmissionMode::Shared;
     cfg.execution_mode = execution_mode;
     cfg.enable_dynamic_safeout =
-        GetIntArg(argc, argv, "--dynamic-safeout", 1) != 0;
+        GetIntArg(argc, argv, "--dynamic-safeout", 1) != 0 &&
+        !pcve_verify_all_fallback;
     cfg.dynamic_safein_mode = dynamic_safein == "frontier"
         ? DynamicSafeInMode::Frontier
         : DynamicSafeInMode::Static;
@@ -1937,6 +2611,8 @@ int main(int argc, char** argv) {
         std::max<int64_t>(0, GetInt64Arg(argc, argv, "--safein-prefetch-max-bytes", 0)));
     cfg.safein_prefetch_emit_quantum = static_cast<uint32_t>(
         std::max(0, GetIntArg(argc, argv, "--safein-prefetch-emit-quantum", 0)));
+    cfg.safein_prefetch_emit_reserve = static_cast<uint32_t>(
+        std::max(0, GetIntArg(argc, argv, "--safein-prefetch-emit-reserve", 0)));
     const std::string safein_prefetch_order =
         GetStringArg(argc, argv, "--safein-prefetch-order", "arrival");
     if (safein_prefetch_order == "arrival") {
@@ -1945,6 +2621,8 @@ int main(int argc, char** argv) {
         cfg.safein_prefetch_order = SafeInPrefetchOrder::Confidence;
     } else if (safein_prefetch_order == "confidence-per-byte") {
         cfg.safein_prefetch_order = SafeInPrefetchOrder::ConfidencePerByte;
+    } else if (safein_prefetch_order == "oracle") {
+        cfg.safein_prefetch_order = SafeInPrefetchOrder::Oracle;
     } else {
         std::fprintf(stderr,
                      "Invalid --safein-prefetch-order: %s\n",
@@ -1957,12 +2635,99 @@ int main(int argc, char** argv) {
     cfg.safein_prefetch_global_window = static_cast<uint32_t>(
         std::max(0, GetIntArg(
             argc, argv, "--safein-prefetch-global-window", 0)));
+    cfg.oracle_prefetch_label_only =
+        GetIntArg(argc, argv, "--oracle-prefetch-label-only", 0) != 0;
     cfg.safein_query_extra_bytes = static_cast<uint64_t>(
         std::max<int64_t>(0, GetInt64Arg(
             argc, argv, "--safein-query-extra-bytes", 0)));
     cfg.safein_max_full_payload_bytes = static_cast<uint32_t>(
         std::min<int64_t>(UINT32_MAX, std::max<int64_t>(0, GetInt64Arg(
             argc, argv, "--safein-max-full-payload-bytes", 0))));
+    const int safein_cold_payload_prefetch =
+        GetIntArg(argc, argv, "--safein-cold-payload-prefetch", 0);
+    if (safein_cold_payload_prefetch != 0 &&
+        safein_cold_payload_prefetch != 1) {
+        std::fprintf(stderr,
+                     "Invalid --safein-cold-payload-prefetch: %d "
+                     "(expected 0 or 1)\n",
+                     safein_cold_payload_prefetch);
+        return 1;
+    }
+    cfg.enable_safein_cold_payload_prefetch =
+        safein_cold_payload_prefetch != 0;
+    cfg.safein_cold_payload_prefix_bytes = static_cast<uint32_t>(
+        std::min<int64_t>(UINT32_MAX, std::max<int64_t>(0, GetInt64Arg(
+            argc, argv, "--safein-cold-payload-prefix-bytes", 0))));
+    const int safein_optional_io_isolation =
+        GetIntArg(argc, argv, "--safein-optional-io-isolation", 0);
+    const int safein_optional_io_detailed_timing =
+        GetIntArg(argc, argv,
+                  "--safein-optional-io-detailed-timing", 0);
+    const int safein_optional_io_timeline =
+        GetIntArg(argc, argv, "--safein-optional-io-timeline", 0);
+    const int safein_optional_io_refill_only_polling =
+        GetIntArg(argc, argv,
+                  "--safein-optional-io-refill-only-polling", 0);
+    const int safein_optional_io_defer_taskrun =
+        GetIntArg(argc, argv,
+                  "--safein-optional-io-defer-taskrun", 1);
+    const int safein_optional_io_force_async =
+        GetIntArg(argc, argv,
+                  "--safein-optional-io-force-async", 0);
+    const int safein_reusable_payload_buffer =
+        GetIntArg(argc, argv, "--safein-reusable-payload-buffer", 0);
+    if ((safein_optional_io_isolation != 0 &&
+         safein_optional_io_isolation != 1) ||
+        (safein_optional_io_detailed_timing != 0 &&
+         safein_optional_io_detailed_timing != 1) ||
+        (safein_optional_io_timeline != 0 &&
+         safein_optional_io_timeline != 1) ||
+        (safein_optional_io_refill_only_polling != 0 &&
+         safein_optional_io_refill_only_polling != 1) ||
+        (safein_optional_io_defer_taskrun != 0 &&
+         safein_optional_io_defer_taskrun != 1) ||
+        (safein_optional_io_force_async != 0 &&
+         safein_optional_io_force_async != 1) ||
+        (safein_reusable_payload_buffer != 0 &&
+         safein_reusable_payload_buffer != 1)) {
+        std::fprintf(stderr,
+                     "SafeIn P0 feature flags must be 0 or 1\n");
+        return 1;
+    }
+    cfg.enable_safein_optional_io_isolation =
+        safein_optional_io_isolation != 0;
+    cfg.enable_safein_optional_io_detailed_timing =
+        safein_optional_io_detailed_timing != 0;
+    cfg.enable_safein_optional_io_timeline =
+        safein_optional_io_timeline != 0;
+    cfg.enable_safein_optional_io_refill_only_polling =
+        safein_optional_io_refill_only_polling != 0;
+    cfg.safein_optional_io_defer_taskrun =
+        safein_optional_io_defer_taskrun != 0;
+    cfg.safein_optional_io_force_async =
+        safein_optional_io_force_async != 0;
+    cfg.safein_optional_io_queue_depth = static_cast<uint32_t>(
+        std::max(1, GetIntArg(
+            argc, argv, "--safein-optional-io-queue-depth", 8)));
+    cfg.safein_optional_io_max_inflight = static_cast<uint32_t>(
+        std::max(1, GetIntArg(
+            argc, argv, "--safein-optional-io-max-inflight", 4)));
+    cfg.safein_optional_io_mandatory_low_watermark =
+        static_cast<uint32_t>(std::max(
+            0, GetIntArg(
+                argc, argv,
+                "--safein-optional-io-mandatory-low-watermark", 8)));
+    cfg.safein_optional_io_min_remaining_probes =
+        static_cast<uint32_t>(std::max(
+            0, GetIntArg(
+                argc, argv,
+                "--safein-optional-io-min-remaining-probes", 4)));
+    cfg.enable_safein_reusable_payload_buffer =
+        safein_reusable_payload_buffer != 0;
+    cfg.safein_reusable_payload_buffer_max_bytes = static_cast<uint32_t>(
+        std::min<int64_t>(UINT32_MAX, std::max<int64_t>(0, GetInt64Arg(
+            argc, argv, "--safein-reusable-payload-buffer-max-bytes",
+            4ll * 1024ll * 1024ll))));
     cfg.enable_safein_bextra_probe_budget =
         GetIntArg(argc, argv, "--safein-bextra-probe-budget", 0) != 0;
     cfg.safein_bextra_rho =
@@ -1971,16 +2736,6 @@ int main(int argc, char** argv) {
         0.0, GetDoubleArg(argc, argv, "--safein-bextra-bytes-per-ms", 0.0));
     cfg.safein_bextra_ema_alpha = static_cast<float>(std::clamp(
         GetDoubleArg(argc, argv, "--safein-bextra-ema-alpha", 0.25), 0.0, 1.0));
-    cfg.non_safeout_candidate_budget = static_cast<uint32_t>(
-        std::max(0, GetIntArg(argc, argv, "--non-safeout-candidate-budget", 0)));
-    cfg.budgeted_prefetch_limit = static_cast<uint32_t>(
-        std::max(0, GetIntArg(argc, argv, "--budgeted-prefetch-limit", 0)));
-    if (cfg.execution_mode == QueryExecutionMode::SerialNoOverlap &&
-        cfg.budgeted_prefetch_limit > 0) {
-        Log("  serial-no-overlap disables budgeted prefetch: requested=%u effective=0\n",
-            cfg.budgeted_prefetch_limit);
-        cfg.budgeted_prefetch_limit = 0;
-    }
     cfg.fixed_vec_buffer_count = static_cast<uint32_t>(
         std::max(0, GetIntArg(argc, argv, "--fixed-vec-buffer-count", 0)));
     cfg.cluster_submit_reserve = static_cast<uint32_t>(
@@ -1991,15 +2746,99 @@ int main(int argc, char** argv) {
         GetIntArg(argc, argv, "--vec-span-coalescing", 0) != 0;
     cfg.vec_span_tile_bytes = static_cast<uint32_t>(
         std::max(1, GetIntArg(argc, argv, "--vec-span-tile-bytes", 4096)));
-    cfg.vec_span_max_byte_amplification = static_cast<float>(
-        std::max(1.0, GetDoubleArg(
-            argc, argv, "--vec-span-max-byte-amplification", 1.10)));
+    const std::string span_planner_mode_arg =
+        GetStringArg(argc, argv, "--vec-span-planner-mode", "GV");
+    if (!ParseSpanPlannerModeArg(span_planner_mode_arg,
+                                 &cfg.vec_span_planner_mode)) {
+        std::fprintf(stderr, "Invalid --vec-span-planner-mode: %s\n",
+                     span_planner_mode_arg.c_str());
+        return 1;
+    }
+    const bool has_span_alpha =
+        HasArgKey(argc, argv, "--vec-span-alpha");
+    const bool has_legacy_span_alpha =
+        HasArgKey(argc, argv, "--vec-span-max-byte-amplification");
+    uint32_t fraction_num = 3;
+    uint32_t fraction_den = 2;
+    uint32_t decimal_num = 3;
+    uint32_t decimal_den = 2;
+    const std::string span_alpha_arg =
+        GetStringArg(argc, argv, "--vec-span-alpha", "");
+    const std::string legacy_span_alpha_arg = GetStringArg(
+        argc, argv, "--vec-span-max-byte-amplification", "");
+    if (has_span_alpha &&
+        (!ParseExactFraction(span_alpha_arg, &fraction_num, &fraction_den) ||
+         fraction_num < fraction_den)) {
+        std::fprintf(stderr, "Invalid --vec-span-alpha: %s\n",
+                     span_alpha_arg.c_str());
+        return 1;
+    }
+    if (has_legacy_span_alpha &&
+        (!ParseExactDecimal(legacy_span_alpha_arg, &decimal_num,
+                            &decimal_den) ||
+         decimal_num < decimal_den)) {
+        std::fprintf(stderr,
+                     "Invalid --vec-span-max-byte-amplification: %s\n",
+                     legacy_span_alpha_arg.c_str());
+        return 1;
+    }
+    if (has_span_alpha && has_legacy_span_alpha &&
+        (fraction_num != decimal_num || fraction_den != decimal_den)) {
+        std::fprintf(stderr,
+                     "Conflicting span alpha options: --vec-span-alpha=%s "
+                     "versus --vec-span-max-byte-amplification=%s\n",
+                     span_alpha_arg.c_str(), legacy_span_alpha_arg.c_str());
+        return 1;
+    }
+    if (has_span_alpha) {
+        cfg.vec_span_alpha_num = fraction_num;
+        cfg.vec_span_alpha_den = fraction_den;
+    } else if (has_legacy_span_alpha) {
+        cfg.vec_span_alpha_num = decimal_num;
+        cfg.vec_span_alpha_den = decimal_den;
+    } else {
+        cfg.vec_span_alpha_num = 3;
+        cfg.vec_span_alpha_den = 2;
+    }
+    const std::string span_rho_arg =
+        GetStringArg(argc, argv, "--vec-span-safein-rho", "1");
+    if (span_rho_arg == "0") {
+        cfg.vec_span_safein_rho_num = 0;
+        cfg.vec_span_safein_rho_den = 1;
+    } else if (span_rho_arg == "1") {
+        cfg.vec_span_safein_rho_num = 1;
+        cfg.vec_span_safein_rho_den = 1;
+    } else if (!ParseExactFraction(span_rho_arg,
+                                   &cfg.vec_span_safein_rho_num,
+                                   &cfg.vec_span_safein_rho_den) ||
+               cfg.vec_span_safein_rho_num >
+                   cfg.vec_span_safein_rho_den) {
+        std::fprintf(stderr, "Invalid --vec-span-safein-rho: %s\n",
+                     span_rho_arg.c_str());
+        return 1;
+    }
+    if (cfg.vec_span_planner_mode == SpanPlannerMode::GV ||
+        cfg.vec_span_planner_mode == SpanPlannerMode::GE) {
+        cfg.vec_span_safein_rho_num = 0;
+        cfg.vec_span_safein_rho_den = 1;
+    }
+    cfg.vec_span_max_byte_amplification =
+        static_cast<float>(cfg.vec_span_alpha_num) /
+        static_cast<float>(cfg.vec_span_alpha_den);
+    cfg.enable_vec_span_payload_reuse =
+        GetIntArg(argc, argv, "--vec-span-payload-reuse", 0) != 0;
+    cfg.compact_vec_span_payload_reuse =
+        GetIntArg(argc, argv, "--vec-span-payload-compact", 0) != 0;
+    cfg.vec_span_safein_tail_count = static_cast<uint32_t>(std::max(
+        0, GetIntArg(argc, argv, "--vec-span-safein-tail-count", 0)));
     cfg.serial_data_drains =
         GetIntArg(argc, argv, "--serial-data-drain", 0) != 0;
     cfg.enable_fine_grained_timing =
         GetIntArg(argc, argv, "--fine-grained-timing", 0) != 0;
     cfg.enable_hotpath_detailed_timing =
         GetIntArg(argc, argv, "--hotpath-detailed-timing", 0) != 0;
+    cfg.enable_pipeline_io_detailed_timing =
+        GetIntArg(argc, argv, "--pipeline-io-detailed-timing", 0) != 0;
     cfg.enable_address_decode_simd =
         GetIntArg(argc, argv, "--address-decode-simd", 1) != 0;
     cfg.enable_rerank_batched_distance_simd =
@@ -2033,7 +2872,17 @@ int main(int argc, char** argv) {
     const double safein_eps_override =
         GetDoubleArg(argc, argv, "--safein-epsilon-override", -1.0);
     cfg.safein_epsilon_override = static_cast<float>(safein_eps_override);
-    if (runtime_safeout_epsilon_overridden) {
+    if (pcve_profile_valid) {
+        cfg.rabitq_pcve_enabled = true;
+        cfg.safeout_epsilon_override =
+            static_cast<float>(pcve_profile.stage1_epsilon_lower);
+        cfg.safein_epsilon_override =
+            static_cast<float>(pcve_profile.stage1_epsilon_upper);
+        cfg.rabitq_pcve_stage2_epsilon_lower =
+            static_cast<float>(pcve_profile.stage2_epsilon_lower);
+        cfg.rabitq_pcve_stage2_epsilon_upper =
+            static_cast<float>(pcve_profile.stage2_epsilon_upper);
+    } else if (runtime_safeout_epsilon_overridden) {
         cfg.safeout_epsilon_override = runtime_safeout_epsilon;
     }
     if (record_sidecar_layout == RecordSidecarLayout::NoCombineFlatStor ||
@@ -2063,8 +2912,95 @@ int main(int argc, char** argv) {
                 &inline_descriptor_map.records;
         }
     }
-    if (have_false_stats_cluster_members) {
+    if (cfg.enable_safein_cold_payload_prefetch) {
+        const bool supported_layout = use_inline_hot_record_store ||
+            record_sidecar_layout == RecordSidecarLayout::NoCombineFlatStor;
+        if (!supported_layout ||
+            cfg.safein_cold_payload_prefix_bytes == 0) {
+            std::fprintf(
+                stderr,
+                "SafeIn cold payload prefetch requires an inline-hot or "
+                "NoCombine store and a positive prefix byte cap\n");
+            return 1;
+        }
+        if (use_inline_hot_record_store &&
+            (inline_descriptor_map.records.empty() ||
+             inline_cold_payload_fd < 0)) {
+            std::fprintf(
+                stderr,
+                "SafeIn cold payload prefetch requires resident inline "
+                "descriptor metadata and payload.cold.dat\n");
+            return 1;
+        }
+    }
+    if (cfg.enable_safein_optional_io_isolation &&
+        (!cfg.enable_safein_cold_payload_prefetch ||
+         cfg.materialization_mode != MaterializationMode::EagerSafeIn ||
+         cfg.execution_mode != QueryExecutionMode::Overlap)) {
+        std::fprintf(
+            stderr,
+            "SafeIn optional-I/O isolation requires eager overlap and "
+            "cold payload prefetch\n");
+        return 1;
+    }
+    if (cfg.enable_safein_optional_io_refill_only_polling &&
+        !cfg.enable_safein_optional_io_isolation) {
+        std::fprintf(stderr,
+                     "SafeIn refill-only polling requires optional-I/O "
+                     "isolation\n");
+        return 1;
+    }
+    if (!cfg.safein_optional_io_defer_taskrun &&
+        !cfg.enable_safein_optional_io_isolation) {
+        std::fprintf(stderr,
+                     "SafeIn optional no-DEFER_TASKRUN requires optional-I/O "
+                     "isolation\n");
+        return 1;
+    }
+    if (cfg.safein_optional_io_force_async &&
+        !cfg.enable_safein_optional_io_isolation) {
+        std::fprintf(stderr,
+                     "SafeIn optional IOSQE_ASYNC requires optional-I/O "
+                     "isolation\n");
+        return 1;
+    }
+    if (cfg.enable_safein_reusable_payload_buffer &&
+        !cfg.enable_safein_cold_payload_prefetch) {
+        std::fprintf(stderr,
+                     "SafeIn reusable payload buffers require cold payload "
+                     "prefetch\n");
+        return 1;
+    }
+    if (cfg.safein_optional_io_max_inflight >
+        cfg.safein_optional_io_queue_depth) {
+        std::fprintf(stderr,
+                     "SafeIn optional max-inflight cannot exceed its queue "
+                     "depth\n");
+        return 1;
+    }
+    if (cfg.safein_prefetch_order == SafeInPrefetchOrder::Oracle &&
+        !cfg.enable_safein_cold_payload_prefetch) {
+        std::fprintf(stderr,
+                     "oracle SafeIn prefetch requires cold payload prefetch\n");
+        return 1;
+    }
+    if (cfg.oracle_prefetch_label_only &&
+        cfg.safein_prefetch_order != SafeInPrefetchOrder::Oracle) {
+        std::fprintf(stderr,
+                     "oracle label-only control requires oracle prefetch order\n");
+        return 1;
+    }
+    if (have_false_stats_cluster_members &&
+        cfg.safein_prefetch_order == SafeInPrefetchOrder::Oracle) {
+        cfg.oracle_cluster_members = &false_stats_cluster_members;
+    } else if (have_false_stats_cluster_members) {
         cfg.false_stats_cluster_members = &false_stats_cluster_members;
+    }
+    if (cfg.safein_prefetch_order == SafeInPrefetchOrder::Oracle &&
+        (gt.empty() || !have_false_stats_cluster_members)) {
+        std::fprintf(stderr,
+                     "oracle SafeIn prefetch requires GT and SafeIn cluster members\n");
+        return 1;
     }
 
     std::vector<VectorReadTraceEntry> vector_read_trace;
@@ -2075,12 +3011,12 @@ int main(int argc, char** argv) {
     std::vector<vdb::query::SafeInConfidenceTraceEntry> safein_confidence_trace;
     if (!safein_confidence_trace_path.empty()) {
         if (cfg.materialization_mode != MaterializationMode::Late ||
-            cfg.non_safeout_candidate_budget != 0 || gt.empty() ||
+            gt.empty() ||
             !have_false_stats_cluster_members) {
             std::fprintf(
                 stderr,
                 "--safein-confidence-trace requires materialization-mode=late, "
-                "non-safeout-candidate-budget=0, GT, and SafeIn cluster members\n");
+                "GT, and SafeIn cluster members\n");
             return 1;
         }
         safein_confidence_trace.reserve(static_cast<size_t>(queries.rows) * 256u);
@@ -2091,11 +3027,11 @@ int main(int argc, char** argv) {
         if (!use_inline_hot_record_store ||
             cfg.materialization_mode != MaterializationMode::EagerSafeIn ||
             cfg.execution_mode != QueryExecutionMode::Overlap ||
-            cfg.non_safeout_candidate_budget != 0 ||
             cfg.safein_prefetch_max_count != 0 ||
             cfg.safein_prefetch_max_bytes != 0 ||
             cfg.safein_query_extra_bytes != 0 ||
             cfg.safein_max_full_payload_bytes != 0 ||
+            cfg.enable_safein_cold_payload_prefetch ||
             cfg.safein_prefetch_order != SafeInPrefetchOrder::Arrival ||
             cfg.safein_prefetch_global_window != 0 ||
             cfg.safein_bextra_bytes_per_ms <= 0.0 ||
@@ -2127,8 +3063,60 @@ int main(int argc, char** argv) {
             prepared ? "prepared" : "skipped", two_level_coarse_warmup_ms);
     }
 
+    std::unique_ptr<IoUringReader> optional_payload_reader;
+    Status optional_file_registration = Status::OK();
+    if (cfg.enable_safein_optional_io_isolation) {
+        optional_payload_reader = std::make_unique<IoUringReader>();
+        vdb::query::IoUringInitOptions optional_ring_options;
+        optional_ring_options.use_iopoll = iopoll;
+        optional_ring_options.use_sqpoll = sqpoll;
+        optional_ring_options.use_defer_taskrun =
+            cfg.safein_optional_io_defer_taskrun;
+        optional_payload_reader->SetForceAsync(
+            cfg.safein_optional_io_force_async);
+        const auto optional_status = optional_payload_reader->Init(
+            cfg.safein_optional_io_queue_depth,
+            std::max<uint32_t>(64u,
+                               cfg.safein_optional_io_queue_depth * 4u),
+            optional_ring_options);
+        if (!optional_status.ok()) {
+            std::fprintf(stderr,
+                         "Optional payload IoUring init failed: %s\n",
+                         optional_status.ToString().c_str());
+            return 1;
+        }
+        std::vector<int> optional_fds;
+        auto add_optional_fd = [&](int fd) {
+            if (fd >= 0 &&
+                std::find(optional_fds.begin(), optional_fds.end(), fd) ==
+                    optional_fds.end()) {
+                optional_fds.push_back(fd);
+            }
+        };
+        add_optional_fd(cfg.separate_record_store.payload_fd);
+        add_optional_fd(cfg.inline_hot_record_store.cold_payload_fd);
+        add_optional_fd(cfg.inline_hot_record_store.buffered_hot_record_fd);
+        if (!optional_fds.empty()) {
+            optional_file_registration = optional_payload_reader->RegisterFiles(
+                optional_fds.data(),
+                static_cast<uint32_t>(optional_fds.size()));
+            if (!optional_file_registration.ok()) {
+                Log("  optional payload fixed-file registration disabled: %s\n",
+                    optional_file_registration.ToString().c_str());
+            }
+        }
+    }
+
     std::unique_ptr<OverlapScheduler> scheduler;
-    if (data_reader) {
+    if (optional_payload_reader) {
+        vdb::query::AsyncReader& mandatory_data_reader =
+            data_reader
+                ? static_cast<vdb::query::AsyncReader&>(*data_reader)
+                : static_cast<vdb::query::AsyncReader&>(cluster_reader);
+        scheduler = std::make_unique<OverlapScheduler>(
+            index, cluster_reader, mandatory_data_reader,
+            *optional_payload_reader, cfg);
+    } else if (data_reader) {
         scheduler = std::make_unique<OverlapScheduler>(
             index, cluster_reader, *data_reader, cfg);
     } else {
@@ -2143,6 +3131,15 @@ int main(int argc, char** argv) {
         effective_data_reader.iopoll_enabled() ? 1 : 0,
         effective_data_reader.registered_files_enabled() ? 1 : 0,
         scheduler->fixed_vec_buffers_enabled() ? 1 : 0);
+    if (optional_payload_reader) {
+        Log("  optional io_uring actual: defer_taskrun=%d force_async=%d "
+            "sqpoll=%d iopoll=%d fixed_files=%d\n",
+            optional_payload_reader->defer_taskrun_enabled() ? 1 : 0,
+            optional_payload_reader->force_async_enabled() ? 1 : 0,
+            optional_payload_reader->sqpoll_enabled() ? 1 : 0,
+            optional_payload_reader->iopoll_enabled() ? 1 : 0,
+            optional_payload_reader->registered_files_enabled() ? 1 : 0);
+    }
 
     std::vector<std::unordered_set<uint32_t>> false_stats_truth_sets;
     if (have_false_stats_cluster_members && !false_stats_image_id_to_row.empty() &&
@@ -2159,15 +3156,63 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (payload_cache_mode == "drop-before-queries" ||
+        payload_cache_mode == "drop-record-files-before-queries") {
+        std::unordered_set<int> payload_fds;
+        if (inline_cold_payload_fd >= 0) {
+            payload_fds.insert(inline_cold_payload_fd);
+        }
+        if (separate_payload_fd >= 0) {
+            payload_fds.insert(separate_payload_fd);
+        }
+        if (payload_cache_mode == "drop-record-files-before-queries") {
+            const int combined_data_fd = index.segment().data_reader().fd();
+            if (combined_data_fd >= 0) {
+                payload_fds.insert(combined_data_fd);
+            }
+            if (inline_buffered_hot_record_fd >= 0) {
+                payload_fds.insert(inline_buffered_hot_record_fd);
+            }
+            if (separate_vector_fd >= 0) {
+                payload_fds.insert(separate_vector_fd);
+            }
+        }
+        if (payload_fds.empty()) {
+            std::fprintf(stderr,
+                         "drop-before-queries requires a cold/separate payload fd\n");
+            return 1;
+        }
+        for (int fd : payload_fds) {
+            const int rc = ::posix_fadvise(
+                fd, 0, 0, POSIX_FADV_DONTNEED);
+            if (rc != 0) {
+                std::fprintf(stderr,
+                             "posix_fadvise(POSIX_FADV_DONTNEED) failed: %s\n",
+                             std::strerror(rc));
+                return 1;
+            }
+        }
+        Log("  Record cache mode %s: dropped before query batch (%zu fd%s)\n",
+            payload_cache_mode.c_str(), payload_fds.size(),
+            payload_fds.size() == 1 ? "" : "s");
+    }
+
     QueryMetrics metrics;
     ProcRss peak_during_query = ReadProcRss();
     Log("\n[Query] Running %u queries...\n", queries.rows);
     for (uint32_t qi = 0; qi < queries.rows; ++qi) {
         const float* q = queries.data.data() + static_cast<size_t>(qi) * queries.cols;
         if (!false_stats_truth_sets.empty() && qi < false_stats_truth_sets.size()) {
-            scheduler->SetFalseStatsTrueTopKRows(&false_stats_truth_sets[qi]);
+            if (cfg.safein_prefetch_order == SafeInPrefetchOrder::Oracle) {
+                scheduler->SetOracleTrueTopKRows(&false_stats_truth_sets[qi]);
+                scheduler->SetFalseStatsTrueTopKRows(nullptr);
+            } else {
+                scheduler->SetFalseStatsTrueTopKRows(&false_stats_truth_sets[qi]);
+                scheduler->SetOracleTrueTopKRows(nullptr);
+            }
         } else {
             scheduler->SetFalseStatsTrueTopKRows(nullptr);
+            scheduler->SetOracleTrueTopKRows(nullptr);
         }
         scheduler->SetVectorReadTraceQueryIndex(qi);
         SearchResults results = scheduler->Search(q);
@@ -2199,11 +3244,16 @@ int main(int argc, char** argv) {
                          vector_read_trace_path.c_str());
             return 1;
         }
-        trace << "query_index,request_index,combined_offset,read_length,request_type\n";
+        trace << "query_index,request_index,flush_index,cluster_id,"
+                 "combined_offset,physical_offset,read_length,request_type,"
+                 "selected_topk\n";
         for (const auto& entry : vector_read_trace) {
             trace << entry.query_index << ',' << entry.request_index << ','
-                  << entry.combined_offset << ',' << entry.read_length << ','
-                  << static_cast<uint32_t>(entry.request_type) << '\n';
+                  << entry.flush_index << ',' << entry.cluster_id << ','
+                  << entry.combined_offset << ',' << entry.physical_offset << ','
+                  << entry.read_length << ','
+                  << static_cast<uint32_t>(entry.request_type) << ','
+                  << static_cast<uint32_t>(entry.selected_topk) << '\n';
         }
         Log("  Vector read trace: %s (%zu records)\n",
             vector_read_trace_path.c_str(), vector_read_trace.size());
@@ -2387,6 +3437,26 @@ int main(int argc, char** argv) {
                          effective_data_reader.registered_files_enabled()) << ",\n";
     f << "    " << JBool("io_uring_registered_buffers_enabled",
                          effective_data_reader.registered_buffers_enabled()) << ",\n";
+    f << "    " << JBool("optional_io_uring_enabled",
+                         optional_payload_reader != nullptr) << ",\n";
+    f << "    " << JBool(
+        "optional_io_uring_defer_taskrun_enabled",
+        optional_payload_reader != nullptr &&
+            optional_payload_reader->defer_taskrun_enabled()) << ",\n";
+    f << "    " << JBool(
+        "optional_io_uring_force_async_enabled",
+        optional_payload_reader != nullptr &&
+            optional_payload_reader->force_async_enabled()) << ",\n";
+    f << "    " << JBool("optional_io_uring_sqpoll_enabled",
+                         optional_payload_reader != nullptr &&
+                             optional_payload_reader->sqpoll_enabled()) << ",\n";
+    f << "    " << JBool("optional_io_uring_iopoll_enabled",
+                         optional_payload_reader != nullptr &&
+                             optional_payload_reader->iopoll_enabled()) << ",\n";
+    f << "    " << JBool(
+        "optional_io_uring_registered_files_enabled",
+        optional_payload_reader != nullptr &&
+            optional_payload_reader->registered_files_enabled()) << ",\n";
     f << "    " << JBool("fixed_vec_buffers_enabled",
                          scheduler->fixed_vec_buffers_enabled()) << ",\n";
     f << "    " << JInt("fixed_vec_buffer_count",
@@ -2398,8 +3468,22 @@ int main(int argc, char** argv) {
                          cfg.enable_vec_span_coalescing) << ",\n";
     f << "    " << JInt("vec_span_tile_bytes",
                          cfg.vec_span_tile_bytes) << ",\n";
+    f << "    " << JStr("vec_span_planner_mode",
+                         SpanPlannerModeName(cfg.vec_span_planner_mode)) << ",\n";
+    f << "    " << JInt("vec_span_alpha_num", cfg.vec_span_alpha_num) << ",\n";
+    f << "    " << JInt("vec_span_alpha_den", cfg.vec_span_alpha_den) << ",\n";
+    f << "    " << JInt("vec_span_safein_rho_num",
+                         cfg.vec_span_safein_rho_num) << ",\n";
+    f << "    " << JInt("vec_span_safein_rho_den",
+                         cfg.vec_span_safein_rho_den) << ",\n";
     f << "    " << JNum("vec_span_max_byte_amplification",
                          cfg.vec_span_max_byte_amplification) << ",\n";
+    f << "    " << JBool("vec_span_payload_reuse_enabled",
+                         cfg.enable_vec_span_payload_reuse) << ",\n";
+    f << "    " << JBool("vec_span_payload_compact_enabled",
+                         cfg.compact_vec_span_payload_reuse) << ",\n";
+    f << "    " << JInt("vec_span_safein_tail_count",
+                         cfg.vec_span_safein_tail_count) << ",\n";
     f << "    " << JStr("submission_mode", submission_mode) << ",\n";
     f << "    " << JStr("execution_mode",
                         QueryExecutionModeName(cfg.execution_mode)) << ",\n";
@@ -2476,6 +3560,26 @@ int main(int argc, char** argv) {
                             result_layout))) << ",\n";
     f << "    " << JStr("rabitq_format_key",
 		                        RaBitQFormatKey(result_rabitq_cfg)) << ",\n";
+    f << "    " << JBool("dynamic_safeout_enabled",
+                         cfg.enable_dynamic_safeout) << ",\n";
+    f << "    " << JBool("rabitq_pcve_requested",
+                         !pcve_profile_path.empty()) << ",\n";
+    f << "    " << JBool("rabitq_pcve_profile_valid",
+                         pcve_profile_valid) << ",\n";
+    f << "    " << JBool("rabitq_pcve_verify_all_fallback",
+                         pcve_verify_all_fallback) << ",\n";
+    f << "    " << JStr("rabitq_pcve_profile_path",
+                        pcve_profile_path) << ",\n";
+    f << "    " << JStr("rabitq_pcve_profile_error",
+                        pcve_profile_error) << ",\n";
+    f << "    " << JNum("rabitq_pcve_s1_epsilon_lower",
+                        pcve_profile_valid ? pcve_profile.stage1_epsilon_lower : -1.0) << ",\n";
+    f << "    " << JNum("rabitq_pcve_s1_epsilon_upper",
+                        pcve_profile_valid ? pcve_profile.stage1_epsilon_upper : -1.0) << ",\n";
+    f << "    " << JNum("rabitq_pcve_s2_epsilon_lower",
+                        pcve_profile_valid ? pcve_profile.stage2_epsilon_lower : -1.0) << ",\n";
+    f << "    " << JNum("rabitq_pcve_s2_epsilon_upper",
+                        pcve_profile_valid ? pcve_profile.stage2_epsilon_upper : -1.0) << ",\n";
     f << "    " << JStr("dynamic_safein_mode",
                         cfg.dynamic_safein_mode == DynamicSafeInMode::Frontier
                             ? "frontier"
@@ -2494,8 +3598,6 @@ int main(int argc, char** argv) {
                          cfg.dynamic_safein_defer_until_ready) << ",\n";
     f << "    " << JInt("dynamic_safein_defer_max_candidates",
                         cfg.dynamic_safein_defer_max_candidates) << ",\n";
-    f << "    " << JInt("non_safeout_candidate_budget",
-                        cfg.non_safeout_candidate_budget) << ",\n";
     f << "    " << JStr("materialization_mode",
                         MaterializationModeName(cfg.materialization_mode)) << ",\n";
     f << "    " << JBool("late_materialization_enabled",
@@ -2510,8 +3612,14 @@ int main(int argc, char** argv) {
                         static_cast<int64_t>(cfg.safein_prefetch_max_bytes)) << ",\n";
     f << "    " << JInt("safein_prefetch_emit_quantum",
                         cfg.safein_prefetch_emit_quantum) << ",\n";
+    f << "    " << JInt("safein_prefetch_emit_reserve",
+                        cfg.safein_prefetch_emit_reserve) << ",\n";
     f << "    " << JStr("safein_prefetch_order",
                         safein_prefetch_order) << ",\n";
+    f << "    " << JBool("oracle_prefetch_label_only",
+                         cfg.oracle_prefetch_label_only) << ",\n";
+    f << "    " << JStr("payload_cache_mode",
+                        payload_cache_mode) << ",\n";
     f << "    " << JInt("safein_prefetch_rank_batch_size",
                         cfg.safein_prefetch_rank_batch_size) << ",\n";
     f << "    " << JInt("safein_prefetch_global_window",
@@ -2520,16 +3628,47 @@ int main(int argc, char** argv) {
                         static_cast<int64_t>(cfg.safein_query_extra_bytes)) << ",\n";
     f << "    " << JInt("safein_max_full_payload_bytes",
                         cfg.safein_max_full_payload_bytes) << ",\n";
+    f << "    " << JBool("safein_cold_payload_prefetch",
+                         cfg.enable_safein_cold_payload_prefetch) << ",\n";
+    f << "    " << JInt("safein_cold_payload_prefix_bytes",
+                        cfg.safein_cold_payload_prefix_bytes) << ",\n";
+    f << "    " << JBool("safein_optional_io_isolation",
+                         cfg.enable_safein_optional_io_isolation) << ",\n";
+    f << "    " << JBool("safein_optional_io_detailed_timing",
+                         cfg.enable_safein_optional_io_detailed_timing)
+      << ",\n";
+    f << "    " << JBool("safein_optional_io_timeline",
+                         cfg.enable_safein_optional_io_timeline)
+      << ",\n";
+    f << "    " << JBool("pipeline_io_detailed_timing",
+                         cfg.enable_pipeline_io_detailed_timing)
+      << ",\n";
+    f << "    " << JBool("safein_optional_io_defer_taskrun_requested",
+                         cfg.safein_optional_io_defer_taskrun) << ",\n";
+    f << "    " << JBool("safein_optional_io_force_async_requested",
+                         cfg.safein_optional_io_force_async) << ",\n";
+    f << "    " << JBool("safein_optional_io_refill_only_polling",
+                         cfg.enable_safein_optional_io_refill_only_polling)
+      << ",\n";
+    f << "    " << JInt("safein_optional_io_queue_depth",
+                        cfg.safein_optional_io_queue_depth) << ",\n";
+    f << "    " << JInt("safein_optional_io_max_inflight",
+                        cfg.safein_optional_io_max_inflight) << ",\n";
+    f << "    " << JInt("safein_optional_io_mandatory_low_watermark",
+                        cfg.safein_optional_io_mandatory_low_watermark)
+      << ",\n";
+    f << "    " << JInt("safein_optional_io_min_remaining_probes",
+                        cfg.safein_optional_io_min_remaining_probes) << ",\n";
+    f << "    " << JBool("safein_reusable_payload_buffer",
+                         cfg.enable_safein_reusable_payload_buffer) << ",\n";
+    f << "    " << JInt("safein_reusable_payload_buffer_max_bytes",
+                        cfg.safein_reusable_payload_buffer_max_bytes) << ",\n";
     f << "    " << JBool("safein_bextra_probe_budget",
                          cfg.enable_safein_bextra_probe_budget) << ",\n";
     f << "    " << JNum("safein_bextra_rho",
                         cfg.safein_bextra_rho) << ",\n";
     f << "    " << JNum("safein_bextra_bytes_per_ms",
                         cfg.safein_bextra_bytes_per_ms) << ",\n";
-    f << "    " << JInt("budgeted_prefetch_limit",
-                        cfg.budgeted_prefetch_limit) << ",\n";
-    f << "    " << JInt("effective_budgeted_prefetch_limit",
-                        cfg.budgeted_prefetch_limit) << ",\n";
     f << "    " << JStr("safein_confidence_primary_score",
                         "normalized_slack_error") << ",\n";
     f << "    " << JNum("loaded_safeout_epsilon",
@@ -2574,6 +3713,42 @@ int main(int argc, char** argv) {
                         metrics.vec_span_candidates * inv_q) << ",\n";
     f << "    " << JNum("avg_vec_span_read_bytes",
                         metrics.vec_span_read_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_payload_views",
+                        metrics.vec_span_payload_views * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_payload_view_bytes",
+                        metrics.vec_span_payload_view_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_payload_retained_bytes",
+                        metrics.vec_span_payload_retained_bytes * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_vec_span_payload_reuse_hits",
+                        metrics.vec_span_payload_reuse_hits * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_payload_reuse_bytes",
+                        metrics.vec_span_payload_reuse_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_payload_requests_avoided",
+                        metrics.vec_span_payload_requests_avoided * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_vec_span_safein_tails_extended",
+                        metrics.vec_span_safein_tails_extended * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_vec_span_safein_tail_extra_bytes",
+                        metrics.vec_span_safein_tail_extra_bytes * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_calls", metrics.vec_span_planner_calls * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_runs", metrics.vec_span_planner_runs * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_candidates", metrics.vec_span_planner_candidates * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_groups", metrics.vec_span_planner_groups * inv_q) << ",\n";
+    f << "    " << JInt("vec_span_planner_max_run", metrics.vec_span_planner_max_run) << ",\n";
+    f << "    " << JNum("avg_vec_span_planned_physical_bytes", metrics.vec_span_planned_physical_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_planned_vector_bytes", metrics.vec_span_planned_vector_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_credit_bytes", metrics.vec_span_planner_credit_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_admission_checks", metrics.vec_span_planner_admission_checks * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_fenwick_queries", metrics.vec_span_planner_fenwick_queries * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_fenwick_updates", metrics.vec_span_planner_fenwick_updates * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_workspace_growths", metrics.vec_span_planner_workspace_growths * inv_q) << ",\n";
+    f << "    \"vec_span_planner_plan_hash_xor\": " << metrics.vec_span_planner_plan_hash << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_fallbacks", metrics.vec_span_planner_fallbacks * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_planner_ms", metrics.vec_span_planner_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_vec_span_sort_ms", metrics.vec_span_sort_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_all_read_bytes", metrics.all_read_bytes * inv_q) << ",\n";
     f << "    " << JNum("avg_payload_read_bytes", metrics.payload_read_bytes * inv_q) << ",\n";
     f << "    " << JNum("avg_safein_prefix_read_requests",
@@ -2603,26 +3778,6 @@ int main(int argc, char** argv) {
                         metrics.serial_full_record_read_bytes * inv_q) << ",\n";
     f << "    " << JNum("avg_serial_payload_read_bytes",
                         metrics.serial_payload_read_bytes * inv_q) << ",\n";
-    f << "    " << JNum("avg_budgeted_prefetch_considered",
-                        metrics.budgeted_prefetch_considered * inv_q) << ",\n";
-    f << "    " << JNum("avg_budgeted_prefetch_scheduled",
-                        metrics.budgeted_prefetch_scheduled * inv_q) << ",\n";
-    f << "    " << JNum("avg_budgeted_prefetch_duplicates",
-                        metrics.budgeted_prefetch_duplicates * inv_q) << ",\n";
-    f << "    " << JNum("avg_budgeted_prefetch_skipped_limit",
-                        metrics.budgeted_prefetch_skipped_limit * inv_q) << ",\n";
-    f << "    " << JNum("avg_budgeted_prefetch_completed",
-                        metrics.budgeted_prefetch_completed * inv_q) << ",\n";
-    f << "    " << JNum("avg_budgeted_prefetch_cache_hits",
-                        metrics.budgeted_prefetch_cache_hits * inv_q) << ",\n";
-    f << "    " << JNum("avg_budgeted_prefetch_inflight_uses",
-                        metrics.budgeted_prefetch_inflight_uses * inv_q) << ",\n";
-    f << "    " << JNum("avg_budgeted_prefetch_used",
-                        metrics.budgeted_prefetch_used * inv_q) << ",\n";
-    f << "    " << JNum("avg_budgeted_prefetch_wasted",
-                        metrics.budgeted_prefetch_wasted * inv_q) << ",\n";
-    f << "    " << JNum("avg_budgeted_prefetch_read_bytes",
-                        metrics.budgeted_prefetch_read_bytes * inv_q) << ",\n";
     f << "    " << JNum("avg_safein_prefetch_considered",
                         metrics.safein_prefetch_considered * inv_q) << ",\n";
     f << "    " << JNum("avg_safein_prefetch_candidates",
@@ -2649,6 +3804,183 @@ int main(int argc, char** argv) {
                         metrics.safein_prefetch_skipped_byte_limit * inv_q) << ",\n";
     f << "    " << JNum("avg_safein_prefetch_scheduled_bytes",
                         metrics.safein_prefetch_scheduled_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_cold_prefetch_requests",
+                        metrics.safein_cold_prefetch_requests * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_cold_prefetch_full_payloads",
+                        metrics.safein_cold_prefetch_full_payloads * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_cold_prefetch_bytes",
+                        metrics.safein_cold_prefetch_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_cold_prefetch_used_bytes",
+                        metrics.safein_cold_prefetch_used_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_cold_prefetch_wasted_bytes",
+                        metrics.safein_cold_prefetch_wasted_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_queued",
+                        metrics.safein_optional_io_queued * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_submitted",
+                        metrics.safein_optional_io_submitted * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_completed",
+                        metrics.safein_optional_io_completed * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_dropped_late",
+                        metrics.safein_optional_io_dropped_late * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_submitted_bytes",
+                        metrics.safein_optional_io_submitted_bytes * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_completed_bytes",
+                        metrics.safein_optional_io_completed_bytes * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_submit_calls",
+                        metrics.safein_optional_io_submit_calls * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_sqes_per_submit",
+                        metrics.safein_optional_io_submit_calls > 0
+                            ? static_cast<double>(
+                                  metrics.safein_optional_io_submitted) /
+                                  metrics.safein_optional_io_submit_calls
+                            : 0.0) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_nonblocking_poll_calls",
+                        metrics.safein_optional_io_nonblocking_poll_calls *
+                            inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_empty_polls",
+                        metrics.safein_optional_io_empty_polls * inv_q)
+      << ",\n";
+    f << "    " << JNum("safein_optional_io_empty_poll_rate",
+                        metrics.safein_optional_io_nonblocking_poll_calls > 0
+                            ? static_cast<double>(
+                                  metrics.safein_optional_io_empty_polls) /
+                                  metrics.safein_optional_io_nonblocking_poll_calls
+                            : 0.0) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_cqes_per_poll",
+                        metrics.safein_optional_io_nonblocking_poll_calls > 0
+                            ? static_cast<double>(
+                                  metrics.safein_optional_io_poll_completions) /
+                                  metrics.safein_optional_io_nonblocking_poll_calls
+                            : 0.0) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_get_events_calls",
+                        metrics.safein_optional_io_get_events_calls * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_completed_before_probe_end",
+                        metrics.safein_optional_io_completed_before_probe_end *
+                            inv_q) << ",\n";
+    f << "    " << JNum(
+        "avg_safein_optional_io_completed_bytes_before_probe_end",
+        metrics.safein_optional_io_completed_bytes_before_probe_end * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_completed_in_final_drain",
+                        metrics.safein_optional_io_completed_in_final_drain *
+                            inv_q) << ",\n";
+    f << "    " << JNum(
+        "avg_safein_optional_io_completed_bytes_in_final_drain",
+        metrics.safein_optional_io_completed_bytes_in_final_drain * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_completed_in_optional_drain",
+                        metrics.safein_optional_io_completed_in_optional_drain *
+                            inv_q) << ",\n";
+    f << "    " << JNum(
+        "avg_safein_optional_io_completed_bytes_in_optional_drain",
+        metrics.safein_optional_io_completed_bytes_in_optional_drain * inv_q)
+      << ",\n";
+    const double optional_timeline_inv =
+        metrics.safein_optional_io_timeline_queries > 0
+            ? 1.0 / static_cast<double>(
+                  metrics.safein_optional_io_timeline_queries)
+            : 0.0;
+    const double optional_submit_timeline_inv =
+        metrics.safein_optional_io_timeline_submit_queries > 0
+            ? 1.0 / static_cast<double>(
+                  metrics.safein_optional_io_timeline_submit_queries)
+            : 0.0;
+    const double optional_completion_timeline_inv =
+        metrics.safein_optional_io_timeline_completion_queries > 0
+            ? 1.0 / static_cast<double>(
+                  metrics.safein_optional_io_timeline_completion_queries)
+            : 0.0;
+    f << "    " << JInt("safein_optional_io_timeline_queries",
+                        static_cast<int64_t>(
+                            metrics.safein_optional_io_timeline_queries))
+      << ",\n";
+    f << "    " << JInt("safein_optional_io_timeline_submit_queries",
+                        static_cast<int64_t>(
+                            metrics.safein_optional_io_timeline_submit_queries))
+      << ",\n";
+    f << "    " << JInt(
+        "safein_optional_io_timeline_completion_queries",
+        static_cast<int64_t>(
+            metrics.safein_optional_io_timeline_completion_queries))
+      << ",\n";
+    f << "    " << JNum(
+        "avg_safein_optional_io_first_submit_probes_remaining",
+        metrics.safein_optional_io_first_submit_probes_remaining *
+            optional_submit_timeline_inv) << ",\n";
+    f << "    " << JNum(
+        "avg_safein_optional_io_first_submit_clusters_processed",
+        metrics.safein_optional_io_first_submit_clusters_processed *
+            optional_submit_timeline_inv) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_inflight_at_probe_end",
+                        metrics.safein_optional_io_inflight_at_probe_end *
+                            optional_timeline_inv) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_prepped_at_probe_end",
+                        metrics.safein_optional_io_prepped_at_probe_end *
+                            optional_timeline_inv) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_pending_at_probe_end",
+                        metrics.safein_optional_io_pending_at_probe_end *
+                            optional_timeline_inv) << ",\n";
+    f << "    " << JNum(
+        "avg_safein_optional_io_inflight_at_final_drain_start",
+        metrics.safein_optional_io_inflight_at_final_drain_start *
+            optional_timeline_inv) << ",\n";
+    f << "    " << JNum(
+        "avg_safein_optional_io_inflight_at_optional_drain_start",
+        metrics.safein_optional_io_inflight_at_optional_drain_start *
+            optional_timeline_inv) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_blocked_mandatory_calls",
+                        metrics.safein_optional_io_blocked_mandatory_calls *
+                            inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_blocked_max_inflight_calls",
+                        metrics.safein_optional_io_blocked_max_inflight_calls *
+                            inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_blocked_short_window_calls",
+                        metrics.safein_optional_io_blocked_short_window_calls *
+                            inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_first_queue_offset_us",
+                        metrics.safein_optional_io_first_queue_offset_us *
+                            optional_timeline_inv) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_first_submit_offset_us",
+                        metrics.safein_optional_io_first_submit_offset_us *
+                            optional_submit_timeline_inv) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_last_submit_offset_us",
+                        metrics.safein_optional_io_last_submit_offset_us *
+                            optional_submit_timeline_inv) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_queue_to_submit_us",
+                        metrics.safein_optional_io_queue_to_submit_us *
+                            optional_submit_timeline_inv) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_probe_end_offset_us",
+                        metrics.safein_optional_io_probe_end_offset_us *
+                            optional_timeline_inv) << ",\n";
+    f << "    " << JNum(
+        "avg_safein_optional_io_first_submit_to_probe_end_us",
+        metrics.safein_optional_io_first_submit_to_probe_end_us *
+            optional_submit_timeline_inv) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_first_completion_offset_us",
+                        metrics.safein_optional_io_first_completion_offset_us *
+                            optional_completion_timeline_inv) << ",\n";
+    f << "    " << JNum("safein_optional_io_submit_to_cqe_p50_us",
+        OptionalLatencyHistogramQuantileUs(
+            metrics.safein_optional_io_submit_to_cqe_histogram, 0.50))
+      << ",\n";
+    f << "    " << JNum("safein_optional_io_submit_to_cqe_p95_us",
+        OptionalLatencyHistogramQuantileUs(
+            metrics.safein_optional_io_submit_to_cqe_histogram, 0.95))
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_submit_to_cqe_samples",
+        std::accumulate(
+            metrics.safein_optional_io_submit_to_cqe_histogram.begin(),
+            metrics.safein_optional_io_submit_to_cqe_histogram.end(),
+            uint64_t{0}) * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_payload_buffer_reuses",
+                        metrics.safein_payload_buffer_reuses * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_payload_prefix_copy_bytes_avoided",
+                        metrics.safein_payload_prefix_copy_bytes_avoided * inv_q)
+      << ",\n";
     f << "    " << JNum("avg_bextra_windows",
                         metrics.bextra_windows * inv_q) << ",\n";
     f << "    " << JNum("avg_bextra_eligible_candidates",
@@ -2681,12 +4013,6 @@ int main(int argc, char** argv) {
                         metrics.dynamic_safein_deferred_flushes * inv_q) << ",\n";
     f << "    " << JNum("avg_dynamic_safein_deferred_safein",
                         metrics.dynamic_safein_deferred_safein * inv_q) << ",\n";
-    f << "    " << JNum("avg_candidate_budget_seen",
-                        metrics.candidate_budget_seen * inv_q) << ",\n";
-    f << "    " << JNum("avg_candidate_budget_selected",
-                        metrics.candidate_budget_selected * inv_q) << ",\n";
-    f << "    " << JNum("avg_candidate_budget_dropped",
-                        metrics.candidate_budget_dropped * inv_q) << ",\n";
     f << "    " << JNum("avg_unique_fetch_candidates",
                         metrics.unique_fetch_candidates * inv_q) << ",\n";
     f << "    " << JNum("avg_total_io_submitted",
@@ -2711,6 +4037,71 @@ int main(int argc, char** argv) {
                         metrics.inline_cold_payload_deferred * inv_q) << ",\n";
     f << "    " << JNum("avg_inline_payload_cache_hits",
                         metrics.inline_payload_cache_hits * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_prepared",
+                        metrics.mandatory_io_prepared * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_prepared_bytes",
+                        metrics.mandatory_io_prepared_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_explicit_submitted",
+                        metrics.mandatory_io_explicit_submitted * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_submit_calls",
+                        metrics.mandatory_io_submit_calls * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_nonblocking_poll_calls",
+                        metrics.mandatory_io_nonblocking_poll_calls * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_wait_poll_calls",
+                        metrics.mandatory_io_wait_poll_calls * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_empty_polls",
+                        metrics.mandatory_io_empty_polls * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_poll_completions",
+                        metrics.mandatory_io_poll_completions * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_get_events_calls",
+                        metrics.mandatory_io_get_events_calls * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_completed",
+                        metrics.mandatory_io_completed * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_completed_bytes",
+                        metrics.mandatory_io_completed_bytes * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_completed_before_probe_end",
+                        metrics.mandatory_io_completed_before_probe_end * inv_q)
+      << ",\n";
+    f << "    " << JNum(
+        "avg_mandatory_io_completed_bytes_before_probe_end",
+        metrics.mandatory_io_completed_bytes_before_probe_end * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_completed_in_final_drain",
+                        metrics.mandatory_io_completed_in_final_drain * inv_q)
+      << ",\n";
+    f << "    " << JNum(
+        "avg_mandatory_io_completed_bytes_in_final_drain",
+        metrics.mandatory_io_completed_bytes_in_final_drain * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_inflight_at_probe_end",
+                        metrics.mandatory_io_inflight_at_probe_end * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_prepped_at_probe_end",
+                        metrics.mandatory_io_prepped_at_probe_end * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_pending_at_probe_end",
+                        metrics.mandatory_io_pending_at_probe_end * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_final_payload_io_prepared",
+                        metrics.final_payload_io_prepared * inv_q) << ",\n";
+    f << "    " << JNum("avg_final_payload_io_prepared_bytes",
+                        metrics.final_payload_io_prepared_bytes * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_final_payload_io_explicit_submitted",
+                        metrics.final_payload_io_explicit_submitted * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_final_payload_io_submit_calls",
+                        metrics.final_payload_io_submit_calls * inv_q) << ",\n";
+    f << "    " << JNum("avg_final_payload_io_wait_poll_calls",
+                        metrics.final_payload_io_wait_poll_calls * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_final_payload_io_nonblocking_poll_calls",
+                        metrics.final_payload_io_nonblocking_poll_calls * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_final_payload_io_completions",
+                        metrics.final_payload_io_completions * inv_q) << ",\n";
     f << "    " << JNum("avg_rabitq_active_bits_per_lane",
                         metrics.stage2_lanes_requested > 0
                             ? static_cast<double>(metrics.stage2_active_ex_bits_sum) /
@@ -2726,6 +4117,24 @@ int main(int argc, char** argv) {
                                   1.0
                             : 0.0) << ",\n";
     f << "    " << JNum("avg_probe_ms", metrics.probe_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_loop_wall_ms",
+                        metrics.probe_loop_wall_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_cluster_wall_ms",
+                        metrics.probe_cluster_wall_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_loop_scheduler_ms",
+                        metrics.probe_loop_scheduler_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_first_submit_offset_us",
+                        metrics.mandatory_io_first_submit_offset_us * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_last_submit_offset_us",
+                        metrics.mandatory_io_last_submit_offset_us * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_first_completion_offset_us",
+                        metrics.mandatory_io_first_completion_offset_us * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_probe_end_offset_us",
+                        metrics.mandatory_io_probe_end_offset_us * inv_q)
+      << ",\n";
     f << "    " << JNum("avg_coarse_select_ms", metrics.coarse_select_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_coarse_score_ms", metrics.coarse_score_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_coarse_topn_ms", metrics.coarse_topn_ms * inv_q) << ",\n";
@@ -2741,8 +4150,79 @@ int main(int argc, char** argv) {
     f << "    " << JNum("avg_probe_stage2_ms", metrics.stage2_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_probe_stage2_decode_ms", metrics.stage2_decode_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_probe_submit_ms", metrics.submit_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_submit_prepare_vec_only_ms",
+                        metrics.submit_prepare_vec_only_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_submit_prepare_all_ms",
+                        metrics.submit_prepare_all_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_submit_emit_ms",
+                        metrics.submit_emit_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_submit_vec_only_emit_ms",
+                        metrics.submit_vec_only_emit_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_submit_pending_slot_alloc_ms",
+                        metrics.submit_pending_slot_alloc_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_probe_submit_prep_read_ms",
+                        metrics.submit_prep_read_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_rerank_compute_ms", metrics.rerank_compute_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_fetch_missing_ms", metrics.fetch_missing_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_prepare_ms",
+                        metrics.safein_optional_io_prepare_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_submit_ms",
+                        metrics.safein_optional_io_submit_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_completion_cpu_ms",
+                        metrics.safein_optional_io_completion_cpu_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_wait_ms",
+                        metrics.safein_optional_io_wait_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_nonblocking_poll_ms",
+                        metrics.safein_optional_io_nonblocking_poll_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_get_events_ms",
+                        metrics.safein_optional_io_get_events_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_final_drain_poll_ms",
+                        metrics.safein_optional_io_final_drain_poll_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_safein_optional_io_drain_ms",
+                        metrics.safein_optional_io_drain_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_submit_ms",
+                        metrics.mandatory_io_submit_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_nonblocking_poll_ms",
+                        metrics.mandatory_io_nonblocking_poll_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_get_events_ms",
+                        metrics.mandatory_io_get_events_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_wait_ms",
+                        metrics.mandatory_io_wait_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_mandatory_io_completion_cpu_ms",
+                        metrics.mandatory_io_completion_cpu_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_final_drain_wait_ms",
+                        metrics.mandatory_io_final_drain_wait_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_mandatory_io_final_drain_poll_ms",
+                        metrics.mandatory_io_final_drain_poll_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum(
+        "avg_mandatory_io_final_drain_completion_cpu_ms",
+        metrics.mandatory_io_final_drain_completion_cpu_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_final_payload_resolve_ms",
+                        metrics.final_payload_resolve_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_final_payload_plan_ms",
+                        metrics.final_payload_plan_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_final_payload_sync_prefix_ms",
+                        metrics.final_payload_sync_prefix_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_final_payload_submit_ms",
+                        metrics.final_payload_submit_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_final_payload_wait_ms",
+                        metrics.final_payload_wait_ms * inv_q) << ",\n";
+    f << "    " << JNum("avg_final_payload_nonblocking_poll_ms",
+                        metrics.final_payload_nonblocking_poll_ms * inv_q)
+      << ",\n";
+    f << "    " << JNum("avg_final_payload_completion_cpu_ms",
+                        metrics.final_payload_completion_cpu_ms * inv_q)
+      << ",\n";
     f << "    " << JNum("avg_io_wait_ms", metrics.io_wait_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_final_drain_ms", metrics.final_drain_ms * inv_q) << ",\n";
     f << "    " << JNum("avg_execute_buffered_ms", metrics.execute_buffered_ms * inv_q) << ",\n";

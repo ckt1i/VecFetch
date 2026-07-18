@@ -3,9 +3,7 @@
 ## Overview
 
 End-to-end benchmark infrastructure for vector search, supporting both sliding-window and full-preload cluster loading modes.
-
 ## Requirements
-
 ### Requirement: E2E benchmark output SHALL support `.clu` loading-mode comparison
 The E2E benchmark workflow SHALL support direct before/after comparison between the existing sliding-window `.clu` loading path and the new full-preload `.clu` loading path under the same warm-serving query settings. 对 resident 主路径优化相关实验，benchmark 还 MUST 能在固定参数下输出同口径的 full E2E 结果与 query-only perf 结果，以支持主路径收益归因.
 
@@ -23,6 +21,122 @@ The E2E benchmark workflow SHALL support direct before/after comparison between 
 - **WHEN** `full_preload` mode is benchmarked
 - **THEN** the benchmark output SHALL record the preload time and preload-related resident memory or byte footprint
 - **AND** these fields SHALL be reported alongside the query-speed result rather than omitted
+
+### Requirement: Benchmark cleanup validation SHALL compare against pre-cleanup best results
+After redundant feature removal, benchmark validation SHALL compare the cleaned implementation against the best pre-cleanup result available under the same dataset, index, and frozen query parameters. The validation MUST report recall, average latency or QPS, total probed count, and rerank or candidate count when available.
+
+#### Scenario: Same-index warm validation is executed
+- **WHEN** cleanup implementation is complete
+- **THEN** validation MUST reuse existing indexes rather than rebuilding unless the index is unavailable or incompatible
+- **AND** the benchmark record MUST include enough metadata to identify dataset, index path, active ex-bits, resident ex-bits, nprobe, topk, and two-level routing settings
+
+#### Scenario: Cleanup result is compared with tolerance
+- **WHEN** post-cleanup metrics are compared with pre-cleanup best metrics
+- **THEN** `recall@10` absolute loss MUST NOT exceed `0.002`
+- **AND** average latency MUST NOT regress by more than `3%` unless repeated runs show the difference is within noise
+- **AND** QPS MUST NOT drop by more than `3%` unless repeated runs show the difference is within noise
+
+### Requirement: Benchmark output SHALL remove abandoned feature fields
+Benchmark output SHALL stop treating removed feature-specific fields as formal output schema. It MUST preserve official fields needed for frozen-path comparison and mechanism attribution.
+
+#### Scenario: Removed feature fields are absent
+- **WHEN** benchmark JSON or CSV output is generated after cleanup
+- **THEN** fields dedicated only to Stage2 progressive pruning, Stage1 envelope skip, address sorting, and budgeted early submit MUST NOT be required
+- **AND** parsers used by cleanup validation MUST not fail because those removed fields are absent
+
+#### Scenario: Frozen-path fields are preserved
+- **WHEN** benchmark output is generated after cleanup
+- **THEN** it MUST still include recall, latency or QPS, preload memory when applicable, coarse select time, probe prepare time, Stage1 time, Stage2 time, submit time, total probed count, and rerank or candidate count when applicable
+
+### Requirement: Online benchmark SHALL expose execution-mode selection
+The online benchmark SHALL allow selecting the query execution mode from the command line. The default MUST remain the current overlap pipeline. A `serial-no-overlap` option MUST select the fully staged serial pipeline used for strong No Pipeline ablation.
+
+#### Scenario: Default benchmark remains overlap mode
+- **WHEN** the benchmark is run without an execution-mode option
+- **THEN** it MUST use the existing overlap pipeline behavior
+- **AND** existing scripts that do not request serial no-overlap MUST remain compatible
+
+#### Scenario: Serial no-overlap mode is selectable
+- **WHEN** the benchmark is run with `--execution-mode serial-no-overlap`
+- **THEN** query execution MUST use the serial no-overlap query pipeline
+- **AND** the output metadata MUST record `execution_mode=serial_no_overlap`
+
+### Requirement: Benchmark output SHALL distinguish serial no-overlap from serial drain diagnostics
+Benchmark output SHALL distinguish the strong Serial NoOverlap baseline from weaker diagnostics such as `serial_data_drains`. Results produced by `--serial-data-drain 1` alone MUST NOT be labeled as the strong No Pipeline baseline.
+
+#### Scenario: Serial drain remains separately identified
+- **WHEN** a run uses `--serial-data-drain 1` with default overlap execution mode
+- **THEN** the output MUST record `serial_data_drains=true`
+- **AND** the output MUST NOT record `execution_mode=serial_no_overlap`
+
+#### Scenario: Strong No Pipeline is explicit
+- **WHEN** a run is intended as the strong No Pipeline baseline
+- **THEN** it MUST record `execution_mode=serial_no_overlap`
+- **AND** it MUST record that async candidate-data overlap is disabled
+
+### Requirement: Benchmark output SHALL report serial read and attribution fields
+Benchmark output for serial no-overlap runs SHALL include fields that make the lack of overlap and the cost of serialized access visible. These fields MUST be sufficient to compare Full Pipeline and Serial NoOverlap under the same candidate and read counts.
+
+#### Scenario: Serial timing fields are exported
+- **WHEN** a serial no-overlap benchmark completes
+- **THEN** the output MUST include average serial raw-vector read time
+- **AND** it MUST include average serial full-record read time
+- **AND** it MUST include average serial final payload read time
+- **AND** it MUST include total query time and tail latency under the same schema as overlap runs
+
+#### Scenario: Serial count fields are exported
+- **WHEN** a serial no-overlap benchmark completes
+- **THEN** the output MUST include raw-vector read request count and bytes
+- **AND** it MUST include full-record read request count and bytes
+- **AND** it MUST include final payload read request count and bytes
+- **AND** it MUST include exact rerank candidate count
+
+### Requirement: Pipeline ablation results SHALL be valid only under matched semantics
+The pipeline ablation reporting workflow SHALL mark a Full Pipeline vs Serial NoOverlap pair as valid only when recall and mechanism counts match within the documented tolerance. Pairs with mismatched candidate generation or read semantics MUST be excluded from pipeline speedup claims.
+
+#### Scenario: Matched pair is accepted
+- **WHEN** Full Pipeline and Serial NoOverlap are run on the same dataset, index, queries, top-k, nprobe, active bits, resident bits, SafeOut epsilon, two-level routing and candidate budget
+- **THEN** the summary workflow MAY report their latency/QPS delta as pipeline effect
+- **AND** it MUST include recall, total probed, SafeOut/SafeIn/Uncertain, rerank count and read-count deltas
+
+#### Scenario: Mismatched pair is rejected
+- **WHEN** a Full Pipeline vs Serial NoOverlap pair has unexplained recall, candidate count, rerank count or read-count mismatch beyond tolerance
+- **THEN** the summary workflow MUST mark the pair invalid for pipeline attribution
+- **AND** it MUST not use that pair to support an independent pipeline contribution claim
+
+### Requirement: E2E benchmark SHALL reject deleted budget and early-submit controls
+Maintained benchmark entry points MUST NOT expose candidate-budget selection, budgeted speculative-vector prefetch, or SafeIn optional early-submit as supported controls. Commands that pass a deleted flag MUST fail clearly rather than silently running a different protocol.
+
+#### Scenario: Candidate-budget flag is rejected
+- **WHEN** a maintained benchmark command passes `--non-safeout-candidate-budget`
+- **THEN** the benchmark MUST exit with a clear unsupported-option error
+- **AND** it MUST NOT run a capped candidate-selection protocol
+
+#### Scenario: Speculative prefetch flag is rejected
+- **WHEN** a maintained benchmark command passes `--budgeted-prefetch-limit`
+- **THEN** the benchmark MUST exit with a clear unsupported-option error
+- **AND** it MUST NOT create speculative raw-vector requests
+
+#### Scenario: SafeIn optional early-submit flag is rejected
+- **WHEN** a maintained benchmark command passes `--safein-optional-io-early-submit-max-requests`
+- **THEN** the benchmark MUST exit with a clear unsupported-option error
+- **AND** it MUST not enable a mandatory-backlog bypass
+
+### Requirement: E2E benchmark output SHALL omit deleted-path fields
+New benchmark output MUST NOT emit configuration, counters, or derived metrics dedicated only to candidate budgets, speculative-vector prefetch, or SafeIn optional early-submit. It SHALL retain general correctness, I/O, span, payload, memory, and latency fields needed to evaluate the supported pipeline.
+
+#### Scenario: New result schema contains no deleted-path metrics
+- **WHEN** a benchmark writes configuration and result metadata after this change
+- **THEN** the output MUST omit deleted budget, speculative-prefetch, and optional-early-submit fields
+- **AND** it MUST retain recall, probed candidates, reranked candidates, supported read counters, and latency metrics
+
+### Requirement: Cleanup SHALL be validated with a same-index no-cap regression
+The benchmark workflow MUST compare a pre-cleanup run with all removed features disabled against a post-cleanup run using the same index, query/GT assets, search parameters, storage layout, cache protocol, warmup, and repeat ordering.
+
+#### Scenario: No-cap cleanup preserves search semantics
+- **WHEN** pre-cleanup and post-cleanup runs use the frozen no-cap operating point
+- **THEN** recall, total probed candidates, candidates reranked, and final result semantics MUST be identical
+- **AND** any difference in supported read counters or latency MUST be reported and explained before the change is accepted
 
 ## CLI Parameters
 

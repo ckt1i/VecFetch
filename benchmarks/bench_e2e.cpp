@@ -203,6 +203,24 @@ static bool RejectDeletedLegacySearchModeFlag(int argc, char* argv[]) {
     return false;
 }
 
+static bool RejectDeletedBudgetedPrefetchFlags(int argc, char* argv[]) {
+    static constexpr const char* kDeletedFlags[] = {
+        "--safein-optional-io-early-submit-max-requests",
+        "--non-safeout-candidate-budget",
+        "--budgeted-prefetch-limit",
+    };
+    for (const char* flag : kDeletedFlags) {
+        if (HasFlag(argc, argv, flag)) {
+            std::fprintf(stderr,
+                         "Unsupported removed scheduling option %s; remove "
+                         "it from the command line.\n",
+                         flag);
+            return true;
+        }
+    }
+    return false;
+}
+
 // ============================================================================
 // Timestamp + dataset name
 // ============================================================================
@@ -883,9 +901,6 @@ struct QueryResult {
     uint32_t duplicate_candidates = 0;
     uint32_t deduplicated_candidates = 0;
     uint32_t unique_fetch_candidates = 0;
-    uint32_t candidate_budget_seen = 0;
-    uint32_t candidate_budget_selected = 0;
-    uint32_t candidate_budget_dropped = 0;
     uint32_t num_candidates_buffered = 0;
     uint32_t num_candidates_reranked = 0;
     uint32_t num_safein_payload_prefetched = 0;
@@ -996,9 +1011,6 @@ struct RoundMetrics {
     double avg_duplicate_candidates = 0;
     double avg_deduplicated_candidates = 0;
     double avg_unique_fetch_candidates = 0;
-    double avg_candidate_budget_seen = 0;
-    double avg_candidate_budget_selected = 0;
-    double avg_candidate_budget_dropped = 0;
     double avg_candidate_batches_per_cluster = 0;
     double avg_safeout_frontier_estimates_buffered_per_cluster = 0;
     double avg_safeout_frontier_estimates_merged_per_cluster = 0;
@@ -1279,11 +1291,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         qr.duplicate_candidates = results.stats().duplicate_candidates;
         qr.deduplicated_candidates = results.stats().deduplicated_candidates;
         qr.unique_fetch_candidates = results.stats().unique_fetch_candidates;
-        qr.candidate_budget_seen = results.stats().candidate_budget_seen;
-        qr.candidate_budget_selected =
-            results.stats().candidate_budget_selected;
-        qr.candidate_budget_dropped =
-            results.stats().candidate_budget_dropped;
         qr.num_candidates_buffered = results.stats().buffered_candidates;
         qr.num_candidates_reranked = results.stats().reranked_candidates;
         qr.num_safein_payload_prefetched = results.stats().total_safein_payload_prefetched;
@@ -1352,9 +1359,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     double sum_probed_clusters = 0, sum_probed = 0, sum_si = 0, sum_so = 0, sum_unc = 0;
     double sum_s2_si = 0, sum_s2_so = 0, sum_s2_unc = 0;
     double sum_dup = 0, sum_dedup = 0, sum_unique_fetch = 0;
-    double sum_candidate_budget_seen = 0;
-    double sum_candidate_budget_selected = 0;
-    double sum_candidate_budget_dropped = 0;
     double sum_false_so = 0, sum_false_si = 0;
     double sum_io_wait = 0, sum_total = 0;
     double sum_coarse_select = 0, sum_coarse_score = 0, sum_coarse_topn = 0;
@@ -1458,9 +1462,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
         sum_dup += qresults[qi].duplicate_candidates;
         sum_dedup += qresults[qi].deduplicated_candidates;
         sum_unique_fetch += qresults[qi].unique_fetch_candidates;
-        sum_candidate_budget_seen += qresults[qi].candidate_budget_seen;
-        sum_candidate_budget_selected += qresults[qi].candidate_budget_selected;
-        sum_candidate_budget_dropped += qresults[qi].candidate_budget_dropped;
         sum_false_so += qresults[qi].false_safeout;
         sum_false_si += qresults[qi].false_safein_upper;
         sum_io_wait += qresults[qi].io_wait_ms;
@@ -1720,9 +1721,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     m.avg_duplicate_candidates = sum_dup / Q;
     m.avg_deduplicated_candidates = sum_dedup / Q;
     m.avg_unique_fetch_candidates = sum_unique_fetch / Q;
-    m.avg_candidate_budget_seen = sum_candidate_budget_seen / Q;
-    m.avg_candidate_budget_selected = sum_candidate_budget_selected / Q;
-    m.avg_candidate_budget_dropped = sum_candidate_budget_dropped / Q;
     m.avg_candidates_buffered = sum_candidates_buffered / Q;
     m.avg_candidates_reranked = sum_candidates_reranked / Q;
     m.avg_safein_payload_prefetched = sum_safein_payload_prefetched / Q;
@@ -1852,11 +1850,6 @@ static std::pair<std::vector<QueryResult>, RoundMetrics> RunQueryRound(
     Log("  %s: duplicate_candidates=%.1f  deduplicated=%.1f  unique_fetch=%.1f\n",
         label, m.avg_duplicate_candidates, m.avg_deduplicated_candidates,
         m.avg_unique_fetch_candidates);
-    Log("  %s: candidate_budget=%u  seen=%.1f  selected=%.1f  dropped=%.1f\n",
-        label, search_cfg.non_safeout_candidate_budget,
-        m.avg_candidate_budget_seen,
-        m.avg_candidate_budget_selected,
-        m.avg_candidate_budget_dropped);
     Log("  %s: buffered=%.1f  reranked=%.1f  safein_payload_prefetched=%.1f  remaining_payload_fetches=%.1f\n",
         label, m.avg_candidates_buffered, m.avg_candidates_reranked,
         m.avg_safein_payload_prefetched, m.avg_remaining_payload_fetches);
@@ -1925,6 +1918,9 @@ int main(int argc, char* argv[]) {
     if (RejectDeletedLegacySearchModeFlag(argc, argv)) {
         return 1;
     }
+    if (RejectDeletedBudgetedPrefetchFlags(argc, argv)) {
+        return 1;
+    }
     int arg_dynamic_safein_min_probes =
         GetIntArg(argc, argv, "--dynamic-safein-min-probes", 0);
     int arg_dynamic_safein_stable_probes =
@@ -1953,8 +1949,6 @@ int main(int argc, char* argv[]) {
     }
     int arg_safein_as_vec_only =
         GetIntArg(argc, argv, "--safein-as-vec-only", 0);
-    int arg_non_safeout_candidate_budget =
-        GetIntArg(argc, argv, "--non-safeout-candidate-budget", 0);
     int arg_safein_threshold_bytes =
         GetIntArg(argc, argv, "--safein-threshold-bytes",
                   GetIntArg(argc, argv, "--safein-all-threshold-bytes",
@@ -2080,13 +2074,6 @@ int main(int argc, char* argv[]) {
                      "Invalid --safein-threshold-bytes: %d "
                      "(expected >= 0)\n",
                      arg_safein_threshold_bytes);
-        return 1;
-    }
-    if (arg_non_safeout_candidate_budget < 0) {
-        std::fprintf(stderr,
-                     "Invalid --non-safeout-candidate-budget: %d "
-                     "(expected >= 0)\n",
-                     arg_non_safeout_candidate_budget);
         return 1;
     }
     if (arg_payload_mode != "metadata" &&
@@ -2909,8 +2896,6 @@ int main(int argc, char* argv[]) {
         static_cast<uint32_t>(std::max(arg_dynamic_safein_defer_max_candidates, 0));
     search_cfg.materialization_mode = arg_materialization_mode;
     search_cfg.safein_as_vec_only = (arg_safein_as_vec_only != 0);
-    search_cfg.non_safeout_candidate_budget =
-        static_cast<uint32_t>(arg_non_safeout_candidate_budget);
     search_cfg.safein_threshold_bytes =
         static_cast<uint32_t>(arg_safein_threshold_bytes);
     search_cfg.io_queue_depth = static_cast<uint32_t>(arg_io_queue_depth);
@@ -3253,11 +3238,6 @@ int main(int argc, char* argv[]) {
         metrics.avg_duplicate_candidates,
         metrics.avg_deduplicated_candidates,
         metrics.avg_unique_fetch_candidates);
-    Log("  non_safeout_candidate_budget=%u  budget_seen=%.1f  selected=%.1f  dropped=%.1f\n",
-        search_cfg.non_safeout_candidate_budget,
-        metrics.avg_candidate_budget_seen,
-        metrics.avg_candidate_budget_selected,
-        metrics.avg_candidate_budget_dropped);
     Log("  false_safeout=%.2f  false_safein_upper=%.1f  total_safein=%lu\n",
         metrics.avg_false_safeout, metrics.avg_false_safein_upper,
         static_cast<unsigned long>(metrics.total_final_safein));
@@ -3386,8 +3366,6 @@ int main(int argc, char* argv[]) {
                              search_cfg.late_materialization_enabled()) << ",\n";
         f << "    " << JBool("safein_as_vec_only",
                              search_cfg.safein_as_vec_only) << ",\n";
-        f << "    " << JInt("non_safeout_candidate_budget",
-                            search_cfg.non_safeout_candidate_budget) << ",\n";
         f << "    " << JInt("safein_threshold_bytes",
                             search_cfg.safein_threshold_bytes) << ",\n";
         f << "    " << JInt("io_queue_depth", search_cfg.io_queue_depth) << ",\n";
@@ -3614,9 +3592,6 @@ int main(int argc, char* argv[]) {
         f << "    " << JNum("avg_duplicate_candidates", metrics.avg_duplicate_candidates) << ",\n";
         f << "    " << JNum("avg_deduplicated_candidates", metrics.avg_deduplicated_candidates) << ",\n";
         f << "    " << JNum("avg_unique_fetch_candidates", metrics.avg_unique_fetch_candidates) << ",\n";
-        f << "    " << JNum("avg_candidate_budget_seen", metrics.avg_candidate_budget_seen) << ",\n";
-        f << "    " << JNum("avg_candidate_budget_selected", metrics.avg_candidate_budget_selected) << ",\n";
-        f << "    " << JNum("avg_candidate_budget_dropped", metrics.avg_candidate_budget_dropped) << ",\n";
         f << "    " << JNum("avg_false_safeout", metrics.avg_false_safeout) << ",\n";
         f << "    " << JNum("avg_false_safein_upper", metrics.avg_false_safein_upper) << ",\n";
         f << "    " << JInt("total_final_safein", static_cast<int64_t>(metrics.total_final_safein)) << ",\n";
@@ -3822,9 +3797,6 @@ int main(int argc, char* argv[]) {
             f << "      " << JNum("remaining_payload_fetch_ms", qr.remaining_payload_fetch_ms) << ",\n";
             f << "      " << JInt("num_candidates_buffered", qr.num_candidates_buffered) << ",\n";
             f << "      " << JInt("num_candidates_reranked", qr.num_candidates_reranked) << ",\n";
-            f << "      " << JInt("candidate_budget_seen", qr.candidate_budget_seen) << ",\n";
-            f << "      " << JInt("candidate_budget_selected", qr.candidate_budget_selected) << ",\n";
-            f << "      " << JInt("candidate_budget_dropped", qr.candidate_budget_dropped) << ",\n";
             f << "      " << JInt("num_safein_payload_prefetched", qr.num_safein_payload_prefetched) << ",\n";
             f << "      " << JInt("num_remaining_payload_fetches", qr.num_remaining_payload_fetches) << ",\n";
             f << "      " << JInt("dynamic_safein_deferred_candidates", qr.dynamic_safein_deferred_candidates) << ",\n";

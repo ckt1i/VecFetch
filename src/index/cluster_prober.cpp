@@ -57,10 +57,17 @@ ClusterProber::ClusterProber(const ConANN& conann, Dim dim, uint8_t code_bits, u
 
 ClusterProber::ClusterProber(const ConANN& conann, Dim dim, uint8_t code_bits,
                              uint8_t total_bits, uint8_t active_ex_bits)
+    : ClusterProber(conann, dim, code_bits, total_bits, active_ex_bits,
+                    Stage2ErrorEnvelope{}) {}
+
+ClusterProber::ClusterProber(const ConANN& conann, Dim dim, uint8_t code_bits,
+                             uint8_t total_bits, uint8_t active_ex_bits,
+                             Stage2ErrorEnvelope stage2_envelope)
     : conann_(conann), dim_(dim), bits_(code_bits), total_bits_(total_bits),
       active_ex_bits_(std::min<uint8_t>(active_ex_bits, code_bits)),
       has_s2_(total_bits > 1 && active_ex_bits_ > 0),
       margin_s2_divisor_(total_bits > 1 ? static_cast<float>(1u << (total_bits - 1)) : 1.0f),
+      stage2_envelope_(stage2_envelope),
       estimator_(dim, code_bits) {}
 
 ClusterProber::~ClusterProber() = default;
@@ -292,7 +299,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
 
             batch.global_idx[batch.count] = global_idx;
             batch.est_dist[batch.count] = est_dist_s1;
-            batch.est_error[batch.count] = safeout_margin_s1;
+            batch.est_error[batch.count] = safein_margin_s1;
             batch.estimate_lower_bound[batch.count] = est_dist_s1 - safeout_margin_s1;
             batch.safein_upper_bound[batch.count] = est_dist_s1 + safein_margin_s1;
             batch.classification_stage[batch.count] = 1;
@@ -682,7 +689,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
                         lane_official_factor_rescale[lane], ex_ip);
                 };
 
-                const bool split_stage2_margin =
+                const bool split_stage2_margin = stage2_envelope_.enabled ||
                     std::abs(view.safein_margin_factor - view.safeout_margin_factor) > 1e-12f;
                 if (!pc.uses_official_1_plus_n() && enable_stage2_scatter_batch_classify &&
                     !split_stage2_margin) {
@@ -728,12 +735,16 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
                         float est_dist_s2 = entry.norm_oc * entry.norm_oc + pq.norm_qc_sq -
                                             2.0f * entry.norm_oc * pq.norm_qc * ip_est;
                         est_dist_s2 = std::max(est_dist_s2, 0.0f);
-                        const float safeout_margin_s2 =
-                            entry.safeout_margin_s1 / margin_s2_divisor_;
-                        const float safein_margin_s2 = entry.margin_s1 / margin_s2_divisor_;
+                        const float geometric_scale = 2.0f * pq.norm_qc * entry.norm_oc;
+                        const float safeout_margin_s2 = stage2_envelope_.enabled
+                            ? geometric_scale * stage2_envelope_.epsilon_lower
+                            : entry.safeout_margin_s1 / margin_s2_divisor_;
+                        const float safein_margin_s2 = stage2_envelope_.enabled
+                            ? geometric_scale * stage2_envelope_.epsilon_upper
+                            : entry.margin_s1 / margin_s2_divisor_;
                         batch.global_idx[batch.count] = entry.global_idx;
                         batch.est_dist[batch.count] = est_dist_s2;
-                        batch.est_error[batch.count] = safeout_margin_s2;
+                        batch.est_error[batch.count] = safein_margin_s2;
                         batch.estimate_lower_bound[batch.count] = est_dist_s2 - safeout_margin_s2;
                         batch.safein_upper_bound[batch.count] = est_dist_s2 + safein_margin_s2;
                         batch.classification_stage[batch.count] = 2;
@@ -759,9 +770,13 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
                             est_dist_s2 = std::max(est_dist_s2, 0.0f);
                         }
 
-                        const float safein_margin_s2 = entry.margin_s1 / margin_s2_divisor_;
-                        const float safeout_margin_s2 =
-                            entry.safeout_margin_s1 / margin_s2_divisor_;
+                        const float geometric_scale = 2.0f * pq.norm_qc * entry.norm_oc;
+                        const float safein_margin_s2 = stage2_envelope_.enabled
+                            ? geometric_scale * stage2_envelope_.epsilon_upper
+                            : entry.margin_s1 / margin_s2_divisor_;
+                        const float safeout_margin_s2 = stage2_envelope_.enabled
+                            ? geometric_scale * stage2_envelope_.epsilon_lower
+                            : entry.safeout_margin_s1 / margin_s2_divisor_;
                         ResultClass rc_s2 = ResultClass::Uncertain;
                         if (est_dist_s2 > safeout_frontier_upper + safeout_margin_s2) {
                             rc_s2 = ResultClass::SafeOut;
@@ -786,7 +801,7 @@ void ClusterProber::Probe(const query::ParsedCluster& pc, uint32_t cluster_id,
 
                         batch.global_idx[batch.count] = entry.global_idx;
                         batch.est_dist[batch.count] = est_dist_s2;
-                        batch.est_error[batch.count] = safeout_margin_s2;
+                        batch.est_error[batch.count] = safein_margin_s2;
                         batch.estimate_lower_bound[batch.count] = est_dist_s2 - safeout_margin_s2;
                         batch.safein_upper_bound[batch.count] = est_dist_s2 + safein_margin_s2;
                         batch.classification_stage[batch.count] = 2;

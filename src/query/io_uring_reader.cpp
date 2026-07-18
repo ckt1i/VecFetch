@@ -1,6 +1,7 @@
 #include "vdb/query/async_reader.h"
 
 #include <liburing.h>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
@@ -68,13 +69,23 @@ IoUringReader::~IoUringReader() {
 
 Status IoUringReader::Init(uint32_t queue_depth, uint32_t cq_entries,
                             bool use_iopoll, bool use_sqpoll) {
+    IoUringInitOptions options;
+    options.use_iopoll = use_iopoll;
+    options.use_sqpoll = use_sqpoll;
+    return Init(queue_depth, cq_entries, options);
+}
+
+Status IoUringReader::Init(uint32_t queue_depth, uint32_t cq_entries,
+                           const IoUringInitOptions& options) {
     struct io_uring_params params;
     std::memset(&params, 0, sizeof(params));
     params.flags = IORING_SETUP_CQSIZE
-                 | IORING_SETUP_SINGLE_ISSUER
-                 | IORING_SETUP_DEFER_TASKRUN;
-    if (use_sqpoll) params.flags |= IORING_SETUP_SQPOLL;
-    if (use_iopoll) params.flags |= IORING_SETUP_IOPOLL;
+                 | IORING_SETUP_SINGLE_ISSUER;
+    if (options.use_defer_taskrun) {
+        params.flags |= IORING_SETUP_DEFER_TASKRUN;
+    }
+    if (options.use_sqpoll) params.flags |= IORING_SETUP_SQPOLL;
+    if (options.use_iopoll) params.flags |= IORING_SETUP_IOPOLL;
     params.cq_entries = cq_entries;
 
     int ret = io_uring_queue_init_params(queue_depth, &impl_->ring, &params);
@@ -82,12 +93,14 @@ Status IoUringReader::Init(uint32_t queue_depth, uint32_t cq_entries,
         // First fallback: drop SQPOLL while keeping the existing single-issuer
         // fast path. This keeps the old warm-path behavior when SQPOLL is not
         // supported or blocked by environment constraints.
-        if (use_sqpoll) {
+        if (options.use_sqpoll) {
             std::memset(&params, 0, sizeof(params));
             params.flags = IORING_SETUP_CQSIZE
-                         | IORING_SETUP_SINGLE_ISSUER
-                         | IORING_SETUP_DEFER_TASKRUN;
-            if (use_iopoll) params.flags |= IORING_SETUP_IOPOLL;
+                         | IORING_SETUP_SINGLE_ISSUER;
+            if (options.use_defer_taskrun) {
+                params.flags |= IORING_SETUP_DEFER_TASKRUN;
+            }
+            if (options.use_iopoll) params.flags |= IORING_SETUP_IOPOLL;
             params.cq_entries = cq_entries;
             ret = io_uring_queue_init_params(queue_depth, &impl_->ring, &params);
         }
@@ -96,17 +109,16 @@ Status IoUringReader::Init(uint32_t queue_depth, uint32_t cq_entries,
         // Final fallback: kernel may not support DEFER_TASKRUN / SINGLE_ISSUER.
         std::memset(&params, 0, sizeof(params));
         params.flags = IORING_SETUP_CQSIZE;
-        if (use_iopoll) params.flags |= IORING_SETUP_IOPOLL;
+        if (options.use_iopoll) params.flags |= IORING_SETUP_IOPOLL;
         params.cq_entries = cq_entries;
         ret = io_uring_queue_init_params(queue_depth, &impl_->ring, &params);
         if (ret < 0) {
             return Status::NotSupported(
                 std::string("io_uring init failed: ") + strerror(-ret));
         }
-        impl_->defer_taskrun = false;
-    } else {
-        impl_->defer_taskrun = true;
     }
+    impl_->defer_taskrun =
+        (params.flags & IORING_SETUP_DEFER_TASKRUN) != 0;
     impl_->initialized = true;
     queue_depth_ = queue_depth;
     cq_entries_ = cq_entries;
@@ -163,6 +175,7 @@ Status IoUringReader::PrepReadFixedTagged(int fd_index, uint8_t* buf,
     }
     io_uring_prep_read(sqe, fd_index, buf, len, offset);
     sqe->flags |= IOSQE_FIXED_FILE;
+    if (force_async_) sqe->flags |= IOSQE_ASYNC;
     io_uring_sqe_set_data64(sqe, user_data);
     ++prepped_;
     return Status::OK();
@@ -195,6 +208,7 @@ Status IoUringReader::PrepReadRegisteredBufferTagged(int fd, uint8_t* buf,
         return Status::IOError(error);
     }
     io_uring_prep_read_fixed(sqe, fd, buf, len, offset, buf_index);
+    if (force_async_) sqe->flags |= IOSQE_ASYNC;
     io_uring_sqe_set_data64(sqe, user_data);
     ++prepped_;
     return Status::OK();
@@ -217,6 +231,7 @@ Status IoUringReader::PrepReadRegisteredBufferFixedFileTagged(
     }
     io_uring_prep_read_fixed(sqe, fd_index, buf, len, offset, buf_index);
     sqe->flags |= IOSQE_FIXED_FILE;
+    if (force_async_) sqe->flags |= IOSQE_ASYNC;
     io_uring_sqe_set_data64(sqe, user_data);
     ++prepped_;
     return Status::OK();
@@ -243,6 +258,7 @@ Status IoUringReader::PrepReadTagged(int fd, uint8_t* buf,
     } else {
         io_uring_prep_read(sqe, fd, buf, len, offset);
     }
+    if (force_async_) sqe->flags |= IOSQE_ASYNC;
     io_uring_sqe_set_data64(sqe, user_data);
     ++prepped_;
     return Status::OK();
@@ -259,31 +275,42 @@ uint32_t IoUringReader::Submit() {
 }
 
 uint32_t IoUringReader::Poll(IoCompletion* out, uint32_t max_count) {
+    last_poll_diagnostics_ = {};
     // Under DEFER_TASKRUN, CQEs won't appear until we explicitly ask the
     // kernel to run deferred task_work.  io_uring_get_events() triggers this
     // without blocking.
     if (impl_->defer_taskrun) {
+        std::chrono::steady_clock::time_point get_events_start;
+        if (detailed_poll_timing_) {
+            get_events_start = std::chrono::steady_clock::now();
+        }
         io_uring_get_events(&impl_->ring);
+        last_poll_diagnostics_.get_events_calls = 1;
+        if (detailed_poll_timing_) {
+            last_poll_diagnostics_.get_events_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - get_events_start)
+                    .count();
+        }
     }
 
     uint32_t count = 0;
-    struct io_uring_cqe* cqe;
-
-    while (count < max_count) {
-        int ret = io_uring_peek_cqe(&impl_->ring, &cqe);
-        if (ret != 0) break;  // No more completions
-
+    struct io_uring_cqe* cqe = nullptr;
+    while (count < max_count &&
+           io_uring_peek_cqe(&impl_->ring, &cqe) == 0) {
         out[count].user_data = io_uring_cqe_get_data64(cqe);
-        out[count].buffer = reinterpret_cast<uint8_t*>(out[count].user_data);
+        out[count].buffer =
+            reinterpret_cast<uint8_t*>(out[count].user_data);
         out[count].result = cqe->res;
         io_uring_cqe_seen(&impl_->ring, cqe);
-        ++count;
         --in_flight_;
+        ++count;
     }
     return count;
 }
 
 uint32_t IoUringReader::WaitAndPoll(IoCompletion* out, uint32_t max_count) {
+    last_poll_diagnostics_ = {};
     if (max_count == 0 || in_flight_ == 0) return 0;
 
     // Wait for at least one completion
@@ -298,18 +325,16 @@ uint32_t IoUringReader::WaitAndPoll(IoCompletion* out, uint32_t max_count) {
     io_uring_cqe_seen(&impl_->ring, cqe);
     --in_flight_;
 
-    // Drain any additional ready completions
     uint32_t count = 1;
-    while (count < max_count) {
-        ret = io_uring_peek_cqe(&impl_->ring, &cqe);
-        if (ret != 0) break;
-
+    while (count < max_count &&
+           io_uring_peek_cqe(&impl_->ring, &cqe) == 0) {
         out[count].user_data = io_uring_cqe_get_data64(cqe);
-        out[count].buffer = reinterpret_cast<uint8_t*>(out[count].user_data);
+        out[count].buffer =
+            reinterpret_cast<uint8_t*>(out[count].user_data);
         out[count].result = cqe->res;
         io_uring_cqe_seen(&impl_->ring, cqe);
-        ++count;
         --in_flight_;
+        ++count;
     }
     return count;
 }

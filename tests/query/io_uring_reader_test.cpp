@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <vector>
 
 #include <fcntl.h>
@@ -87,6 +88,64 @@ TEST_F(IoUringReaderTest, MultipleReads) {
     }
 }
 
+TEST_F(IoUringReaderTest, PollReturnsAllReadyCompletionsWithoutLoss) {
+    constexpr uint32_t kReads = 16;
+    std::vector<std::array<uint8_t, 8>> buffers(kReads);
+    for (uint32_t i = 0; i < kReads; ++i) {
+        ASSERT_TRUE(reader_->PrepReadTagged(
+                        fd_, buffers[i].data(), buffers[i].size(),
+                        (i * 31) % 1000, 1000 + i).ok());
+    }
+    EXPECT_EQ(reader_->Submit(), kReads);
+
+    usleep(1000);
+    IoCompletion first[5];
+    const uint32_t first_count = reader_->Poll(first, 5);
+    EXPECT_LE(first_count, 5u);
+    EXPECT_EQ(reader_->InFlight(), kReads - first_count);
+
+    std::set<uint64_t> tags;
+    for (uint32_t i = 0; i < first_count; ++i) {
+        EXPECT_EQ(first[i].result, 8);
+        tags.insert(first[i].user_data);
+    }
+    IoCompletion remaining[kReads];
+    while (reader_->InFlight() > 0) {
+        const uint32_t n = reader_->WaitAndPoll(remaining, kReads);
+        ASSERT_GT(n, 0u);
+        for (uint32_t i = 0; i < n; ++i) {
+            EXPECT_EQ(remaining[i].result, 8);
+            tags.insert(remaining[i].user_data);
+        }
+    }
+    EXPECT_EQ(tags.size(), kReads);
+}
+
+TEST_F(IoUringReaderTest, WaitAndPollDrainsReadyCompletionsWithoutLoss) {
+    constexpr uint32_t kReads = 24;
+    std::vector<std::array<uint8_t, 8>> buffers(kReads);
+    for (uint32_t i = 0; i < kReads; ++i) {
+        ASSERT_TRUE(reader_->PrepReadTagged(
+                        fd_, buffers[i].data(), buffers[i].size(),
+                        (i * 37) % 1000, 2000 + i).ok());
+    }
+    EXPECT_EQ(reader_->Submit(), kReads);
+
+    IoCompletion completions[kReads];
+    std::set<uint64_t> tags;
+    while (reader_->InFlight() > 0) {
+        const uint32_t before = reader_->InFlight();
+        const uint32_t n = reader_->WaitAndPoll(completions, kReads);
+        ASSERT_GT(n, 0u);
+        EXPECT_EQ(reader_->InFlight(), before - n);
+        for (uint32_t i = 0; i < n; ++i) {
+            EXPECT_EQ(completions[i].result, 8);
+            tags.insert(completions[i].user_data);
+        }
+    }
+    EXPECT_EQ(tags.size(), kReads);
+}
+
 TEST_F(IoUringReaderTest, EmptySubmit) {
     EXPECT_EQ(reader_->Submit(), 0u);
     EXPECT_EQ(reader_->InFlight(), 0u);
@@ -95,6 +154,54 @@ TEST_F(IoUringReaderTest, EmptySubmit) {
 TEST_F(IoUringReaderTest, PollNonBlocking) {
     IoCompletion comp;
     EXPECT_EQ(reader_->Poll(&comp, 1), 0u);
+}
+
+TEST_F(IoUringReaderTest, DetailedPollDiagnosticsTrackGetEvents) {
+    reader_->SetDetailedPollTiming(true);
+    IoCompletion comp;
+    EXPECT_EQ(reader_->Poll(&comp, 1), 0u);
+    const AsyncPollDiagnostics diagnostics =
+        reader_->last_poll_diagnostics();
+    EXPECT_EQ(diagnostics.get_events_calls,
+              reader_->defer_taskrun_enabled() ? 1u : 0u);
+    if (reader_->defer_taskrun_enabled()) {
+        EXPECT_GT(diagnostics.get_events_ns, 0u);
+    }
+}
+
+TEST_F(IoUringReaderTest, OptionalNoDeferPolicyIsPerReaderAndPreservesReads) {
+    if (!reader_->defer_taskrun_enabled()) {
+        GTEST_SKIP() << "Kernel fallback cannot validate default defer policy";
+    }
+
+    IoUringReader optional_reader;
+    IoUringInitOptions options;
+    options.use_defer_taskrun = false;
+    optional_reader.SetForceAsync(true);
+    auto status = optional_reader.Init(64, 256, options);
+    if (!status.ok()) {
+        GTEST_SKIP() << "io_uring no-defer init unavailable: "
+                     << status.message();
+    }
+
+    EXPECT_TRUE(reader_->defer_taskrun_enabled());
+    EXPECT_FALSE(reader_->force_async_enabled());
+    EXPECT_FALSE(optional_reader.defer_taskrun_enabled());
+    EXPECT_TRUE(optional_reader.force_async_enabled());
+
+    uint8_t buf[16]{};
+    ASSERT_TRUE(optional_reader.PrepRead(fd_, buf, 16, 0).ok());
+    EXPECT_EQ(optional_reader.Submit(), 1u);
+    IoCompletion completion;
+    EXPECT_EQ(optional_reader.WaitAndPoll(&completion, 1), 1u);
+    EXPECT_EQ(completion.result, 16);
+    for (int i = 0; i < 16; ++i) {
+        EXPECT_EQ(buf[i], static_cast<uint8_t>(i));
+    }
+
+    optional_reader.SetDetailedPollTiming(true);
+    EXPECT_EQ(optional_reader.Poll(&completion, 1), 0u);
+    EXPECT_EQ(optional_reader.last_poll_diagnostics().get_events_calls, 0u);
 }
 
 TEST_F(IoUringReaderTest, SqpollRequestFallsBackCleanly) {

@@ -96,6 +96,15 @@ struct ProbeStats {
     double stage2_decode_ms = 0;
 };
 
+// Optional calibrated Stage-2 distance envelope. The lower epsilon protects
+// SafeOut decisions; the upper epsilon is used by the top-k upper frontier.
+// Disabled preserves the legacy bit-ratio scaling exactly.
+struct Stage2ErrorEnvelope {
+    bool enabled = false;
+    float epsilon_lower = 0.0f;
+    float epsilon_upper = 0.0f;
+};
+
 /// Cluster candidate classifier implementing the two-stage RaBitQ pipeline.
 ///
 /// Encapsulates the FastScan Stage 1 / ExRaBitQ Stage 2 classification loop
@@ -117,6 +126,9 @@ class ClusterProber {
                   uint8_t total_bits);
     ClusterProber(const ConANN& conann, Dim dim, uint8_t code_bits,
                   uint8_t total_bits, uint8_t active_ex_bits);
+    ClusterProber(const ConANN& conann, Dim dim, uint8_t code_bits,
+                  uint8_t total_bits, uint8_t active_ex_bits,
+                  Stage2ErrorEnvelope stage2_envelope);
     ~ClusterProber();
 
     VDB_DISALLOW_COPY_AND_MOVE(ClusterProber);
@@ -161,6 +173,7 @@ class ClusterProber {
     uint8_t active_ex_bits_;
     bool has_s2_;
     float margin_s2_divisor_;   // 2^(total_bits-1), precomputed; 1.0 when no S2
+    Stage2ErrorEnvelope stage2_envelope_;
     rabitq::RaBitQEstimator estimator_;
 };
 

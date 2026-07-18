@@ -144,7 +144,8 @@ void RerankConsumer::ConsumeAll(uint8_t* buf, AddressEntry addr,
             std::abort();
         }
         std::memcpy(pbuf, buf + payload_offset, desc.inline_bytes);
-        StorePayload(addr.offset, pbuf, desc.inline_bytes, nullptr);
+        StorePayload(addr.offset, pbuf, desc.inline_bytes,
+                     desc.inline_bytes, nullptr);
         ctx_.stats().total_safein_payload_prefetched++;
         return;
     }
@@ -162,23 +163,41 @@ void RerankConsumer::ConsumeAll(uint8_t* buf, AddressEntry addr,
             std::abort();
         }
         std::memcpy(pbuf, buf + vec_bytes_, payload_prefix_len);
-        StorePayload(addr.offset, pbuf, payload_prefix_len, nullptr);
+        StorePayload(addr.offset, pbuf, payload_prefix_len,
+                     payload_prefix_len, nullptr);
         ctx_.stats().total_safein_payload_prefetched++;
     }
 }
 
 void RerankConsumer::ConsumePayloadPrefix(uint8_t* buf, AddressEntry addr,
                                           uint32_t prefix_len,
-                                          BufferPool* pool_owner) {
-    StorePayload(addr.offset, buf, prefix_len, pool_owner);
+                                          BufferPool* pool_owner,
+                                          uint32_t payload_capacity) {
+    StorePayload(addr.offset, buf, prefix_len,
+                 std::max(prefix_len, payload_capacity), pool_owner);
     ctx_.stats().total_safein_payload_prefetched++;
 }
 
 void RerankConsumer::ConsumePayload(uint8_t* buf, AddressEntry addr,
                                     uint32_t payload_len,
                                     BufferPool* pool_owner) {
-    StorePayload(addr.offset, buf, payload_len, pool_owner);
+    StorePayload(addr.offset, buf, payload_len, payload_len, pool_owner);
     ctx_.stats().total_payload_prefetched++;
+}
+
+bool RerankConsumer::CachePayloadView(
+    uint64_t offset, const uint8_t* payload, uint32_t payload_len) {
+    if (payload == nullptr || payload_len == 0 ||
+        payload_cache_.count(offset) > 0) {
+        return false;
+    }
+    PayloadCacheEntry entry;
+    entry.storage = const_cast<uint8_t*>(payload);
+    entry.bytes = payload_len;
+    entry.capacity = payload_len;
+    entry.span_view = true;
+    payload_cache_.emplace(offset, std::move(entry));
+    return true;
 }
 
 bool RerankConsumer::HasPayload(uint64_t offset) const {
@@ -197,16 +216,42 @@ const uint8_t* RerankConsumer::CachedPayloadData(uint64_t offset) const {
     return it->second.storage;
 }
 
+uint8_t* RerankConsumer::MutableCachedPayloadData(uint64_t offset) {
+    auto it = payload_cache_.find(offset);
+    return it == payload_cache_.end() ? nullptr : it->second.storage;
+}
+
+uint32_t RerankConsumer::CachedPayloadCapacity(uint64_t offset) const {
+    auto it = payload_cache_.find(offset);
+    return it == payload_cache_.end() ? 0 : it->second.capacity;
+}
+
+bool RerankConsumer::CachedPayloadIsSpanView(uint64_t offset) const {
+    auto it = payload_cache_.find(offset);
+    return it != payload_cache_.end() && it->second.span_view;
+}
+
+bool RerankConsumer::ExtendCachedPayload(uint64_t offset,
+                                         uint32_t ready_bytes) {
+    auto it = payload_cache_.find(offset);
+    if (it == payload_cache_.end() || ready_bytes > it->second.capacity) {
+        return false;
+    }
+    it->second.bytes = std::max(it->second.bytes, ready_bytes);
+    return true;
+}
+
 AlignedBufPtr RerankConsumer::TakePayload(uint64_t offset) {
     auto it = payload_cache_.find(offset);
     if (it == payload_cache_.end()) return nullptr;
-    PayloadCacheEntry entry = it->second;
+    PayloadCacheEntry entry = std::move(it->second);
     payload_cache_.erase(it);
-    if (entry.pool_owner == nullptr) {
+    if (!entry.span_view && entry.pool_owner == nullptr) {
         return AlignedBufPtr(entry.storage);
     }
 
-    const uint32_t alloc_len = (std::max(entry.bytes, 1u) + 4095u) & ~4095u;
+    const uint32_t alloc_len =
+        (std::max(entry.capacity, 1u) + 4095u) & ~4095u;
     uint8_t* copy = static_cast<uint8_t*>(std::aligned_alloc(4096, alloc_len));
     if (copy == nullptr) {
         std::fprintf(stderr,
@@ -218,7 +263,9 @@ AlignedBufPtr RerankConsumer::TakePayload(uint64_t offset) {
     if (entry.bytes > 0) {
         std::memcpy(copy, entry.storage, entry.bytes);
     }
-    entry.pool_owner->Release(entry.storage);
+    if (!entry.span_view) {
+        entry.pool_owner->Release(entry.storage);
+    }
     return AlignedBufPtr(copy);
 }
 
@@ -230,31 +277,36 @@ void RerankConsumer::ReleasePayload(uint64_t offset) {
 }
 
 void RerankConsumer::CachePayload(uint64_t offset, AlignedBufPtr buf) {
-    StorePayload(offset, buf.release(), 0, nullptr);
+    StorePayload(offset, buf.release(), 0, 0, nullptr);
 }
 
 void RerankConsumer::StorePayload(uint64_t offset, uint8_t* storage,
-                                  uint32_t bytes, BufferPool* pool_owner) {
+                                  uint32_t bytes, uint32_t capacity,
+                                  BufferPool* pool_owner) {
     auto found = payload_cache_.find(offset);
     if (found != payload_cache_.end()) {
         ReleasePayloadEntry(&found->second);
-        found->second = PayloadCacheEntry{storage, bytes, pool_owner};
+        found->second = PayloadCacheEntry{
+            storage, bytes, std::max(bytes, capacity), pool_owner, false};
         return;
     }
     payload_cache_.emplace(
-        offset, PayloadCacheEntry{storage, bytes, pool_owner});
+        offset, PayloadCacheEntry{
+            storage, bytes, std::max(bytes, capacity), pool_owner, false});
 }
 
 void RerankConsumer::ReleasePayloadEntry(PayloadCacheEntry* entry) {
     if (entry == nullptr || entry->storage == nullptr) return;
-    if (entry->pool_owner != nullptr) {
+    if (!entry->span_view && entry->pool_owner != nullptr) {
         entry->pool_owner->Release(entry->storage);
-    } else {
+    } else if (!entry->span_view) {
         std::free(entry->storage);
     }
     entry->storage = nullptr;
     entry->bytes = 0;
+    entry->capacity = 0;
     entry->pool_owner = nullptr;
+    entry->span_view = false;
 }
 
 void RerankConsumer::ClearPayloadCache() {

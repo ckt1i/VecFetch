@@ -180,6 +180,59 @@ TEST(ClusterProberTest, OfficialV13Stage2ScoresUseOfficialFactors) {
         EXPECT_NEAR(batch.est_dist[lane], expected, 1e-3f) << "lane=" << lane;
     }
 
+    constexpr float kLowerEpsilon = 0.02f;
+    constexpr float kUpperEpsilon = 0.05f;
+    vdb::index::ClusterProber asymmetric_prober(
+        conann, dim, config.active_code_bits(), config.effective_total_bits(),
+        config.ex_bits, vdb::index::Stage2ErrorEnvelope{
+                            true, kLowerEpsilon, kUpperEpsilon});
+    CollectingSink asymmetric_sink;
+    vdb::index::ProbeStats asymmetric_stats;
+    asymmetric_prober.Probe(
+        parsed, 0, view, std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(), true, false, false, true, true,
+        nullptr, nullptr, asymmetric_sink, asymmetric_stats);
+    ASSERT_EQ(asymmetric_sink.batches.size(), 1u);
+    const auto& asymmetric_batch = asymmetric_sink.batches[0];
+    ASSERT_EQ(asymmetric_batch.count, kRecords);
+    for (uint32_t lane = 0; lane < kRecords; ++lane) {
+        const float geometric_scale =
+            2.0f * pq.norm_qc * block_norms[lane];
+        EXPECT_NEAR(asymmetric_batch.est_dist[lane] -
+                        asymmetric_batch.estimate_lower_bound[lane],
+                    geometric_scale * kLowerEpsilon, 1e-5f);
+        EXPECT_NEAR(asymmetric_batch.est_error[lane],
+                    geometric_scale * kUpperEpsilon, 1e-5f);
+        EXPECT_NEAR(asymmetric_batch.safein_upper_bound[lane] -
+                        asymmetric_batch.est_dist[lane],
+                    geometric_scale * kUpperEpsilon, 1e-5f);
+    }
+
+    vdb::rabitq::PreparedClusterQueryView stage1_view = view;
+    stage1_view.safeout_margin_factor = 0.03f;
+    stage1_view.safein_margin_factor = 0.07f;
+    vdb::index::ClusterProber stage1_only_prober(
+        conann, dim, config.active_code_bits(), config.effective_total_bits(), 0);
+    CollectingSink stage1_sink;
+    vdb::index::ProbeStats stage1_stats;
+    stage1_only_prober.Probe(
+        parsed, 0, stage1_view, std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(), true, false, false, true, true,
+        nullptr, nullptr, stage1_sink, stage1_stats);
+    ASSERT_EQ(stage1_sink.batches.size(), 1u);
+    const auto& stage1_batch = stage1_sink.batches[0];
+    ASSERT_EQ(stage1_batch.count, kRecords);
+    for (uint32_t lane = 0; lane < kRecords; ++lane) {
+        EXPECT_NEAR(stage1_batch.est_dist[lane] -
+                        stage1_batch.estimate_lower_bound[lane],
+                    block_norms[lane] * stage1_view.safeout_margin_factor, 1e-5f);
+        EXPECT_NEAR(stage1_batch.est_error[lane],
+                    block_norms[lane] * stage1_view.safein_margin_factor, 1e-5f);
+        EXPECT_NEAR(stage1_batch.safein_upper_bound[lane] -
+                        stage1_batch.est_dist[lane],
+                    block_norms[lane] * stage1_view.safein_margin_factor, 1e-5f);
+    }
+
     std::filesystem::remove_all(test_dir);
 }
 

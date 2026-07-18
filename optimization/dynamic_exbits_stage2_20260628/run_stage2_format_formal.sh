@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Historical runner retained as non-runnable legacy evidence. Its candidate-
+# budget command is intentionally incompatible with current benchmark binaries.
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/home/zcq/VDB/VectorRetrival}"

@@ -56,7 +56,8 @@ class RerankConsumer {
     /// the cache entry is released; otherwise it is freed normally.
     void ConsumePayloadPrefix(uint8_t* buf, AddressEntry addr,
                               uint32_t prefix_len,
-                              BufferPool* pool_owner = nullptr);
+                              BufferPool* pool_owner = nullptr,
+                              uint32_t payload_capacity = 0);
 
     /// Consume a PAYLOAD buffer: transfers ownership to the payload cache.
     /// When pool_owner is non-null, the buffer is returned to that pool when
@@ -64,6 +65,11 @@ class RerankConsumer {
     void ConsumePayload(uint8_t* buf, AddressEntry addr,
                         uint32_t payload_len = 0,
                         BufferPool* pool_owner = nullptr);
+
+    /// Cache a non-owning payload view backed by scheduler-owned query-local
+    /// storage. Returns false when a payload entry already exists.
+    bool CachePayloadView(uint64_t offset, const uint8_t* payload,
+                          uint32_t payload_len);
 
     /// Check if any payload bytes are cached for this address offset.
     bool HasPayload(uint64_t offset) const;
@@ -73,6 +79,20 @@ class RerankConsumer {
 
     /// Pointer to cached payload prefix/full bytes, or nullptr if absent.
     const uint8_t* CachedPayloadData(uint64_t offset) const;
+
+    /// Mutable access used to append a missing suffix directly into a
+    /// prefetched final-sized buffer.
+    uint8_t* MutableCachedPayloadData(uint64_t offset);
+
+    /// Allocated payload capacity for an existing cache entry.
+    uint32_t CachedPayloadCapacity(uint64_t offset) const;
+
+    /// Whether the cached payload is a zero-copy view into a vector span.
+    bool CachedPayloadIsSpanView(uint64_t offset) const;
+
+    /// Mark more contiguous payload bytes as ready after an in-place suffix
+    /// read. Returns false if the cache entry is missing or too small.
+    bool ExtendCachedPayload(uint64_t offset, uint32_t ready_bytes);
 
     /// Take ownership of a cached payload buffer (removes from cache).
     /// Returns nullptr if not found.  Buffer was allocated via aligned_alloc.
@@ -118,11 +138,13 @@ class RerankConsumer {
     struct PayloadCacheEntry {
         uint8_t* storage = nullptr;
         uint32_t bytes = 0;
+        uint32_t capacity = 0;
         BufferPool* pool_owner = nullptr;
+        bool span_view = false;
     };
 
     void StorePayload(uint64_t offset, uint8_t* storage, uint32_t bytes,
-                      BufferPool* pool_owner);
+                      uint32_t capacity, BufferPool* pool_owner);
     static void ReleasePayloadEntry(PayloadCacheEntry* entry);
     void ClearPayloadCache();
 

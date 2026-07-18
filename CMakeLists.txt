@@ -329,6 +329,7 @@ add_library(vdb_query STATIC
     src/query/io_uring_reader.cpp
     src/query/result_collector.cpp
     src/query/rerank_consumer.cpp
+    src/query/span_planner.cpp
     src/query/overlap_scheduler.cpp
     src/query/buffer_pool.cpp
 )
@@ -552,6 +553,10 @@ if(VDB_BUILD_TESTS)
     add_executable(test_overlap_scheduler tests/query/overlap_scheduler_test.cpp)
     target_link_libraries(test_overlap_scheduler PRIVATE vdb_query GTest::gtest GTest::gtest_main)
     add_test(NAME test_overlap_scheduler COMMAND test_overlap_scheduler)
+
+    add_executable(test_span_planner tests/query/span_planner_test.cpp)
+    target_link_libraries(test_span_planner PRIVATE vdb_query GTest::gtest GTest::gtest_main)
+    add_test(NAME test_span_planner COMMAND test_span_planner)
 
     # -------------------------------------------------------------------------
     # IO tests (Phase 8)

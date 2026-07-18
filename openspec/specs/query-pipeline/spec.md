@@ -513,3 +513,201 @@ The first vector-read submit compaction stage SHALL keep request generation and 
 - **WHEN** query 结束时仍存在 deferred candidates
 - **THEN** scheduler MUST flush 所有 deferred candidates
 - **AND** 任何 candidate MUST NOT 因 dynamic frontier 一直未 ready 而被丢弃
+## Requirements
+### Requirement: Query pipeline SHALL remove abandoned experimental pruning controls
+The query pipeline SHALL NOT expose Stage2 progressive active-bits pruning, Stage2 per-bit pruning, or Stage1 block-level skip envelope as supported query controls in the frozen serving path. The fixed active ex-bits path and standard Stage1/Stage2 SafeOut semantics MUST remain the supported path.
+
+#### Scenario: Progressive pruning flags are unavailable
+- **WHEN** a benchmark or serving command is configured after this cleanup
+- **THEN** Stage2 progressive active-bits and per-bit pruning flags MUST NOT be accepted as supported runtime controls
+- **AND** the query MUST use the fixed active ex-bits path
+
+#### Scenario: Stage1 envelope skip is unavailable
+- **WHEN** a resident query probes cluster blocks after this cleanup
+- **THEN** Stage1 block-level skip envelope MUST NOT participate in SafeOut decisions
+- **AND** standard Stage1 mask and Stage2 refinement semantics MUST remain unchanged
+
+### Requirement: Query pipeline SHALL remove abandoned submit scheduling variants
+The query pipeline SHALL NOT expose vector-read address sorting or budgeted early submit as supported scheduling variants in the frozen serving path. Existing fixed submit, flush, drain, SafeIn, SafeOut, and prefetch behavior MUST remain available.
+
+#### Scenario: Address sorting is not used for vector-read submit
+- **WHEN** the scheduler emits vector-only data reads in the frozen serving path
+- **THEN** it MUST NOT reorder candidates through the abandoned vector-read address sorting option
+- **AND** candidate correctness and final result ordering MUST remain equivalent to the pre-cleanup fixed path
+
+#### Scenario: Budgeted early submit is not used during probing
+- **WHEN** the scheduler processes probed candidates before final drain
+- **THEN** it MUST NOT emit candidates through the abandoned budgeted early-submit queue
+- **AND** normal submit batching, tail flush, and final drain MUST preserve all eligible candidates
+
+### Requirement: Query pipeline SHALL preserve frozen routing and pipeline behavior
+The cleanup SHALL preserve the frozen query behavior: fixed active ex-bits, selective resident preload when configured, compact batched preload when configured, two-level coarse routing when configured, and SafeIn/SafeOut plus prefetch pipeline semantics.
+
+#### Scenario: Frozen query controls remain available
+- **WHEN** a benchmark enables resident serving with fixed active ex-bits and two-level coarse routing
+- **THEN** the query pipeline MUST accept and apply those supported controls
+- **AND** the cleanup MUST NOT force fallback to a non-resident or non-two-level path
+
+#### Scenario: SafeIn and SafeOut semantics are unchanged
+- **WHEN** a query is executed with the same index, query vectors, and supported frozen parameters before and after cleanup
+- **THEN** the SafeIn/SafeOut candidate semantics MUST remain equivalent
+- **AND** final recall MUST stay within the cleanup validation tolerance
+
+### Requirement: Query pipeline SHALL support a serial no-overlap execution mode
+The query pipeline SHALL provide a `serial_no_overlap` execution mode for resident RecordGate queries. This mode MUST reuse the same index, coarse routing, RaBitQ Stage1/Stage2 probing, SafeOut/SafeIn classification, candidate budget, deduplication and final top-k semantics as the default overlap pipeline. It MUST differ only in execution scheduling: probe MUST finish candidate collection before any raw-vector or payload data read is issued.
+
+#### Scenario: Serial mode collects candidates before data I/O
+- **WHEN** a resident query runs with `execution_mode=serial_no_overlap`
+- **THEN** the pipeline MUST complete coarse routing and probing for all selected clusters before issuing raw-vector, full-record or payload reads
+- **AND** the probe phase MUST NOT call async data `PrepRead`, `Submit`, `Poll` or `WaitAndPoll` for candidate data
+
+#### Scenario: Serial mode preserves candidate semantics
+- **WHEN** the same query, index and search parameters are run under default overlap mode and serial no-overlap mode
+- **THEN** both modes MUST use the same SafeOut/SafeIn frontier logic and candidate budget policy
+- **AND** both modes MUST produce matching probed counts, SafeOut/SafeIn/Uncertain counts and rerank candidate counts within benchmark tolerance
+
+### Requirement: Serial no-overlap mode SHALL execute read plans synchronously after probe
+After probe finishes, `serial_no_overlap` mode SHALL materialize the same candidate read plans that the overlap path would execute and SHALL read them synchronously. `VEC_ONLY` plans MUST read only raw-vector bytes, `VEC_ALL` plans MUST read the full record and preserve SafeIn payload-cache semantics, and final payload reads MUST happen only after exact rerank finalizes top-k.
+
+#### Scenario: Vector-only plans are read synchronously
+- **WHEN** a collected candidate materializes as `VEC_ONLY`
+- **THEN** serial mode MUST synchronously read exactly the raw-vector byte range from `data.dat` or the configured separate vector store
+- **AND** the read vector MUST be passed to the same exact rerank consumer semantics as the overlap path
+
+#### Scenario: SafeIn full-record plans are preserved
+- **WHEN** a collected candidate materializes as `VEC_ALL` under the same access policy used by Full Pipeline
+- **THEN** serial mode MUST synchronously read the full record byte range
+- **AND** the raw vector MUST be exact-reranked
+- **AND** the payload portion MUST be cached for final result assembly using semantics equivalent to the overlap path
+
+#### Scenario: Final payload materialization remains after exact rerank
+- **WHEN** exact rerank finalizes the query top-k
+- **THEN** serial mode MUST synchronously read only payloads missing from the payload cache
+- **AND** result assembly MUST produce the same payload schema and ordering semantics as the overlap path
+
+### Requirement: Serial no-overlap mode SHALL not use speculative prefetch
+Serial no-overlap mode MUST disable speculative or budgeted prefetch mechanisms that issue candidate data reads before final read-plan materialization. If a benchmark command supplies a speculative prefetch limit, the effective value in serial mode MUST be zero or the command MUST fail with a clear error.
+
+#### Scenario: Budgeted prefetch is disabled in serial mode
+- **WHEN** a query runs with `execution_mode=serial_no_overlap`
+- **THEN** the effective `budgeted_prefetch_limit` MUST be zero
+- **AND** no `SPEC_VEC_ONLY` request MUST be emitted
+
+### Requirement: Serial no-overlap mode SHALL preserve batch exact-rerank semantics
+Serial no-overlap mode SHALL preserve the existing exact-rerank computation semantics, including batch SIMD rerank when enabled. This mode is a scheduling ablation and MUST NOT implicitly downgrade exact rerank to scalar per-vector computation.
+
+#### Scenario: Batch rerank remains available
+- **WHEN** serial mode has synchronously read all selected raw vectors
+- **THEN** it MAY pass those vectors to the existing batched rerank consumer
+- **AND** it MUST report exact rerank counts and distances under the same semantics as overlap mode
+
+### Requirement: Query pipeline supports sidecar hot/cold record layout mode
+The query pipeline SHALL keep supporting the Phase 1 sidecar hot/cold record
+layout mode that reads raw vectors and payload bytes from separate physical
+planes while preserving recall and top-k semantics.
+
+#### Scenario: Sidecar hot/cold query preserves recall
+- **WHEN** combined-store and sidecar hot/cold-store queries use the same index,
+  query file, ground truth, `topk`, `nprobe`, RabitQ bits, SafeOut, and SafeIn
+  settings
+- **THEN** `recall_at_k` MUST be identical within deterministic benchmark
+  output for the same candidate set
+- **AND** final result ordering MUST remain distance-sorted
+
+#### Scenario: Sidecar hot vector reads use fixed-size vector addressing
+- **WHEN** a candidate requires exact rerank under sidecar hot/cold layout
+- **THEN** the scheduler MUST read exactly `vec_bytes` from `hotvec.dat`
+- **AND** the hot vector read offset MUST be derived from the mapped hot vector
+  row, not from the cold payload offset
+
+### Requirement: Query pipeline supports inline hot-record layout mode
+The query pipeline SHALL support an inline hot-record layout mode whose cluster
+addresses directly identify hot records containing raw vectors and payload
+descriptors.
+
+#### Scenario: Inline hot-record query preserves recall
+- **WHEN** combined-store and inline hot-record queries use equivalent
+  quantized cluster data, query file, ground truth, `topk`, `nprobe`, RabitQ
+  bits, SafeOut, and SafeIn settings
+- **THEN** `recall_at_k` MUST be identical within deterministic benchmark
+  output for the same candidate set
+- **AND** final result ordering MUST remain distance-sorted
+
+#### Scenario: Inline exact rerank reads vector and descriptor from hot record
+- **WHEN** a candidate requires exact rerank under inline hot-record layout
+- **THEN** the scheduler MUST read the raw vector bytes from
+  `AddressEntry.offset`
+- **AND** it MUST read the payload descriptor adjacent to the raw vector
+- **AND** it MUST feed only the raw vector bytes into exact rerank
+- **AND** for `cold_pointer` descriptors it MUST defer cold payload bytes until
+  final top-k materialization
+
+#### Scenario: Inline query avoids sidecar map lookup
+- **WHEN** query runs with `record_layout=inline_hot_record_store`
+- **THEN** query initialization MUST NOT load `hotcold_map.bin` or
+  `address_map.bin`
+- **AND** per-query record access MUST NOT perform `combined_offset -> row_id`
+  lookup
+- **AND** benchmark JSON MUST expose a diagnostic showing sidecar map bytes or
+  sidecar record count is zero for the inline layout
+
+#### Scenario: Inline mode is benchmark-selectable
+- **WHEN** `bench_e2e` or `bench_online_query` is invoked with the inline
+  hot-record store argument or a derived inline index directory
+- **THEN** it MUST open the hot record file and optional `payload.cold.dat`
+- **AND** it MUST pass descriptor-aware layout metadata to the query scheduler
+- **AND** it MUST report `record_layout=inline_hot_record_store`
+
+### Requirement: Hot/cold experiments compare against existing layouts
+The query experiment report SHALL compare inline hot-record results against the
+current combined-store, existing separate-store, and Phase 1 sidecar hot/cold
+baselines using the same query settings.
+
+#### Scenario: VoxCeleb2 and MSMARCO comparison table exists
+- **WHEN** the Phase 2 experiment scripts finish
+- **THEN** the result summary MUST include combined, separate-store, Phase 1
+  sidecar hot/cold, and Phase 2 inline hot-record rows for VoxCeleb2 and
+  MSMARCO
+- **AND** each row MUST include recall, avg ms, QPS, p95, p99, read requests,
+  read bytes, relevant pipeline timing fields, and layout memory overhead
+
+#### Scenario: Inline improvement is analyzed against sidecar overhead
+- **WHEN** Phase 2 results are summarized
+- **THEN** the report MUST include the delta between sidecar hot/cold and inline
+  hot-record layouts
+- **AND** it MUST discuss whether any speedup is consistent with removing
+  `hotcold_map.bin` and row-id lookup overhead
+
+### Requirement: Query pipeline SHALL use an uncapped post-SafeOut verification path
+The query pipeline SHALL treat every candidate that survives SafeOut and requires exact verification as eligible for the normal mandatory raw-vector path. It MUST NOT apply a second `non_safeout_candidate_budget` selection heap or drop a surviving candidate because of that deleted budget.
+
+#### Scenario: Uncertain candidate enters mandatory vector verification
+- **WHEN** a candidate is not removed by SafeOut and requires exact-vector verification
+- **THEN** the scheduler MUST enqueue the candidate through the mandatory vector-read path
+- **AND** it MUST NOT route the candidate through a global top-estimate candidate-budget heap
+
+#### Scenario: SafeIn does not replace exact verification
+- **WHEN** a SafeIn candidate still requires exact membership confirmation
+- **THEN** its raw vector MUST remain eligible for the mandatory verification path
+- **AND** any payload timing policy MUST remain separate from exact-vector correctness
+
+### Requirement: Query pipeline SHALL not issue speculative raw-vector requests from a candidate budget
+The query pipeline MUST NOT expose or emit a `SPEC_VEC_ONLY` request type, maintain pending speculative vector plans, or cache raw vectors on behalf of a deleted candidate-budget prefetch policy. Vector-span coalescing SHALL continue to operate on mandatory vector reads according to its existing admission rules.
+
+#### Scenario: Mandatory vector submission contains no speculative request type
+- **WHEN** the scheduler emits raw-vector I/O for candidates surviving SafeOut
+- **THEN** every emitted raw-vector request MUST use a supported mandatory or span request type
+- **AND** no request MUST depend on `budgeted_prefetch_limit` or speculative final-use tracking
+
+#### Scenario: Query finalization requires no speculative cache cleanup
+- **WHEN** a query finalizes its exact top-k and payload results
+- **THEN** finalization MUST complete without a speculative-vector cache, speculative-offset set, or speculative wasted-prefetch accounting
+
+### Requirement: SerialNoOverlap SHALL remain valid without speculative-prefetch special handling
+`SerialNoOverlap` SHALL remain a benchmark-only execution mode, but its correctness MUST NOT depend on forcing a deleted speculative-prefetch limit to zero or rejecting pending `SPEC_VEC_ONLY` plans.
+
+#### Scenario: SerialNoOverlap runs the unified no-cap candidate flow
+- **WHEN** a query runs in `SerialNoOverlap` mode
+- **THEN** it MUST use the same uncapped post-SafeOut candidate semantics as the default execution mode
+- **AND** it MUST complete without speculative-vector configuration or pending speculative plans
+

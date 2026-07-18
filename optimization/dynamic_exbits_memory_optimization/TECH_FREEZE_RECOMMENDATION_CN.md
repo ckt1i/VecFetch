@@ -30,7 +30,7 @@ tile_lane_bitmajor RaBitQ 格式
 | `VDB_RESIDENT_PRELOAD_MODE=compact` / `compact_batched` | 默认 resident preload 路径 | 稳定、简单，支持 selective resident preload。 |
 | two-level coarse routing + warmup | 默认开启，`budget_factor=16` | warmup 前移后避免 hierarchy build 摊入查询；此前用户也要求默认开启 two-level。 |
 | SafeIn/SafeOut + pipeline overlap | 保留为主方法核心 | 对应论文算法和系统贡献，不应为了精简而移除。 |
-| `non_safeout_candidate_budget=400` | 主实验建议固定使用；selective preload 消融可单独说明口径 | 历史主实验多采用该 budget；selective preload 最新表主要证明内存与同口径 recall，不作为主 Pareto。 |
+| uncapped mandatory exact verification | 主实验统一使用；不再暴露第二个 non-SafeOut candidate cap | 当前 no-cap 口径让所有通过 SafeOut 且需要精确验证的候选进入统一 mandatory vector 路径。旧 budget=400 结果仅为历史证据。 |
 
 ## 建议保留但默认关闭
 
@@ -50,7 +50,7 @@ tile_lane_bitmajor RaBitQ 格式
 | Stage1 block envelope：`--stage1-block-skip-envelope` | 已从主线 benchmark CLI / 查询配置 / resident preload 统计删除 | runtime 版本 ESCI 1.8ms -> 10.9ms；precompute 版本 skip rate 仅 0.47%/0.28%，明显负优化。 |
 | `VDB_STAGE1_PRECOMPUTE_ENVELOPE` | 已从 resident preload 路径删除 | 额外内存 22.7 MiB / 106.2 MiB，但总耗时大幅变慢。 |
 | `--vec-read-address-sort` / sort window | 已从主线 benchmark CLI / scheduler 分支删除 | 地址排序降低少量 final drain，但排序/emit 开销更高，总体变慢。 |
-| `--budgeted-early-submit` 及 interval/count/max | 已从主线 benchmark CLI / scheduler early-submit 分支删除；最终 `non_safeout_candidate_budget` 保留 | submit/drain 降低但总耗时变慢；当前 early-submit 判定不够稳定。 |
+| budgeted/optional early-submit 及 candidate-budget speculative prefetch | 已从主线 benchmark CLI、scheduler、统计和结果 schema 删除 | submit/drain 降低但总耗时变慢；当前方法只保留正常 mandatory/optional admission。 |
 | `full_file_mmap_2mb` | 不作为默认；建议隐藏到 legacy/debug | MSMARCO bits=4 final_drain 明显倒退，full-file 冷数据常驻污染热路径。 |
 | full-file resident preload | 不建议用于最终 online-query 主路径 | 内存口径更大，也和 selective resident preload 不兼容。 |
 | `small_lane4` / `small_lane2` / `microbatch` | 从最终候选删除 | 复核后收益不稳定或负收益。 |

@@ -1,5 +1,7 @@
 # COCO100k bit=4 stage2 压缩实验结果
 
+> 历史结果记录；其中旧 candidate-budget 命令不是当前方法，也不能直接由当前 benchmark CLI 重跑。
+
 ## 实验设置
 
 数据集：

@@ -438,6 +438,10 @@ TEST_F(PayloadPipelineTest, ShadowVectorStoreKeepsCombinedPayloadPath) {
     EXPECT_TRUE(std::all_of(trace.begin(), trace.end(), [](const auto& entry) {
         return entry.query_index == 7 && entry.request_type == 0;
     }));
+    EXPECT_EQ(std::count_if(trace.begin(), trace.end(), [](const auto& entry) {
+                  return entry.selected_topk;
+              }),
+              results.size());
     ASSERT_EQ(results[0].payload.size(), 2u);
     const int64_t result_id = results[0].payload[0].fixed.i64;
     EXPECT_EQ(results[0].payload[1].var_data,

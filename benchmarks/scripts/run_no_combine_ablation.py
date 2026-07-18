@@ -70,7 +70,6 @@ def build_cmd(dataset: str, layout: str, topk: int, nprobe: int, queries: int) -
         "--hotpath-detailed-timing", "0",
         "--two-level-coarse-routing", "1",
         "--two-level-coarse-budget-factor", "16",
-        "--non-safeout-candidate-budget", "400",
     ]
     if layout == "no_combine_flatstor":
         cmd[1:1] = ["--separate-store-dir", str(cfg["store"])]

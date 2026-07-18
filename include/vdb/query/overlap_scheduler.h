@@ -36,6 +36,10 @@ class OverlapScheduler {
                      const SearchConfig& config);
     OverlapScheduler(index::IvfIndex& index, AsyncReader& cluster_reader,
                      AsyncReader& data_reader, const SearchConfig& config);
+    OverlapScheduler(index::IvfIndex& index, AsyncReader& cluster_reader,
+                     AsyncReader& data_reader,
+                     AsyncReader& optional_payload_reader,
+                     const SearchConfig& config);
     ~OverlapScheduler();
 
     /// Execute a single query and return results.
@@ -48,12 +52,15 @@ class OverlapScheduler {
     /// Update query-local truth rows used only by SafeIn/SafeOut false-stat
     /// accounting. This does not change candidate generation or ranking.
     void SetFalseStatsTrueTopKRows(const std::unordered_set<uint32_t>* rows);
+    void SetOracleTrueTopKRows(const std::unordered_set<uint32_t>* rows);
 
     /// Label vector-read trace records emitted by the next Search call.
     void SetVectorReadTraceQueryIndex(uint32_t query_index);
 
  private:
     friend class ::OverlapSchedulerTest;
+
+    struct ReadPlanEntry;
 
     enum class PendingBufferCleanup : uint8_t {
         None,
@@ -66,11 +73,12 @@ class OverlapScheduler {
     struct VecSpanMember {
         AddressEntry addr;
         uint32_t buffer_offset = 0;
+        uint32_t safein_credit_bytes = 0;
     };
 
     struct PendingIO {
         enum class Type : uint8_t {
-            VEC_ONLY, VEC_ALL, PAYLOAD, PAYLOAD_PREFIX, SPEC_VEC_ONLY,
+            VEC_ONLY, VEC_ALL, PAYLOAD, PAYLOAD_PREFIX,
             PAYLOAD_DESCRIPTOR, VEC_SPAN
         };
         Type type;
@@ -79,6 +87,10 @@ class OverlapScheduler {
         uint32_t read_length = 0;
         uint32_t payload_total_length = 0;
         uint32_t payload_prefix_length = 0;
+        uint32_t payload_buffer_capacity = 0;
+        bool payload_reuses_cache = false;
+        bool optional_payload_io = false;
+        uint64_t optional_submit_timestamp_ns = 0;
         uint64_t bextra_extra_bytes = 0;
         size_t bextra_trace_index = std::numeric_limits<size_t>::max();
         std::vector<VecSpanMember> span_members;
@@ -96,6 +108,8 @@ class OverlapScheduler {
                                class RerankConsumer& reranker,
                                const std::vector<ClusterID>& sorted_clusters);
     void FinalDrain(SearchContext& ctx, class RerankConsumer& reranker);
+    void DrainOptionalPayloads(SearchContext& ctx,
+                               class RerankConsumer& reranker);
     void DispatchCompletion(uint64_t slot_token, int32_t result,
                             SearchContext& ctx,
                             class RerankConsumer& reranker);
@@ -127,6 +141,10 @@ class OverlapScheduler {
     void ReleasePendingSlot(uint32_t slot_id);
     void CleanupPendingSlot(PendingSlot& slot);
     void CleanupPendingSlots();
+    void ReleaseRetainedVecSpans();
+    void InstallFinalSpanPayloadViews(
+        SearchContext& ctx, class RerankConsumer& reranker,
+        const std::vector<CollectorEntry>& results);
     uint8_t* AcquireVecOnlyBuffer();
     void ReleaseVecOnlyBuffer(uint8_t* buf);
     void ReleaseVectorOnlyPendingSlot(uint32_t slot_id);
@@ -134,7 +152,22 @@ class OverlapScheduler {
     bool TryAcquireFixedVecBuffer(uint8_t** buffer, uint16_t* buffer_index);
     void ReleaseFixedVecBuffer(uint16_t buffer_index);
     void EmitPendingDataRequests(SearchContext& ctx, uint32_t max_count);
+    void EmitPendingOptionalPayloadRequests(SearchContext& ctx,
+                                            uint32_t max_count);
+    void MaybeSubmitOptionalPayloadRequests(
+        SearchContext& ctx, class RerankConsumer& reranker,
+        uint32_t probes_remaining);
+    void PollOptionalPayloadCompletions(SearchContext& ctx,
+                                        class RerankConsumer& reranker,
+                                        bool wait_for_one);
+    uint32_t PrepareSafeInPayloadRead(SearchContext& ctx,
+                                      const ReadPlanEntry& plan,
+                                      AsyncReader& reader,
+                                      bool optional_payload_io);
+    void SnapshotOptionalPayloadProbeEnd(SearchContext& ctx);
     uint32_t PendingDataRequestCount() const;
+    uint32_t PendingMandatoryDataRequestCount() const;
+    uint32_t PendingOptionalPayloadRequestCount() const;
     void ApplyBextraWindowBudget(SearchContext& ctx,
                                  uint32_t clusters_processed,
                                  uint32_t clusters_remaining);
@@ -149,7 +182,9 @@ class OverlapScheduler {
     index::IvfIndex& index_;
     AsyncReader& cluster_reader_;
     AsyncReader& data_reader_;
+    AsyncReader& optional_payload_reader_;
     bool isolated_submission_mode_ = false;
+    bool isolated_optional_payload_io_ = false;
     SearchConfig config_;
     BufferPool buffer_pool_;
     std::vector<PendingSlot> pending_slots_;
@@ -206,6 +241,10 @@ class OverlapScheduler {
         PendingIO::Type type = PendingIO::Type::VEC_ONLY;
         AddressEntry addr;
         uint32_t read_length = 0;
+        int payload_prefix_fd = -1;
+        uint64_t cold_payload_offset = 0;
+        uint32_t cold_payload_total_length = 0;
+        uint32_t cold_payload_prefix_length = 0;
         bool has_truth = false;
         bool is_true_topk = false;
         uint64_t bextra_extra_bytes = 0;
@@ -214,12 +253,26 @@ class OverlapScheduler {
 
     struct VecOnlyReadPlan {
         AddressEntry addr;
+        bool safein = false;
+        uint32_t safein_credit_bytes = 0;
     };
 
-    struct SpeculativeVector {
-        AddressEntry addr;
-        AlignedBufPtr storage;
+    struct VecSpanExecutionGroup {
+        size_t begin = 0;
+        size_t end = 0;
+        uint64_t read_offset = 0;
+        uint32_t read_length = 0;
+        uint64_t safein_credit_bytes = 0;
     };
+
+    uint32_t ResolveVecSpanSafeInCreditBytes(AddressEntry addr,
+                                             bool safein) const;
+    VecOnlyReadPlan MakeVecOnlyReadPlan(AddressEntry addr,
+                                        bool safein) const;
+    void PlanVecOnlySpanGroups(SearchContext& ctx,
+                               std::vector<VecOnlyReadPlan>& plans,
+                               size_t begin, size_t end,
+                               std::vector<VecSpanExecutionGroup>* groups);
 
     struct PayloadLocation {
         uint32_t length = 0;
@@ -243,15 +296,6 @@ class OverlapScheduler {
         bool is_true_topk = false;
     };
 
-    struct BudgetedReadPlan {
-        float rank_key = std::numeric_limits<float>::infinity();
-        ReadPlanEntry plan;
-
-        bool operator<(const BudgetedReadPlan& other) const {
-            return rank_key < other.rank_key;
-        }
-    };
-
     using PreparedClusterQueryView = rabitq::PreparedClusterQueryView;
     PreparedClusterQueryView PrepareClusterQueryView(const SearchContext& ctx,
                                                      uint32_t cluster_id,
@@ -262,18 +306,40 @@ class OverlapScheduler {
     QueryDedupSet submitted_candidate_offsets_;
     SubmitScratch submit_scratch_;
     std::deque<ReadPlanEntry> pending_all_plans_;
+    std::deque<ReadPlanEntry> pending_optional_payload_plans_;
+    std::deque<uint32_t> optional_payload_prepped_slots_;
     std::vector<VecOnlyReadPlan> pending_vec_only_plans_;
-    std::vector<VecOnlyReadPlan> pending_spec_vec_plans_;
     std::vector<DeferredSafeInPlan> deferred_safein_plans_;
-    std::vector<BudgetedReadPlan> budgeted_read_plan_heap_;
     size_t pending_vec_only_head_ = 0;
-    size_t pending_spec_vec_head_ = 0;
-    std::unordered_set<uint64_t> speculative_prefetch_offsets_;
-    std::unordered_set<uint64_t> speculative_final_offsets_;
-    std::unordered_map<uint64_t, SpeculativeVector> speculative_vector_cache_;
     std::unordered_map<uint64_t, uint64_t> candidate_order_by_offset_;
     std::unordered_map<uint64_t, PayloadLocation> payload_location_cache_;
+    std::unordered_map<uint64_t, uint32_t> cold_prefetched_bytes_by_offset_;
+    struct RetainedVecSpan {
+        uint8_t* buffer = nullptr;
+        uint32_t bytes = 0;
+        uint32_t used = 0;
+        bool compact = false;
+        bool keep_for_final_payload = false;
+    };
+    struct SpanPayloadRef {
+        AddressEntry addr;
+        const uint8_t* payload = nullptr;
+        uint32_t bytes = 0;
+        uint32_t span_index = 0;
+    };
+    std::vector<RetainedVecSpan> retained_vec_spans_;
+    std::vector<SpanPayloadRef> span_payload_refs_;
+    std::vector<uint64_t> final_payload_offset_table_scratch_;
+    std::vector<std::vector<VecSpanMember>> free_vec_span_member_vectors_;
+    SpanPlannerScratch vec_span_planner_scratch_;
+    std::vector<SpanPlannerItem> vec_span_planner_items_;
+    std::vector<SpanPlannerGroup> vec_span_planner_groups_;
+    std::vector<VecSpanExecutionGroup> vec_span_execution_groups_;
+    uint32_t vec_span_safein_tails_extended_ = 0;
     uint64_t next_candidate_order_ = 0;
+    uint64_t optional_probe_start_ns_ = 0;
+    uint32_t optional_probe_total_clusters_ = 0;
+    uint64_t pipeline_probe_start_ns_ = 0;
 
     uint32_t vec_bytes_;
     uint32_t aligned_vec_bytes_ = 0;
@@ -342,24 +408,22 @@ class OverlapScheduler {
                                       bool has_truth,
                                       bool is_true_topk) const;
     uint32_t SafeInReadLength(AddressEntry addr) const;
+    void ConfigureSafeInReadPlan(SearchContext& ctx, AddressEntry addr,
+                                 ReadPlanEntry* plan) const;
+    uint64_t SafeInPlanTotalReadBytes(const ReadPlanEntry& plan) const;
+    uint64_t SafeInPlanExtraBytes(const ReadPlanEntry& plan) const;
+    bool UseDecoupledSafeInPrefetch() const;
+    bool UseIsolatedOptionalPayloadIO() const;
+    void EnqueueSafeInReadPlan(SearchContext& ctx,
+                               const ReadPlanEntry& plan);
+    bool HasSafeInPrefetchCountCapacity() const;
     bool ShouldScheduleSafeInPrefetch(SearchContext& ctx,
-                                      uint32_t read_length,
-                                      uint32_t extra_bytes = 0);
+                                      uint64_t read_bytes,
+                                      uint64_t extra_bytes = 0);
+    void FinalizeColdPrefetchStats(
+        SearchContext& ctx, const std::vector<CollectorEntry>& results) const;
     void FlushDeferredSafeInPlans(SearchContext& ctx, float threshold,
                                   bool force);
-    bool UseNonSafeOutCandidateBudget() const;
-    void AddBudgetedReadPlan(SearchContext& ctx, const ReadPlanEntry& plan,
-                             float rank_key);
-    void MaybeScheduleBudgetedPrefetch(SearchContext& ctx,
-                                       const ReadPlanEntry& plan);
-    bool TryUseSpeculativeVector(SearchContext& ctx,
-                                 class RerankConsumer& reranker,
-                                 AddressEntry addr);
-    void CacheSpeculativeVector(SearchContext& ctx, AddressEntry addr,
-                                const uint8_t* vec);
-    void FinalizeBudgetedPrefetchStats(SearchContext& ctx);
-    void MaterializeBudgetedReadPlans(SearchContext& ctx,
-                                      class RerankConsumer& reranker);
     bool UseSeparateRecordStore() const;
     bool UseVectorSidecarStore() const;
     bool UseInlineHotRecordStore() const;
@@ -367,6 +431,8 @@ class OverlapScheduler {
         SearchContext& ctx, AddressEntry addr) const;
     uint64_t SeparateVectorOffset(const SeparateRecordLocation& loc) const;
     void RecordVectorReadTrace(AddressEntry addr, bool from_vec_all);
+    void MarkVectorReadTraceSelectedTopK(
+        const std::vector<CollectorEntry>& results);
     void MarkSafeInConfidenceTraceSelectedTopK(
         const std::vector<CollectorEntry>& results);
     storage::HotPayloadDescriptor ReadInlinePayloadDescriptorOrAbort(
@@ -386,6 +452,10 @@ class OverlapScheduler {
 
     uint32_t vector_read_trace_query_index_ = 0;
     uint32_t vector_read_trace_request_index_ = 0;
+    uint32_t vector_read_trace_flush_index_ = 0;
+    uint32_t vector_read_trace_current_flush_index_ = 0;
+    std::unordered_map<uint64_t, uint32_t>
+        vector_read_trace_cluster_by_offset_;
     size_t safein_confidence_trace_query_start_ = 0;
     double bextra_probe_cluster_ema_ms_ = 0.0;
     uint64_t bextra_inflight_bytes_ = 0;

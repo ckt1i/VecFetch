@@ -20,6 +20,15 @@ add_executable(bench_e2e bench_online_query.cpp rabitq_bench_calibration.cpp)
 target_link_libraries(bench_e2e PRIVATE vdb_query vdb_io)
 vdb_enable_target_avx512(bench_e2e)
 
+if(VDB_BUILD_TESTS)
+    add_test(
+        NAME test_bench_e2e_rejects_deleted_prefetch_flags
+        COMMAND ${CMAKE_COMMAND}
+            -DBENCH_E2E=$<TARGET_FILE:bench_e2e>
+            -DBENCH_BUILD_INDEX=$<TARGET_FILE:bench_build_index>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/reject_deleted_prefetch_flags.cmake)
+endif()
+
 # ----- No Combine Store Materializer -----
 add_executable(bench_materialize_no_combine_store bench_materialize_no_combine_store.cpp)
 target_link_libraries(bench_materialize_no_combine_store PRIVATE vdb_index vdb_io)
@@ -60,6 +69,10 @@ add_executable(bench_direct3_kernel bench_direct3_kernel.cpp)
 target_link_libraries(bench_direct3_kernel PRIVATE vdb_simd)
 vdb_enable_target_avx512(bench_direct3_kernel)
 
+# ----- Ordered span planner CPU microbenchmark -----
+add_executable(bench_span_planner_cpu bench_span_planner_cpu.cpp)
+target_link_libraries(bench_span_planner_cpu PRIVATE vdb_query)
+
 # ----- Index Geometry Utility -----
 add_executable(bench_index_geometry bench_index_geometry.cpp)
 target_link_libraries(bench_index_geometry PRIVATE vdb_index vdb_io)
@@ -89,6 +102,11 @@ vdb_enable_target_avx512(bench_conann_recall)
 add_executable(bench_rabitq_diagnostic bench_rabitq_diagnostic.cpp)
 target_link_libraries(bench_rabitq_diagnostic PRIVATE vdb_index vdb_io)
 vdb_enable_target_avx512(bench_rabitq_diagnostic)
+
+# ----- Precision-conditioned RaBitQ interval auditor -----
+add_executable(bench_rabitq_interval_audit bench_rabitq_interval_audit.cpp)
+target_link_libraries(bench_rabitq_interval_audit PRIVATE vdb_index vdb_io)
+vdb_enable_target_avx512(bench_rabitq_interval_audit)
 
 # ----- SafeIn Replay Benchmark -----
 add_executable(bench_safein_replay bench_safein_replay.cpp)

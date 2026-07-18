@@ -16,6 +16,11 @@ struct IoCompletion {
     int32_t result;     // Success: bytes read, Failure: negative errno
 };
 
+struct AsyncPollDiagnostics {
+    uint32_t get_events_calls = 0;
+    uint64_t get_events_ns = 0;
+};
+
 // ============================================================================
 // AsyncReader — abstract I/O backend interface
 // ============================================================================
@@ -51,6 +56,16 @@ class AsyncReader {
 
     /// Number of PrepRead()ed SQEs not yet Submit()ed.
     virtual uint32_t prepped() const = 0;
+
+    /// Optional low-level diagnostics for the most recent Poll call.
+    /// Readers that do not expose backend details return zeros.
+    virtual AsyncPollDiagnostics last_poll_diagnostics() const {
+        return {};
+    }
+
+    /// Detailed backend timing is disabled by default because it adds clocks
+    /// inside the I/O hot path. Scheduler-level counters remain available.
+    virtual void SetDetailedPollTiming(bool) {}
 };
 
 // ============================================================================
@@ -91,6 +106,12 @@ class PreadFallbackReader : public AsyncReader {
 // IoUringReader — io_uring async I/O (declared here, implemented separately)
 // ============================================================================
 
+struct IoUringInitOptions {
+    bool use_iopoll = false;
+    bool use_sqpoll = false;
+    bool use_defer_taskrun = true;
+};
+
 class IoUringReader : public AsyncReader {
  public:
     IoUringReader();
@@ -102,6 +123,8 @@ class IoUringReader : public AsyncReader {
     /// @return Status::OK or Status::NotSupported
     Status Init(uint32_t queue_depth = 64, uint32_t cq_entries = 4096,
                 bool use_iopoll = false, bool use_sqpoll = false);
+    Status Init(uint32_t queue_depth, uint32_t cq_entries,
+                const IoUringInitOptions& options);
 
     /// Register file descriptors for IOSQE_FIXED_FILE optimization.
     /// After registration, use PrepReadFixed with the fd index (0-based).
@@ -136,6 +159,13 @@ class IoUringReader : public AsyncReader {
     uint32_t WaitAndPoll(IoCompletion* out, uint32_t max_count) override;
     uint32_t InFlight() const override;
     uint32_t prepped() const override { return prepped_; }
+    AsyncPollDiagnostics last_poll_diagnostics() const override {
+        return last_poll_diagnostics_;
+    }
+    void SetDetailedPollTiming(bool enabled) override {
+        detailed_poll_timing_ = enabled;
+    }
+    void SetForceAsync(bool enabled) { force_async_ = enabled; }
     uint32_t queue_depth() const { return queue_depth_; }
     uint32_t cq_entries() const { return cq_entries_; }
     bool defer_taskrun_enabled() const { return defer_taskrun_enabled_; }
@@ -143,6 +173,7 @@ class IoUringReader : public AsyncReader {
     bool sqpoll_enabled() const { return sqpoll_enabled_; }
     bool registered_files_enabled() const { return registered_files_enabled_; }
     bool registered_buffers_enabled() const { return registered_buffers_enabled_; }
+    bool force_async_enabled() const { return force_async_; }
 
  private:
     struct Impl;
@@ -156,6 +187,9 @@ class IoUringReader : public AsyncReader {
     bool sqpoll_enabled_ = false;
     bool registered_files_enabled_ = false;
     bool registered_buffers_enabled_ = false;
+    bool detailed_poll_timing_ = false;
+    bool force_async_ = false;
+    AsyncPollDiagnostics last_poll_diagnostics_;
 };
 
 }  // namespace query

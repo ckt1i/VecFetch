@@ -1,3 +1,6 @@
+# Historical command notebook. Commands containing removed scheduling flags are
+# non-runnable legacy evidence and must not be reused as current protocols.
+
 ./bench_vector_search \
   --base /home/zcq/VDB/data/coco_100k/image_embeddings.fvecs \
   --query /home/zcq/VDB/data/coco_100k/query_embeddings.fvecs \
